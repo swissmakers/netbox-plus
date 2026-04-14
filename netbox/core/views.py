@@ -39,11 +39,13 @@ from netbox.ui.panels import (
 )
 from netbox.views import generic
 from netbox.views.generic.base import BaseObjectView
+from netbox.views.generic.utils import get_prerequisite_model
 from netbox.views.generic.mixins import TableMixin
 from utilities.apps import get_installed_apps
 from utilities.data import shallow_compare_dict
-from utilities.forms import ConfirmationForm
+from utilities.forms import ConfirmationForm, restrict_form_fields
 from utilities.htmx import htmx_partial
+from utilities.querydict import normalize_querydict
 from utilities.json import ConfigJSONEncoder
 from utilities.query import count_related
 from utilities.views import (
@@ -405,7 +407,7 @@ class ConfigRevisionView(generic.ObjectView):
         config = deepcopy(instance.data or {})
 
         # Serialize any JSON-based classes
-        for attr in ['CUSTOM_VALIDATORS', 'DEFAULT_USER_PREFERENCES', 'PROTECTION_RULES']:
+        for attr in ['CUSTOM_VALIDATORS', 'DEFAULT_USER_PREFERENCES', 'PROTECTION_RULES', 'ENTERPRISE_AUTH']:
             if attr in config:
                 config[attr] = json.dumps(config[attr], cls=ConfigJSONEncoder, indent=4)
 
@@ -418,6 +420,36 @@ class ConfigRevisionView(generic.ObjectView):
 class ConfigRevisionEditView(generic.ObjectEditView):
     queryset = ConfigRevision.objects.all()
     form = forms.ConfigRevisionForm
+
+    def get(self, request, *args, **kwargs):
+        obj = self.get_object(**kwargs)
+        obj = self.alter_object(obj, request, args, kwargs)
+        model = self.queryset.model
+
+        initial_data = normalize_querydict(request.GET)
+
+        form_prefix = 'quickadd' if request.GET.get('_quickadd') else None
+        form = self.form(instance=obj, initial=initial_data, prefix=form_prefix)
+        restrict_form_fields(form, request.user)
+
+        context = {
+            'model': model,
+            'object': obj,
+            'form': form,
+        }
+
+        if request.GET.get('_quickadd'):
+            return render(request, 'htmx/quick_add.html', context)
+
+        if htmx_partial(request):
+            return render(request, self.htmx_template_name, context)
+
+        return render(request, self.template_name, {
+            **context,
+            'return_url': self.get_return_url(request, obj),
+            'prerequisite_model': get_prerequisite_model(self.queryset),
+            **self.get_extra_context(request, obj),
+        })
 
 
 @register_model_view(ConfigRevision, 'delete')

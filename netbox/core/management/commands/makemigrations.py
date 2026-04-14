@@ -16,7 +16,7 @@ class Command(_Command):
                 "This command is available for development purposes only. It will\n"
                 "NOT resolve any issues with missing or unapplied migrations. For assistance,\n"
                 "please post to the NetBox discussion forum on GitHub:\n"
-                "    https://github.com/netbox-community/netbox/discussions"
+                "    https://github.com/swissmakers/netbox-plus/discussions"
             )
 
         super().handle(*args, **kwargs)

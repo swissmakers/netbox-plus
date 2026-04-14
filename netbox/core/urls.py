@@ -2,7 +2,7 @@ from django.urls import include, path
 
 from utilities.urls import get_model_urls
 
-from . import views
+from . import auth_views, views
 
 app_name = 'core'
 urlpatterns = (
@@ -48,6 +48,20 @@ urlpatterns = (
 
     path('config-revisions/', include(get_model_urls('core', 'configrevision', detail=False))),
     path('config-revisions/<int:pk>/', include(get_model_urls('core', 'configrevision'))),
+
+    path('ldap-oidc/', auth_views.EnterpriseAuthHubView.as_view(), name='auth_hub'),
+    path('ldap-oidc/ldap/', auth_views.EnterpriseLDAPEditView.as_view(), name='auth_ldap'),
+    path('ldap-oidc/oidc/', auth_views.EnterpriseOIDCEditView.as_view(), name='auth_oidc'),
+    path(
+        'ldap-oidc/ldap/test/',
+        auth_views.EnterpriseLDAPTestView.as_view(),
+        name='auth_ldap_test',
+    ),
+    path(
+        'ldap-oidc/oidc/test/',
+        auth_views.EnterpriseOIDCTestView.as_view(),
+        name='auth_oidc_test',
+    ),
 
     path('system/', views.SystemView.as_view(), name='system'),
 

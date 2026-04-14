@@ -1,4 +1,4 @@
-**Looking for help?** NetBox has a vast, active community of fellow users that may be able to provide assistance. Just [start a discussion](https://github.com/netbox-community/netbox/discussions/new) right here on GitHub! Or if you'd prefer to chat, join us live in the `#netbox` channel on the [NetDev Community Slack](https://netdev.chat/)!
+**Looking for help?** NetBox has a vast, active community of fellow users that may be able to provide assistance. Just [start a discussion](https://github.com/swissmakers/netbox-plus/discussions/new) right here on GitHub! Or if you'd prefer to chat, join us live in the `#netbox` channel on the [NetDev Community Slack](https://netdev.chat/)!
 
 <div align="center">
   <h3>
@@ -38,11 +38,11 @@ NetBox users are welcome to participate in either role, on stage or in the crowd
 
 :warning: Bug reports are used to call attention to some unintended or unexpected behavior in NetBox, such as when an error occurs or when the result of taking some action is inconsistent with the documentation. **Bug reports may not be used to suggest new functionality**; please see "feature requests" below if that is your goal.
 
-* First, ensure that you're running the [latest stable version](https://github.com/netbox-community/netbox/releases) of NetBox. If you're running an older version, it's likely that the bug has already been fixed.
+* First, ensure that you're running the [latest stable version](https://github.com/swissmakers/netbox-plus/releases) of NetBox. If you're running an older version, it's likely that the bug has already been fixed.
 
-* Next, search our [issues list](https://github.com/netbox-community/netbox/issues?q=is%3Aissue) to see if the bug you've found has already been reported. If you come across a bug report that seems to match, please click "add a reaction" in the bottom left corner of the issue and add a thumbs up ( :thumbsup: ). This will help draw more attention to it. Any comments you can add to provide additional information or context would also be much appreciated.
+* Next, search our [issues list](https://github.com/swissmakers/netbox-plus/issues?q=is%3Aissue) to see if the bug you've found has already been reported. If you come across a bug report that seems to match, please click "add a reaction" in the bottom left corner of the issue and add a thumbs up ( :thumbsup: ). This will help draw more attention to it. Any comments you can add to provide additional information or context would also be much appreciated.
 
-* If you can't find any existing issues (open or closed) that seem to match yours, you're welcome to [submit a new bug report](https://github.com/netbox-community/netbox/issues/new?label=type%3A+bug&template=bug_report.yaml). Be sure to complete the entire report template, including detailed steps that someone triaging your issue can follow to confirm the reported behavior. (If we're not able to replicate the bug based on the information provided, we'll ask for additional detail.)
+* If you can't find any existing issues (open or closed) that seem to match yours, you're welcome to [submit a new bug report](https://github.com/swissmakers/netbox-plus/issues/new?label=type%3A+bug&template=bug_report.yaml). Be sure to complete the entire report template, including detailed steps that someone triaging your issue can follow to confirm the reported behavior. (If we're not able to replicate the bug based on the information provided, we'll ask for additional detail.)
 
 * Some other tips to keep in mind:
   * Error messages and screenshots are especially helpful.
@@ -52,17 +52,17 @@ NetBox users are welcome to participate in either role, on stage or in the crowd
   * We appreciate your patience as bugs are prioritized by their severity, impact, and difficulty to resolve.
 
 * For more information on how bug reports are handled, please see our [issue
-intake policy](https://github.com/netbox-community/netbox/wiki/Issue-Intake-Policy).
+intake policy](https://github.com/swissmakers/netbox-plus/wiki/Issue-Intake-Policy).
 
 ## :bulb: Feature Requests
 
-* First, check the GitHub [issues list](https://github.com/netbox-community/netbox/issues?q=is%3Aissue) to see if the feature you have in mind has already been proposed. If you happen to find an open feature request that matches your idea, click "add a reaction" in the top right corner of the issue and add a thumbs up ( :thumbsup: ). This ensures that the issue has a better chance of receiving attention. Also feel free to add a comment with any additional justification for the feature.
+* First, check the GitHub [issues list](https://github.com/swissmakers/netbox-plus/issues?q=is%3Aissue) to see if the feature you have in mind has already been proposed. If you happen to find an open feature request that matches your idea, click "add a reaction" in the top right corner of the issue and add a thumbs up ( :thumbsup: ). This ensures that the issue has a better chance of receiving attention. Also feel free to add a comment with any additional justification for the feature.
 
 * Please don't submit duplicate issues! Sometimes we reject feature requests, for various reasons. Even if you disagree with those reasons, please **do not** submit a duplicate feature request. It is very disrepectful of the maintainers' time, and you may be barred from opening future issues.
 
-* If you have a rough idea that's not quite ready for formal submission yet, start a [GitHub discussion](https://github.com/netbox-community/netbox/discussions) instead. This is a great way to test the viability and narrow down the scope of a new feature prior to submitting a formal proposal, and can serve to generate interest in your idea from other community members.
+* If you have a rough idea that's not quite ready for formal submission yet, start a [GitHub discussion](https://github.com/swissmakers/netbox-plus/discussions) instead. This is a great way to test the viability and narrow down the scope of a new feature prior to submitting a formal proposal, and can serve to generate interest in your idea from other community members.
 
-* Once you're ready, submit a feature request [using this template](https://github.com/netbox-community/netbox/issues/new?label=type%3A+feature&template=feature_request.yaml). Be sure to provide sufficient context and detail to convey exactly what you're proposing and why. The stronger your use case, the better chance your proposal has of being accepted.
+* Once you're ready, submit a feature request [using this template](https://github.com/swissmakers/netbox-plus/issues/new?label=type%3A+feature&template=feature_request.yaml). Be sure to provide sufficient context and detail to convey exactly what you're proposing and why. The stronger your use case, the better chance your proposal has of being accepted.
 
 * Some other tips to keep in mind:
   * Don't prepend your issue title with a label like `[Feature]`; the proper label will be assigned automatically.
@@ -70,7 +70,7 @@ intake policy](https://github.com/netbox-community/netbox/wiki/Issue-Intake-Poli
   * Verify that you have GitHub notifications enabled and are subscribed to your issue after submitting.
   * You're welcome to volunteer to implement your FR, but don't submit a pull request until it has been approved.
 
-* For more information on how feature requests are handled, please see our [issue intake policy](https://github.com/netbox-community/netbox/wiki/Issue-Intake-Policy).
+* For more information on how feature requests are handled, please see our [issue intake policy](https://github.com/swissmakers/netbox-plus/wiki/Issue-Intake-Policy).
 
 ## :arrow_heading_up: Submitting Pull Requests
 
@@ -111,14 +111,10 @@ Do you have an idea for something you'd like to build in NetBox, but might not b
 
 Check out our [plugin development tutorial](https://github.com/netbox-community/netbox-plugin-tutorial) to get started!
 
-## :briefcase: Looking for a Job?
-
-At [NetBox Labs](https://netboxlabs.com/), we're always looking for highly skilled and motivated people to join our team. While NetBox is a core part of our product lineup, we have an ever-expanding suite of solutions serving the network automation space. Check out our [current openings](https://netboxlabs.com/careers/) to see if you might be a fit!
-
 ## :heart: Other Ways to Contribute
 
 You don't have to be a developer to contribute to NetBox: There are plenty of other ways you can add value to the community! Below are just a few examples:
 
-* Help answer questions and provide feedback in our [GitHub discussions](https://github.com/netbox-community/netbox/discussions) and on [Slack](https://netdev.chat/).
+* Help answer questions and provide feedback in our [GitHub discussions](https://github.com/swissmakers/netbox-plus/discussions).
 * Write a blog article or record a YouTube video demonstrating how NetBox is used at your organization.
-* Help grow our [library of device & module type definitions](https://github.com/netbox-community/devicetype-library).
+* Help grow the [library of device & module type definitions](https://github.com/netbox-community/devicetype-library).

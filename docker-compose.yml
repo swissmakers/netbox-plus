@@ -1,0 +1,127 @@
+# NetBox Plus all-in-one stack: PostgreSQL, Redis, Gunicorn (web), and RQ workers.
+#
+# Usage:
+#   cp docker/.env.example .env
+#   # Edit .env —> set NETBOX_SECRET_KEY and optional superuser vars
+#   docker compose up --build
+#
+# UI: http://localhost:8080
+#
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-netbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netbox}
+      POSTGRES_DB: ${POSTGRES_DB:-netbox}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  netbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # UBI 10 needs x86-64-v3; UBI 9 is the safe default for older CPUs (see docker/README.md).
+        BASE_IMAGE: ${NETBOX_BASE_IMAGE:-registry.access.redhat.com/ubi9/ubi:latest}
+    image: ${NETBOX_IMAGE:-netbox-plus:local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NETBOX_CONFIGURATION: netbox.configuration_docker
+      NETBOX_SECRET_KEY: ${NETBOX_SECRET_KEY:?Set NETBOX_SECRET_KEY in .env}
+      NETBOX_ALLOWED_HOSTS: ${NETBOX_ALLOWED_HOSTS:-*}
+      NETBOX_DB_HOST: postgres
+      NETBOX_DB_NAME: ${POSTGRES_DB:-netbox}
+      NETBOX_DB_USER: ${POSTGRES_USER:-netbox}
+      NETBOX_DB_PASSWORD: ${POSTGRES_PASSWORD:-netbox}
+      NETBOX_DB_PORT: ${NETBOX_DB_PORT:-5432}
+      NETBOX_REDIS_HOST: redis
+      NETBOX_REDIS_PORT: ${NETBOX_REDIS_PORT:-6379}
+      NETBOX_REDIS_PASSWORD: ${NETBOX_REDIS_PASSWORD:-}
+      NETBOX_HTTP_PORT: ${NETBOX_HTTP_PORT:-8080}
+      NETBOX_BIND_ADDRESS: ${NETBOX_BIND_ADDRESS:-0.0.0.0}
+      NETBOX_DEBUG: ${NETBOX_DEBUG:-false}
+      NETBOX_CSRF_TRUSTED_ORIGINS: ${NETBOX_CSRF_TRUSTED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-3}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-3}
+      NETBOX_CREATE_SUPERUSER: ${NETBOX_CREATE_SUPERUSER:-0}
+      NETBOX_SUPERUSER_NAME: ${NETBOX_SUPERUSER_NAME:-admin}
+      NETBOX_SUPERUSER_EMAIL: ${NETBOX_SUPERUSER_EMAIL:-admin@example.com}
+      NETBOX_SUPERUSER_PASSWORD: ${NETBOX_SUPERUSER_PASSWORD:-}
+    volumes:
+      - netbox-static:/opt/netbox/app/static
+      - netbox-media:/opt/netbox/app/media
+    ports:
+      - "${NETBOX_PUBLISH_PORT:-8080}:8080"
+    command: ['web']
+    healthcheck:
+      test:
+        [
+          'CMD',
+          '/opt/netbox/venv/bin/python',
+          '-c',
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/login/', timeout=5).read(64)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  netbox-worker:
+    image: ${NETBOX_IMAGE:-netbox-plus:local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Web runs migrate once; worker starts after DB schema exists and Gunicorn is up.
+      netbox:
+        condition: service_healthy
+    environment:
+      NETBOX_CONFIGURATION: netbox.configuration_docker
+      NETBOX_SECRET_KEY: ${NETBOX_SECRET_KEY:?Set NETBOX_SECRET_KEY in .env}
+      NETBOX_ALLOWED_HOSTS: ${NETBOX_ALLOWED_HOSTS:-*}
+      NETBOX_DB_HOST: postgres
+      NETBOX_DB_NAME: ${POSTGRES_DB:-netbox}
+      NETBOX_DB_USER: ${POSTGRES_USER:-netbox}
+      NETBOX_DB_PASSWORD: ${POSTGRES_PASSWORD:-netbox}
+      NETBOX_DB_PORT: ${NETBOX_DB_PORT:-5432}
+      NETBOX_REDIS_HOST: redis
+      NETBOX_REDIS_PORT: ${NETBOX_REDIS_PORT:-6379}
+      NETBOX_REDIS_PASSWORD: ${NETBOX_REDIS_PASSWORD:-}
+    volumes:
+      - netbox-static:/opt/netbox/app/static
+      - netbox-media:/opt/netbox/app/media
+    command: ['worker']
+
+volumes:
+  postgres-data:
+  redis-data:
+  netbox-static:
+  netbox-media:

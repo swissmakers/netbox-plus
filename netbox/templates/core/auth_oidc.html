@@ -1,0 +1,84 @@
+{% extends 'generic/_base.html' %}
+{% load i18n form_helpers %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+  {% if env_overrides.key or env_overrides.secret %}
+    <div class="alert alert-warning mt-4" role="alert">
+      {% trans "OIDC environment overrides are active. Fields backed by NETBOX_OIDC_KEY / NETBOX_OIDC_SECRET are read-only in the UI; runtime uses environment values." %}
+    </div>
+  {% endif %}
+  <form method="post" class="object-edit mt-4" id="enterprise-oidc-form" action="">
+    {% csrf_token %}
+    <div id="form_fields">
+      {% include 'htmx/form.html' %}
+    </div>
+
+    <div class="card border mt-4 mb-3">
+      <div class="card-header fw-semibold">{% trans "Test discovery" %}</div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          {% trans "Uses the OIDC issuer URL currently in this form. No save required." %}
+        </p>
+        <button type="button" class="btn btn-outline-primary" id="btn-test-oidc">
+          {% trans "Test OIDC discovery" %}
+        </button>
+        <pre id="oidc-test-result" class="small mt-3 mb-0 p-3 rounded border bg-body-secondary text-body" style="white-space:pre-wrap;min-height:3rem;font-family:var(--tblr-font-monospace);" aria-live="polite"></pre>
+      </div>
+    </div>
+
+    <div class="btn-float-group-right pb-5">
+      <a href="{{ return_url }}" class="btn btn-outline-secondary btn-float">{% trans "Cancel" %}</a>
+      <button type="submit" class="btn btn-primary">{% trans "Save" %}</button>
+    </div>
+  </form>
+
+  <script>
+  (function() {
+    const btn = document.getElementById('btn-test-oidc');
+    const out = document.getElementById('oidc-test-result');
+    const form = document.getElementById('enterprise-oidc-form');
+    if (!btn || !form) return;
+    function getCookie(name) {
+      const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
+      return v ? decodeURIComponent(v[2]) : '';
+    }
+    function formatOidcResult(j) {
+      const lines = [];
+      if (j.detail) lines.push(j.detail);
+      if (j.steps && j.steps.length) {
+        j.steps.forEach(function(s) {
+          const mark = s.status === 'error' ? '[!] ' : (s.status === 'skip' ? '[-] ' : '[+] ');
+          lines.push(mark + s.label + ': ' + s.message);
+        });
+      }
+      if (!j.ok && j.error) lines.push('Error: ' + j.error);
+      return lines.join('\n');
+    }
+    btn.addEventListener('click', function() {
+      out.textContent = '';
+      out.className = 'small mt-3 mb-0 p-3 rounded border bg-body-secondary text-body';
+      const fd = new FormData(form);
+      fetch('{% url "core:auth_oidc_test" %}', {
+        method: 'POST',
+        headers: {'X-CSRFToken': getCookie('csrftoken')},
+        body: fd,
+        credentials: 'same-origin',
+      }).then(function(r) { return r.json().then(function(j) { return {ok: r.ok, j: j}; }); })
+        .then(function(res) {
+          out.textContent = formatOidcResult(res.j);
+          if (res.j.ok) {
+            out.classList.add('border-success', 'text-success');
+          } else {
+            out.classList.add('border-danger', 'text-danger');
+          }
+        })
+        .catch(function(e) {
+          out.textContent = String(e);
+          out.classList.add('border-danger', 'text-danger');
+        });
+    });
+  })();
+  </script>
+{% endblock %}

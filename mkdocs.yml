@@ -1,8 +1,8 @@
 site_name: NetBox Documentation
 site_dir: netbox/project-static/docs
-site_url: https://docs.netbox.dev/
-repo_name: netbox-community/netbox
-repo_url: https://github.com/netbox-community/netbox
+site_url: https://swissmakers.ch/netbox-plus
+repo_name: swissmakers/netbox-plus
+repo_url: https://github.com/swissmakers/netbox-plus
 theme:
   name: material
   custom_dir: docs/_theme/
@@ -42,9 +42,7 @@ extra:
   build_public: !ENV BUILD_PUBLIC
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/netbox-community/netbox
-    - icon: fontawesome/brands/slack
-      link: https://netdev.chat/
+      link: https://github.com/swissmakers/netbox-plus
 extra_css:
     - extra.css
 markdown_extensions:
@@ -163,6 +161,7 @@ nav:
     - Administration:
         - Authentication:
             - Overview: 'administration/authentication/overview.md'
+            - Enterprise authentication UI: 'administration/authentication/enterprise-auth.md'
             - Google: 'administration/authentication/google.md'
             - Microsoft Entra ID: 'administration/authentication/microsoft-entra-id.md'
             - Okta: 'administration/authentication/okta.md'

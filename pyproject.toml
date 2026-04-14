@@ -2,15 +2,16 @@
 # https://www.python.org/dev/peps/pep-0518/
 
 [project]
-name = "netbox"
-version = "4.5.7"
+name = "netbox plus"
+version = "4.5.8"
 requires-python = ">=3.12"
 description = "The premier source of truth powering network automation."
 readme = "README.md"
-license = "Apache-2.0"
+license = "GPL-3.0-only"
 license-files = ["LICENSE.txt"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Framework :: Django",
     "Natural Language :: English",
     "Programming Language :: Python",
@@ -21,10 +22,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://netboxlabs.com/products/netbox/"
+Homepage = "https://github.com/swissmakers/netbox-plus"
 Documentation = "https://netboxlabs.com/docs/netbox/"
-Source = "https://github.com/netbox-community/netbox"
-Issues = "https://github.com/netbox-community/netbox/issues"
+Source = "https://github.com/swissmakers/netbox-plus"
+Issues = "https://github.com/swissmakers/netbox-plus/issues"
 
 [tool.black]
 line-length = 120

@@ -19,11 +19,78 @@ from utilities.request import apply_request_processors
 
 __all__ = (
     'CoreMiddleware',
+    'EnterpriseAuthMiddleware',
     'MaintenanceModeMiddleware',
     'PrometheusAfterMiddleware',
     'PrometheusBeforeMiddleware',
     'RemoteUserMiddleware',
 )
+
+
+class EnterpriseAuthMiddleware:
+    """
+    Apply OpenID Connect settings and optional authentication backends from
+    dynamic configuration (ENTERPRISE_AUTH) for each request.
+
+    LDAP is prepended before OIDC so ``authenticate(username, password)`` tries LDAP first;
+    OIDC sign-in remains the SSO redirect flow on the login page. ``ObjectPermissionBackend``
+    (local users) stays last in ``NETBOX_AUTHENTICATION_BACKENDS_BASE``.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        self._apply_enterprise_auth()
+        return self.get_response(request)
+
+    @staticmethod
+    def _apply_enterprise_auth():
+        from netbox.config.enterprise_auth import (
+            LDAP_BACKEND_PATH,
+            OIDC_BACKEND_PATH,
+            get_enterprise_auth,
+            oidc_key_resolved,
+            oidc_secret_resolved,
+        )
+
+        if not hasattr(settings, 'NETBOX_AUTHENTICATION_BACKENDS_BASE'):
+            return
+
+        try:
+            cfg = get_enterprise_auth(getattr(get_config(), 'ENTERPRISE_AUTH', None))
+        except Exception:
+            cfg = get_enterprise_auth({})
+
+        base = list(settings.NETBOX_AUTHENTICATION_BACKENDS_BASE)
+        obj_perm = 'netbox.authentication.ObjectPermissionBackend'
+        if obj_perm in base:
+            split_at = base.index(obj_perm)
+            head, tail = base[:split_at], base[split_at:]
+        else:
+            head, tail = base, []
+
+        new_head = list(head)
+        # LDAP before OIDC so username/password login tries LDAP first; OIDC remains SSO button flow.
+        to_prepend = []
+        ldap = cfg.get('ldap') or {}
+        if ldap.get('enabled') and LDAP_BACKEND_PATH not in new_head:
+            to_prepend.append(LDAP_BACKEND_PATH)
+
+        oidc = cfg.get('oidc') or {}
+        if oidc.get('enabled') and OIDC_BACKEND_PATH not in new_head:
+            setattr(settings, 'SOCIAL_AUTH_OIDC_OIDC_ENDPOINT', (oidc.get('oidc_endpoint') or '').rstrip('/'))
+            setattr(settings, 'SOCIAL_AUTH_OIDC_KEY', oidc_key_resolved(oidc))
+            setattr(settings, 'SOCIAL_AUTH_OIDC_SECRET', oidc_secret_resolved(oidc))
+            setattr(
+                settings,
+                'SOCIAL_AUTH_OIDC_USERNAME_KEY',
+                (oidc.get('username_key') or 'preferred_username').strip() or 'preferred_username',
+            )
+            to_prepend.append(OIDC_BACKEND_PATH)
+
+        new_head = to_prepend + [b for b in new_head if b not in to_prepend]
+        settings.AUTHENTICATION_BACKENDS = tuple(new_head + list(tail))
 
 
 class CoreMiddleware:

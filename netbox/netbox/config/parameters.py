@@ -1,6 +1,10 @@
+from copy import deepcopy
+
 from django import forms
 from django.contrib.postgres.forms import SimpleArrayField
 from django.utils.translation import gettext_lazy as _
+
+from netbox.config.enterprise_auth import ENTERPRISE_AUTH_DEFAULT
 
 
 class ConfigParam:
@@ -218,6 +222,23 @@ PARAMS = (
         label=_('Maps URL'),
         default='https://maps.google.com/?q=',
         description=_("Base URL for mapping geographic locations")
+    ),
+
+    # Enterprise authentication (NetBox Plus): LDAP / OpenID Connect via dynamic config.
+    # Precedence: netbox/ldap_config.py overrides UI values when present. OIDC keys from the UI
+    # are applied at request time unless also defined in configuration.py (see middleware).
+    ConfigParam(
+        name='ENTERPRISE_AUTH',
+        label=_('Enterprise authentication (LDAP / OIDC)'),
+        default=deepcopy(ENTERPRISE_AUTH_DEFAULT),
+        description=_(
+            'Structured settings for LDAP and OpenID Connect. Edit via Admin → Authentication → LDAP / OIDC. '
+            'Secrets may be overridden with environment variables NETBOX_LDAP_BIND_PASSWORD and NETBOX_OIDC_SECRET.'
+        ),
+        field=forms.JSONField,
+        field_kwargs={
+            'widget': forms.Textarea(attrs={'class': 'font-monospace', 'rows': 28}),
+        },
     ),
 
 )

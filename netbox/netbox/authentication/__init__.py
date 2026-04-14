@@ -1,3 +1,4 @@
+import importlib
 import logging
 from collections import defaultdict
 
@@ -322,7 +323,28 @@ try:
     _LDAPUser._mirror_groups = _mirror_groups
 
 except ModuleNotFoundError:
-    pass
+    NBLDAPBackend = None
+
+
+def _apply_ldap_tls_options(ldap_mod, ignore_cert_errors, ca_cert_dir, ca_cert_file):
+    """
+    Apply LDAP TLS options at module scope.
+
+    OpenLDAP may cache TLS context; force NEWCTX so updated certificate options
+    (for example OPT_X_TLS_REQUIRE_CERT=NEVER) are honored for subsequent
+    connections in this worker.
+    """
+    if ignore_cert_errors:
+        ldap_mod.set_option(ldap_mod.OPT_X_TLS_REQUIRE_CERT, ldap_mod.OPT_X_TLS_NEVER)
+    if ca_cert_dir:
+        ldap_mod.set_option(ldap_mod.OPT_X_TLS_CACERTDIR, ca_cert_dir)
+    if ca_cert_file:
+        ldap_mod.set_option(ldap_mod.OPT_X_TLS_CACERTFILE, ca_cert_file)
+    try:
+        ldap_mod.set_option(ldap_mod.OPT_X_TLS_NEWCTX, 0)
+    except Exception:
+        # Some python-ldap/OpenLDAP builds may not expose OPT_X_TLS_NEWCTX.
+        pass
 
 
 class LDAPBackend:
@@ -338,43 +360,60 @@ class LDAPBackend:
                 )
             raise e
 
-        try:
-            from netbox import ldap_config
-        except ModuleNotFoundError as e:
-            if getattr(e, 'name') == 'ldap_config':
-                raise ImproperlyConfigured(
-                    "LDAP configuration file not found: Check that ldap_config.py has been created alongside "
-                    "configuration.py."
-                )
-            raise e
-
-        try:
-            getattr(ldap_config, 'AUTH_LDAP_SERVER_URI')
-        except AttributeError:
+        if NBLDAPBackend is None:
             raise ImproperlyConfigured(
-                "Required parameter AUTH_LDAP_SERVER_URI is missing from ldap_config.py."
+                "LDAP authentication has been configured, but django-auth-ldap is not installed."
+            )
+
+        ldap_config = None
+        try:
+            ldap_config = importlib.import_module('netbox.ldap_config')
+        except (ImportError, ModuleNotFoundError, OSError):
+            ldap_config = None
+
+        if ldap_config is not None and getattr(ldap_config, 'AUTH_LDAP_SERVER_URI', None):
+            obj = NBLDAPBackend()
+
+            # Read LDAP configuration parameters from ldap_config.py instead of settings.py
+            ldap_settings = LDAPSettings()
+            for param in dir(ldap_config):
+                if param.startswith(ldap_settings._prefix):
+                    setattr(ldap_settings, param[10:], getattr(ldap_config, param))
+            obj.settings = ldap_settings
+
+            _apply_ldap_tls_options(
+                ldap,
+                getattr(ldap_config, 'LDAP_IGNORE_CERT_ERRORS', False),
+                getattr(ldap_config, 'LDAP_CA_CERT_DIR', None),
+                getattr(ldap_config, 'LDAP_CA_CERT_FILE', None),
+            )
+
+            return obj
+
+        # Fall back to NetBox Plus dynamic configuration (no ldap_config.py, or file present but missing server URI)
+        from netbox.authentication.enterprise_ldap import build_ldap_settings_from_dict
+        from netbox.config import get_config
+        from netbox.config.enterprise_auth import get_enterprise_auth
+
+        enterprise = get_enterprise_auth(getattr(get_config(), 'ENTERPRISE_AUTH', None))
+        ldap_cfg = enterprise.get('ldap') or {}
+        if not ldap_cfg.get('enabled'):
+            raise ImproperlyConfigured(
+                "LDAP authentication is enabled in REMOTE_AUTH_BACKEND, but no ldap_config.py was found and "
+                "enterprise LDAP is disabled in the dynamic configuration (Admin > Authentication > "
+                "LDAP / OIDC, or ENTERPRISE_AUTH.ldap.enabled)."
             )
 
         obj = NBLDAPBackend()
+        ldap_settings = build_ldap_settings_from_dict(ldap_cfg)
+        obj.settings = ldap_settings
 
-        # Read LDAP configuration parameters from ldap_config.py instead of settings.py
-        settings = LDAPSettings()
-        for param in dir(ldap_config):
-            if param.startswith(settings._prefix):
-                setattr(settings, param[10:], getattr(ldap_config, param))
-        obj.settings = settings
-
-        # Optionally disable strict certificate checking
-        if getattr(ldap_config, 'LDAP_IGNORE_CERT_ERRORS', False):
-            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
-
-        # Optionally set CA cert directory
-        if ca_cert_dir := getattr(ldap_config, 'LDAP_CA_CERT_DIR', None):
-            ldap.set_option(ldap.OPT_X_TLS_CACERTDIR, ca_cert_dir)
-
-        # Optionally set CA cert file
-        if ca_cert_file := getattr(ldap_config, 'LDAP_CA_CERT_FILE', None):
-            ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
+        _apply_ldap_tls_options(
+            ldap,
+            getattr(ldap_settings, '_netbox_ignore_cert_errors', False),
+            getattr(ldap_settings, '_netbox_ca_cert_dir', None),
+            getattr(ldap_settings, '_netbox_ca_cert_file', None),
+        )
 
         return obj
 

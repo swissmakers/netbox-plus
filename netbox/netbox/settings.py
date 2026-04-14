@@ -95,6 +95,8 @@ DATABASE = getattr(configuration, 'DATABASE', None)  # Legacy DB definition
 DATABASE_ROUTERS = getattr(configuration, 'DATABASE_ROUTERS', [])
 DATABASES = getattr(configuration, 'DATABASES', {'default': DATABASE})
 DEBUG = getattr(configuration, 'DEBUG', False)
+if os.environ.get('NETBOX_DEBUG', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+    DEBUG = True
 DEFAULT_DASHBOARD = getattr(configuration, 'DEFAULT_DASHBOARD', None)
 DEFAULT_PERMISSIONS = getattr(configuration, 'DEFAULT_PERMISSIONS', {
     # Permit users to manage their own bookmarks
@@ -232,7 +234,7 @@ if RELEASE_CHECK_URL:
         URLValidator()(RELEASE_CHECK_URL)
     except ValidationError:
         raise ImproperlyConfigured(
-            "RELEASE_CHECK_URL must be a valid URL. Example: https://api.github.com/repos/netbox-community/netbox"
+            "RELEASE_CHECK_URL must be a valid URL. Example: https://api.github.com/repos/swissmakers/netbox-plus"
         )
 
 # Validate configured proxy routers
@@ -474,6 +476,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.locale.LocaleMiddleware',
+    'netbox.middleware.EnterpriseAuthMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -540,6 +543,8 @@ AUTHENTICATION_BACKENDS = [
     *REMOTE_AUTH_BACKEND,
     'netbox.authentication.ObjectPermissionBackend',
 ]
+# Preserved for NetBox Plus enterprise auth middleware (prepend OIDC/LDAP from dynamic config without dropping this).
+NETBOX_AUTHENTICATION_BACKENDS_BASE = tuple(AUTHENTICATION_BACKENDS)
 
 # Use our custom User model
 AUTH_USER_MODEL = 'users.User'
@@ -569,6 +574,10 @@ STATICFILES_DIRS = (
     os.path.join(BASE_DIR, 'project-static', 'js'),
     ('docs', os.path.join(BASE_DIR, 'project-static', 'docs')),  # Prefix with /docs
 )
+
+# When True, Django serves collected static files from STATIC_ROOT (e.g. Gunicorn-only Docker). Reverse proxies
+# should set this to False and alias STATIC_URL to STATIC_ROOT instead.
+SERVE_STATIC_IN_APP = getattr(configuration, 'SERVE_STATIC_IN_APP', False)
 
 # Media URL
 MEDIA_URL = f'/{BASE_PATH}media/'
@@ -755,7 +764,10 @@ REST_FRAMEWORK = {
 
 SPECTACULAR_SETTINGS = {
     'TITLE': 'NetBox REST API',
-    'LICENSE': {'name': 'Apache v2 License'},
+    'LICENSE': {
+        'name': 'GNU General Public License v3.0',
+        'url': 'https://www.gnu.org/licenses/gpl-3.0.html',
+    },
     'VERSION': RELEASE.full_version,
     'COMPONENT_SPLIT_REQUEST': True,
     'REDOC_DIST': 'SIDECAR',

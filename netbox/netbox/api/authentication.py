@@ -104,7 +104,12 @@ class TokenAuthentication(BaseAuthentication):
         user = token.user
 
         # When LDAP authentication is active try to load user data from LDAP directory
-        if 'netbox.authentication.LDAPBackend' in settings.REMOTE_AUTH_BACKEND:
+        remote = settings.REMOTE_AUTH_BACKEND
+        if isinstance(remote, str):
+            remote = [remote]
+        ldap_in_remote = 'netbox.authentication.LDAPBackend' in remote
+        ldap_in_backends = 'netbox.authentication.LDAPBackend' in settings.AUTHENTICATION_BACKENDS
+        if ldap_in_remote or ldap_in_backends:
             from netbox.authentication import LDAPBackend
             ldap_backend = LDAPBackend()
 

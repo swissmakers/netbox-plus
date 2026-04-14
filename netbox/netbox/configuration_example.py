@@ -124,6 +124,8 @@ CSRF_COOKIE_NAME = 'csrftoken'
 # sensitive information about your installation. Only enable debugging while performing testing. Never enable debugging
 # on a production system.
 DEBUG = False
+# You may also set the environment variable NETBOX_DEBUG to 1/true/yes/on to force DEBUG=True after this module loads
+# (works with any configuration module, including netbox.configuration_docker).
 
 # Set the default preferred language/locale
 DEFAULT_LANGUAGE = 'en-us'
@@ -212,7 +214,7 @@ REMOTE_AUTH_DEFAULT_PERMISSIONS = {}
 # This repository is used to check whether there is a new release of NetBox available. Set to None to disable the
 # version check or use the URL below to check for release in the official NetBox repository.
 RELEASE_CHECK_URL = None
-# RELEASE_CHECK_URL = 'https://api.github.com/repos/netbox-community/netbox/releases'
+# RELEASE_CHECK_URL = 'https://api.github.com/repos/swissmakers/netbox-plus/releases'
 
 # The file path where custom reports will be stored. A trailing slash is not needed. Note that the default value of
 # this setting is derived from the installed location.

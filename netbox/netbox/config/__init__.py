@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 
 from django.conf import settings
@@ -75,6 +76,12 @@ class Config:
 
     def _populate_from_db(self):
         """Cache data from latest ConfigRevision, then populate from cache"""
+        # Avoid querying before migrations exist (e.g. manage.py migrate); reduces PostgreSQL
+        # "relation does not exist" noise. Docker entrypoint sets this only for migrate.
+        if os.environ.get('NETBOX_SKIP_DB_CONFIG', '').lower() in ('1', 'true', 'yes'):
+            logger.debug('Skipping config DB load (NETBOX_SKIP_DB_CONFIG is set)')
+            return
+
         from core.models import ConfigRevision
 
         try:

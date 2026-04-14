@@ -1,4 +1,6 @@
+import tempfile
 import urllib.parse
+from pathlib import Path
 
 from django.test import Client, override_settings
 from django.urls import reverse
@@ -91,4 +93,22 @@ class MediaViewTestCase(TestCase):
         response = Client().get(url)
 
         # Unauthenticated request should return a 404 (not found)
+        self.assertHttpStatus(response, 404)
+
+
+class ServeStaticInAppTestCase(TestCase):
+
+    def test_static_served_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'probe.txt').write_text('ok', encoding='utf-8')
+            with override_settings(SERVE_STATIC_IN_APP=True, STATIC_ROOT=tmp):
+                response = Client().get('/static/probe.txt')
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(response.content, b'ok')
+
+    def test_static_not_served_when_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, 'probe.txt').write_text('ok', encoding='utf-8')
+            with override_settings(SERVE_STATIC_IN_APP=False, STATIC_ROOT=tmp):
+                response = Client().get('/static/probe.txt')
         self.assertHttpStatus(response, 404)

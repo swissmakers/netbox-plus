@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.conf.urls import include
+from django.http import Http404
 from django.urls import path
+from django.views.static import serve
 from django.views.decorators.cache import cache_page
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
@@ -10,6 +12,17 @@ from netbox.graphql.schema import schema
 from netbox.graphql.views import NetBoxGraphQLView
 from netbox.plugins.urls import plugin_api_patterns, plugin_patterns
 from netbox.views import HomeView, MediaView, SearchView, StaticMediaFailureView, htmx
+
+
+def _serve_static_if_enabled(request, path):
+    """
+    Serve collected static files when SERVE_STATIC_IN_APP is set (no nginx in front). Otherwise behave as if the
+    route did not exist so reverse proxies can own STATIC_URL.
+    """
+    if not getattr(settings, 'SERVE_STATIC_IN_APP', False):
+        raise Http404()
+    return serve(request, path, document_root=settings.STATIC_ROOT)
+
 
 _patterns = [
 
@@ -87,9 +100,13 @@ if settings.DEBUG:
 if settings.METRICS_ENABLED:
     _patterns.append(path('', include('django_prometheus.urls')))
 
+# Collected static (see SERVE_STATIC_IN_APP); listed before BASE_PATH so it matches STATIC_URL when BASE_PATH is set.
+_static_route = f"{settings.STATIC_URL.strip('/')}/<path:path>"
+
 # Prepend BASE_PATH
 urlpatterns = [
-    path(settings.BASE_PATH, include(_patterns))
+    path(_static_route, _serve_static_if_enabled),
+    path(settings.BASE_PATH, include(_patterns)),
 ]
 
 handler404 = 'netbox.views.errors.handler_404'

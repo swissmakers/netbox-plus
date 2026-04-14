@@ -1,7 +1,8 @@
 {
   "compilerOptions": {
     "forceConsistentCasingInFileNames": true,
-    // Needed for tom-select/src/vanilla.ts
+    "noEmit": true,
+    // Needed for tom-select/src/vanilla.ts (requires noEmit or emitDeclarationOnly)
     "allowImportingTsExtensions": true,
     "allowSyntheticDefaultImports": true,
     "moduleResolution": "node",

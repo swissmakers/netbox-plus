@@ -2,6 +2,9 @@
 
 This guide explains how to implement LDAP authentication using an external server. User authentication will fall back to built-in Django users in the event of a failure.
 
+!!! info "NetBox Plus"
+    In NetBox Plus, **Admin → Authentication → LDAP / OIDC** is the primary way to manage persistent LDAP/OIDC configuration in the database. `ldap_config.py` remains available only as a legacy compatibility fallback. See [Enterprise authentication UI](../administration/authentication/enterprise-auth.md).
+
 ## Install Requirements
 
 ### Install System Packages

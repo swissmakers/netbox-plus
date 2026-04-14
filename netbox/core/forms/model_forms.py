@@ -9,6 +9,7 @@ from django.utils.translation import gettext_lazy as _
 from core.forms.mixins import SyncedDataMixin
 from core.models import *
 from netbox.config import PARAMS, get_config
+from netbox.config.enterprise_auth import get_enterprise_auth
 from netbox.forms import NetBoxModelForm, PrimaryModelForm
 from netbox.registry import registry
 from netbox.utils import get_data_backend_choices
@@ -226,6 +227,11 @@ class ConfigRevisionForm(forms.ModelForm, metaclass=ConfigFormMetaclass):
 
         # Populate JSON data on the instance
         instance.data = self.render_json()
+        # ENTERPRISE_AUTH is edited on Admin → LDAP / OIDC
+        if 'ENTERPRISE_AUTH' not in instance.data:
+            instance.data['ENTERPRISE_AUTH'] = get_enterprise_auth(
+                getattr(get_config(), 'ENTERPRISE_AUTH', None)
+            )
 
         if commit:
             instance.save()

@@ -27,10 +27,10 @@ This documentation provides two options for installing NetBox: from a downloadab
 
 ### Option A: Download a Release Archive
 
-Download the [latest stable release](https://github.com/netbox-community/netbox/releases) from GitHub as a tarball or ZIP archive and extract it to your desired path. In this example, we'll use `/opt/netbox` as the NetBox root.
+Download the [latest stable release](https://github.com/swissmakers/netbox-plus/releases) from GitHub as a tarball or ZIP archive and extract it to your desired path. In this example, we'll use `/opt/netbox` as the NetBox root.
 
 ```no-highlight
-sudo wget https://github.com/netbox-community/netbox/archive/refs/tags/vX.Y.Z.tar.gz
+sudo wget https://github.com/swissmakers/netbox-plus/archive/refs/tags/vX.Y.Z.tar.gz
 sudo tar -xzf vX.Y.Z.tar.gz -C /opt
 sudo ln -s /opt/netbox-X.Y.Z/ /opt/netbox
 ```
@@ -56,7 +56,7 @@ sudo apt install -y git
 Next, clone the git repository:
 
 ```no-highlight
-sudo git clone https://github.com/netbox-community/netbox.git .
+sudo git clone https://github.com/swissmakers/netbox-plus.git .
 ```
 
 This command should generate output similar to the following:
@@ -71,7 +71,7 @@ Receiving objects: 100% (148317/148317), 165.12 MiB | 28.71 MiB/s, done.
 Resolving deltas: 100% (116428/116428), done.
 ```
 
-Finally, check out the tag for the desired release. You can find these on our [releases page](https://github.com/netbox-community/netbox/releases). Replace `vX.Y.Z` with your selected release tag below.
+Finally, check out the tag for the desired release. You can find these on our [releases page](https://github.com/swissmakers/netbox-plus/releases). Replace `vX.Y.Z` with your selected release tag below.
 
 ```
 sudo git checkout vX.Y.Z

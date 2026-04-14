@@ -11,7 +11,7 @@ Getting started with NetBox development is pretty straightforward, and should fe
 
 ### 1. Fork the Repo
 
-Assuming you'll be working on your own fork, your first step will be to fork the [official git repository](https://github.com/netbox-community/netbox). (If you're a maintainer who's going to be working directly with the official repo, skip this step.) Click the "fork" button at top right (be sure that you've logged into GitHub first).
+Assuming you'll be working on your own fork, your first step will be to fork the [official git repository](https://github.com/swissmakers/netbox-plus). (If you're a maintainer who's going to be working directly with the official repo, skip this step.) Click the "fork" button at top right (be sure that you've logged into GitHub first).
 
 ![GitHub fork button](../media/development/github_fork_button.png)
 
@@ -195,7 +195,7 @@ git commit -m "Closes #1234: Add IPv5 support"
 git push origin
 ```
 
-Once your fork has the new commit, submit a [pull request](https://github.com/netbox-community/netbox/compare) to the NetBox repo to propose the changes. Be sure to provide a detailed accounting of the changes being made and the reasons for doing so.
+Once your fork has the new commit, submit a [pull request](https://github.com/swissmakers/netbox-plus/compare) to the NetBox repo to propose the changes. Be sure to provide a detailed accounting of the changes being made and the reasons for doing so.
 
 Once submitted, a maintainer will review your pull request and either merge it or request changes. If changes are needed, you can make them via new commits to your fork: The pull request will update automatically.
 

@@ -1,5 +1,8 @@
 # Authentication
 
+!!! tip "NetBox Plus enterprise UI"
+    NetBox Plus can configure LDAP and OpenID Connect under **Admin → Authentication → LDAP / OIDC**. See [Enterprise authentication UI](enterprise-auth.md).
+
 ## Local Authentication
 
 Local user accounts and groups can be created in NetBox under the "Authentication" section in the "Admin" menu.

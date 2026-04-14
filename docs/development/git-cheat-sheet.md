@@ -13,7 +13,7 @@ git clone https://github.com/$org-name/$repo-name
 ```
 
 ``` title="Example"
-$ git clone https://github.com/netbox-community/netbox
+$ git clone https://github.com/swissmakers/netbox-plus
 Cloning into 'netbox'...
 remote: Enumerating objects: 95112, done.
 remote: Counting objects: 100% (682/682), done.
@@ -37,7 +37,7 @@ remote: Enumerating objects: 1, done.
 remote: Counting objects: 100% (1/1), done.
 remote: Total 1 (delta 0), reused 0 (delta 0), pack-reused 0
 Unpacking objects: 100% (1/1), done.
-From https://github.com/netbox-community/netbox
+From https://github.com/swissmakers/netbox-plus
    28bc76695..e0741cc9a  develop    -> origin/develop
 Updating 28bc76695..e0741cc9a
 Fast-forward
@@ -196,7 +196,7 @@ index 93e125079..4344fb514 100644
 +and here too
 +
  <div align="center">
-   <img src="https://raw.githubusercontent.com/netbox-community/netbox/main/docs/netbox_logo.svg" width="400" alt="NetBox logo" />
+   <img src="https://raw.githubusercontent.com/swissmakers/netbox-plus/main/docs/netbox_logo.svg" width="400" alt="NetBox logo" />
  </div>
 diff --git a/foo.py b/foo.py
 new file mode 100644
@@ -239,9 +239,9 @@ Total 3 (delta 2), reused 0 (delta 0)
 remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
 remote: 
 remote: Create a pull request for 'testing' on GitHub by visiting:
-remote:      https://github.com/netbox-community/netbox/pull/new/testing
+remote:      https://github.com/swissmakers/netbox-plus/pull/new/testing
 remote: 
-To https://github.com/netbox-community/netbox
+To https://github.com/swissmakers/netbox-plus
  * [new branch]          testing -> testing
 Branch 'testing' set up to track remote branch 'testing' from 'origin'.
 ```
@@ -268,7 +268,7 @@ gh pr list
 ``` title="Example"
 $ gh pr list
 
-Showing 3 of 3 open pull requests in netbox-community/netbox
+Showing 3 of 3 open pull requests in swissmakers/netbox-plus
 
 #10223  #7503 API Bulk-Create of Devices does not check Rack-Space  7503-bulkdevice             about 17 hours ago
 #9716   Closes #9599: Add cursor pagination mode                    lyuyangh:cursor-pagination  about 1 month ago
@@ -347,9 +347,9 @@ If a change has been pushed to the upstream branch since you most recently pulle
 
 ```
 $ git push
-To https://github.com/netbox-community/netbox.git
+To https://github.com/swissmakers/netbox-plus.git
  ! [rejected]            develop -> develop (fetch first)
-error: failed to push some refs to 'https://github.com/netbox-community/netbox.git'
+error: failed to push some refs to 'https://github.com/swissmakers/netbox-plus.git'
 hint: Updates were rejected because the remote contains work that you do
 hint: not have locally. This is usually caused by another repository pushing
 hint: to the same ref. You may want to first integrate the remote changes
@@ -370,7 +370,7 @@ remote: Enumerating objects: 1, done.
 remote: Counting objects: 100% (1/1), done.
 remote: Total 1 (delta 0), reused 0 (delta 0), pack-reused 0
 Unpacking objects: 100% (1/1), done.
-From https://github.com/netbox-community/netbox
+From https://github.com/swissmakers/netbox-plus
    815b2d8a2..8c35ebbb7  develop    -> origin/develop
 $ git rebase origin/develop
 First, rewinding head to replay your work on top of it...
@@ -383,6 +383,6 @@ Compressing objects: 100% (9/9), done.
 Writing objects: 100% (9/9), 1.02 KiB | 1.02 MiB/s, done.
 Total 9 (delta 6), reused 0 (delta 0)
 remote: Resolving deltas: 100% (6/6), completed with 5 local objects.
-To https://github.com/netbox-community/netbox.git
+To https://github.com/swissmakers/netbox-plus.git
    8c35ebbb7..ada745324  develop -> develop
 ```

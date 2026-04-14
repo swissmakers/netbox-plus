@@ -25,7 +25,7 @@ These version constraints are added to `base_requirements.txt` to ensure that ne
 
 ### Close the Release Milestone
 
-Close the [release milestone](https://github.com/netbox-community/netbox/milestones) on GitHub after ensuring there are no remaining open issues associated with it.
+Close the [release milestone](https://github.com/swissmakers/netbox-plus/milestones) on GitHub after ensuring there are no remaining open issues associated with it.
 
 ### Update the Release Notes
 
@@ -89,7 +89,7 @@ git checkout -B release-vX.Y.Z
 
 ### Notify netbox-docker Project of Any Relevant Changes
 
-Notify the [`netbox-docker`](https://github.com/netbox-community/netbox-docker) maintainers (in **#netbox-docker**) of any changes that may be relevant to their build process, including:
+Notify the [`netbox-docker`](https://github.com/swissmakers/netbox-plus-docker) maintainers (in **#netbox-docker**) of any changes that may be relevant to their build process, including:
 
 * Significant changes to `upgrade.sh`
 * Increases in minimum versions for service dependencies (PostgreSQL, Redis, etc.)
@@ -187,7 +187,7 @@ Once CI has completed and a colleague has reviewed the PR, merge it. This effect
 
 ### Create a New Release
 
-Create a [new release](https://github.com/netbox-community/netbox/releases/new) on GitHub with the following parameters.
+Create a [new release](https://github.com/swissmakers/netbox-plus/releases/new) on GitHub with the following parameters.
 
 * **Tag:** Current version (e.g. `v4.2.1`)
 * **Target:** `main`

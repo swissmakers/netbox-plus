@@ -42,7 +42,7 @@ In addition to its expansive and robust data model, NetBox offers myriad mechani
 Because NetBox is an open source application licensed under [Apache 2](https://www.apache.org/licenses/LICENSE-2.0.html), its entire code base is completely accessible to the end user, and there's never a risk of vendor lock-in. Additionally, NetBox development is an entirely public, community-driven process to which everyone can provide input.
 
 !!! tip "NetBox Development"
-    Interested in contributing to NetBox? Check out our [GitHub repository](https://github.com/netbox-community/netbox) to get started!
+    Interested in contributing to NetBox? Check out our [GitHub repository](https://github.com/swissmakers/netbox-plus) to get started!
 
 ## :material-language-python: Powered by Python
 
@@ -52,5 +52,3 @@ NetBox is built on the enormously popular [Django](http://www.djangoproject.com/
 
 * Try out our [public demo](https://demo.netbox.dev/) if you want to jump right in
 * The [installation guide](./installation/index.md) will help you get your own deployment up and running
-* Or try the community [Docker image](https://github.com/netbox-community/netbox-docker) for a low-touch approach
-* [NetBox Cloud](https://netboxlabs.com/netbox-cloud) is a managed solution offered by [NetBox Labs](https://netboxlabs.com/)

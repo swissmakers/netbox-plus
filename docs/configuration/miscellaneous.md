@@ -213,7 +213,7 @@ If no queue is defined the queue named `default` will be used.
 
 Default: `None` (disabled)
 
-This parameter defines the URL of the repository that will be checked for new NetBox releases. When a new release is detected, a message will be displayed to administrative users on the home page. This can be set to the official repository (`'https://api.github.com/repos/netbox-community/netbox/releases'`) or a custom fork. Set this to `None` to disable automatic update checks.
+This parameter defines the URL of the repository that will be checked for new NetBox releases. When a new release is detected, a message will be displayed to administrative users on the home page. This can be set to the official repository (`'https://api.github.com/repos/swissmakers/netbox-plus/releases'`) or a custom fork. Set this to `None` to disable automatic update checks.
 
 !!! note
     The URL provided **must** be compatible with the [GitHub REST API](https://docs.github.com/en/rest).

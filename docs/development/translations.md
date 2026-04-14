@@ -17,7 +17,7 @@ To update the English `.po` file from which all translations are derived, use th
 Then, commit the change and push to the `main` branch on GitHub. Any new strings will appear for translation on Transifex automatically.
 
 !!! note
-    It is typically not necessary to update source strings manually, as this is done nightly by a [GitHub action](https://github.com/netbox-community/netbox/blob/main/.github/workflows/update-translation-strings.yml).
+    It is typically not necessary to update source strings manually, as this is done nightly by a [GitHub action](https://github.com/swissmakers/netbox-plus/blob/main/.github/workflows/update-translation-strings.yml).
 
 ## Updating Translated Strings
 
@@ -51,7 +51,7 @@ Once any new `.mo` files have been generated, they need to be committed and push
 
 ## Proposing New Languages
 
-If you'd like to add support for a new language to NetBox, the first step is to [submit a GitHub issue](https://github.com/netbox-community/netbox/issues/new?assignees=&labels=type%3A+translation&projects=&template=translation.yaml) to capture the proposal. While we'd like to add as many languages as possible, we do need to limit the rate at which new languages are added. New languages will be selected according to community interest and the number of volunteers who sign up as translators.
+If you'd like to add support for a new language to NetBox, the first step is to [submit a GitHub issue](https://github.com/swissmakers/netbox-plus/issues/new?assignees=&labels=type%3A+translation&projects=&template=translation.yaml) to capture the proposal. While we'd like to add as many languages as possible, we do need to limit the rate at which new languages are added. New languages will be selected according to community interest and the number of volunteers who sign up as translators.
 
 Once a proposed language has been approved, a NetBox maintainer will:
 

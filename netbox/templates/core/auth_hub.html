@@ -1,0 +1,56 @@
+{% extends 'generic/_base.html' %}
+{% load i18n %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+  <div class="row mt-4">
+    <div class="col-12 col-lg-8">
+      {% if ldap_file_active %}
+        <div class="alert alert-info" role="alert">
+          {% trans "netbox/ldap_config.py defines AUTH_LDAP_SERVER_URI. File-based LDAP takes precedence; the LDAP form edits dynamic settings used when the file does not set the server URI." %}
+        </div>
+      {% endif %}
+
+      <p class="text-muted">{% trans "Configure LDAP for username and password sign-in, or OpenID Connect for SSO buttons on the login page. Changes apply immediately after save (no restart)." %}</p>
+
+      <div class="row g-3 mt-2">
+        <div class="col-md-6">
+          <div class="card h-100">
+            <div class="card-body">
+              <h2 class="h5 card-title">{% trans "LDAP" %}</h2>
+              <p class="card-text text-muted small">
+                {% if enterprise_auth.ldap.enabled %}
+                  {% trans "Status: enabled" %}
+                {% else %}
+                  {% trans "Status: disabled" %}
+                {% endif %}
+              </p>
+              <a href="{% url 'core:auth_ldap' %}" class="btn btn-primary">{% trans "Configure LDAP" %}</a>
+              <div class="mt-3">
+                <span class="text-muted small d-block mb-1">{% trans "Templates (form only)" %}</span>
+                <a href="{% url 'core:auth_ldap' %}?preset=active_directory" class="btn btn-sm btn-outline-secondary">{% trans "Active Directory" %}</a>
+                <a href="{% url 'core:auth_ldap' %}?preset=freeipa" class="btn btn-sm btn-outline-secondary">{% trans "FreeIPA" %}</a>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card h-100">
+            <div class="card-body">
+              <h2 class="h5 card-title">{% trans "OpenID Connect" %}</h2>
+              <p class="card-text text-muted small">
+                {% if enterprise_auth.oidc.enabled %}
+                  {% trans "Status: enabled" %}
+                {% else %}
+                  {% trans "Status: disabled" %}
+                {% endif %}
+              </p>
+              <a href="{% url 'core:auth_oidc' %}" class="btn btn-primary">{% trans "Configure OIDC" %}</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

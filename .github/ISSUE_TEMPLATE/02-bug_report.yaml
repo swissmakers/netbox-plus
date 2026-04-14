@@ -10,7 +10,7 @@ body:
         **NOTE:** This form is only for reporting _reproducible bugs_ in a current NetBox
         release. If you're having trouble with installation or just looking for assistance
         using NetBox, please visit our
-        [discussion forum](https://github.com/netbox-community/netbox/discussions) instead.
+        [discussion forum](https://github.com/swissmakers/netbox-plus/discussions) instead.
   - type: dropdown
     attributes:
       label: NetBox Edition

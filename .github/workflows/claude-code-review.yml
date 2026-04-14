@@ -8,7 +8,7 @@ jobs:
   claude-review:
     # Only run for PRs submitted by organization members or owners
     if: |
-      github.repository == 'netbox-community/netbox' &&
+      github.repository == 'swissmakers/netbox-plus' &&
       (github.event.pull_request.author_association == 'MEMBER' ||
       github.event.pull_request.author_association == 'OWNER')
 

@@ -416,6 +416,12 @@ ADMIN_MENU = Menu(
                 get_model_item('users', 'group', _('Groups')),
                 get_model_item('users', 'token', _('API Tokens')),
                 get_model_item('users', 'objectpermission', _('Permissions'), actions=['add']),
+                MenuItem(
+                    link='core:auth_hub',
+                    link_text=_('LDAP / OIDC'),
+                    staff_only=True,
+                    permissions=['core.add_configrevision'],
+                ),
             ),
         ),
         MenuGroup(

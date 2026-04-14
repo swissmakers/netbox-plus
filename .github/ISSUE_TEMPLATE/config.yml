@@ -2,16 +2,16 @@
 blank_issues_enabled: false
 contact_links:
   - name: 📖 Contributing Policy
-    url: https://github.com/netbox-community/netbox/blob/main/CONTRIBUTING.md
+    url: https://github.com/swissmakers/netbox-plus/blob/main/CONTRIBUTING.md
     about: "Please read through our contributing policy before opening an issue or pull request."
   - name: ❓ Discussion
-    url: https://github.com/netbox-community/netbox/discussions
+    url: https://github.com/swissmakers/netbox-plus/discussions
     about: "If you're just looking for help, try starting a discussion instead."
   - name: 👔 Professional Support
-    url: https://netboxlabs.com/netbox-enterprise/
-    about: "Professional support is available for NetBox Enterprise or Cloud."
+    url: https://swissmakers.ch/
+    about: "Professional support is available for NetBox Plus."
   - name: 🌎 Correct a Translation
-    url: https://explore.transifex.com/netbox-community/netbox/
+    url: https://explore.transifex.com/swissmakers/netbox-plus/
     about: "Spot an incorrect translation? You can propose a fix on Transifex."
   - name: 💬 Community Slack
     url: https://netdev.chat

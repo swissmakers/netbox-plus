@@ -16,21 +16,28 @@ On top of that, NetBox Plus will add Swissmakers improvements such as hardenings
 
 This repository includes a **Dockerfile** and **Compose** stack (PostgreSQL, Redis, Gunicorn, RQ workers) based on **Red Hat UBI** (UBI 9 by default; UBI 10 optional on capable CPUs). See `docker/` and `docker-compose.yml`.
 
+**Swissmakers recommends [Podman](https://podman.io/)** for this stack on Linux; examples use `podman compose`. See [Containers with Podman Compose](docs/installation/docker.md) for commands and why Podman is the documented default.
+
 ### Pre-built image (Swissmakers)
 
-Official multi-arch builds are published to Docker Hub as **[`swissmakers/netbox-plus`](https://hub.docker.com/repository/docker/swissmakers/netbox-plus)**. Pull with `docker pull swissmakers/netbox-plus:latest` (or another published tag), set `NETBOX_IMAGE=swissmakers/netbox-plus:latest` in `.env`, then from the repo root run `docker compose pull` and `docker compose up -d`. Details: [Docker / Compose install docs](docs/installation/docker.md).
+Official multi-arch builds are published to Docker Hub as **[`swissmakers/netbox-plus`](https://hub.docker.com/repository/docker/swissmakers/netbox-plus)**. From the repo root run `podman compose pull` and `podman compose up -d` (Compose defaults to that image; override `NETBOX_IMAGE` in `.env` for another tag or registry). More detail: [Containers with Podman Compose](docs/installation/docker.md) and `docker/README.md`.
 
 ### Build from source
 
+Build and tag a local development image directly from the repository root:
+
 ```bash
-cp docker/.env.example .env
-# Edit .env —> set NETBOX_SECRET_KEY and change superuser variables
-docker compose up --build
-# UI: http://localhost:8080
+podman build -t netbox-plus:dev .
 ```
 
-Adjust for your orchestrator (e.g. Podman) as needed.
+Then set `NETBOX_IMAGE=localhost/netbox-plus:dev` in `.env` and start the stack:
 
+```bash
+cp docker/.env.example .env
+# Edit .env —> set NETBOX_SECRET_KEY and NETBOX_IMAGE=localhost/netbox-plus:dev
+podman compose up -d
+# UI: http://localhost:8080
+```
 
 ## Documentation
 

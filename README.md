@@ -65,6 +65,12 @@ NetBox Plus builds on the work of the **NetBox community** and **NetBox Labs** /
 
 ## Screenshots
 
+- Home user interface
 <p align="center">
-  <img src="docs/media/screenshots/home-light.png" width="600" alt="NetBox user interface screenshot" />
+  <img src="docs/media/screenshots/home-dark.png" alt="NetBox user interface screenshot" />
+</p>
+
+- LDAP authentication settings
+<p align="center">
+  <img src="docs/media/screenshots/ldap-settings.png" alt="NetBox LDAP interface screenshot" />
 </p>

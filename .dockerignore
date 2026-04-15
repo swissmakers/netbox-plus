@@ -6,8 +6,6 @@
 **/.mypy_cache
 .venv
 venv
-docs
-mkdocs.yml
 htmlcov
 .coverage
 *.egg-info

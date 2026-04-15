@@ -2,12 +2,41 @@
 
 Upgrading NetBox to a new version is pretty simple, however users are cautioned to always review the release notes and save a backup of their current deployment prior to beginning an upgrade.
 
-NetBox can generally be upgraded directly to any newer release with no interim steps, with the one exception being incrementing major versions. This can be done only from the most recent _minor_ release of the major version. For example, NetBox v2.11.8 can be upgraded to version 3.3.2 following the steps below. However, a deployment of NetBox v2.10.10 or earlier must first be upgraded to any v2.11 release, and then to any v3.x release. (This is to accommodate the consolidation of database schema migrations effected by a major version change).
+NetBox can generally be upgraded directly to any newer release with no interim steps, with the one exception being incrementing major versions. This can be done only from the most recent _minor_ release of the major version. For example, NetBox v2.11.8 can be upgraded to version 3.3.2 once the new code is deployed and migrations have run. However, a deployment of NetBox v2.10.10 or earlier must first be upgraded to any v2.11 release, and then to any v3.x release. (This is to accommodate the consolidation of database schema migrations effected by a major version change).
 
 [![Upgrade paths](../media/installation/upgrade_paths.png)](../media/installation/upgrade_paths.png)
 
 !!! warning "Perform a Backup"
     Always be sure to save a backup of your current NetBox deployment prior to starting the upgrade process.
+
+## NetBox Plus: upgrading with containers
+
+If you run NetBox Plus with **[Containers with Podman Compose](docker.md)** (the `docker-compose.yml` in the repository root and the `swissmakers/netbox-plus` image, or a local image via `NETBOX_IMAGE`), upgrading is intentionally minimal:
+
+1. **Back up** your database and anything you care about in persistent storage (for example a PostgreSQL logical dump and the Docker/Podman volumes used for Postgres data and NetBox media).
+2. **Read the [release notes](../release-notes/index.md)** for every release between your current version and the version you are moving to.
+3. From the **repository root** (where `docker-compose.yml` lives), with your existing `.env`:
+
+    ```bash
+    podman compose pull netbox
+    podman compose up -d
+    ```
+
+    If you use Docker Engine instead of Podman, use the same commands with `docker compose`.
+
+Compose uses one image for both `netbox` and `netbox-worker`. Pulling the `netbox` service image is enough for both to pick up the new version on the next `up`.
+
+**What happens automatically:** the web container’s entrypoint runs `manage.py migrate` and `manage.py collectstatic` before Gunicorn starts. The worker waits until the web service is healthy, so migrations are not run in parallel from two containers. You do **not** run `upgrade.sh` or maintain a host-level Python virtualenv for the application.
+
+**Image tags:** the default `NETBOX_IMAGE` is `swissmakers/netbox-plus:latest`. For repeatable upgrades, set `NETBOX_IMAGE` in `.env` to a specific published tag when available, change it when you intend to move to a new version, then `pull` and `up -d` again.
+
+**Major version jumps:** the database rules in the introduction still apply; the container only automates migration execution after the new code is running.
+
+For stack details, environment variables, and optional local builds, see **[Containers with Podman Compose (NetBox Plus)](docker.md)** and the repository **`docker/README.md`**.
+
+---
+
+The sections below describe upgrading a **traditional** Linux installation (release tarball, Git checkout, or similar under `/opt/netbox`). Skip them if you use the container stack above.
 
 ## 1. Review the Release Notes
 

@@ -21,7 +21,15 @@ def _serve_static_if_enabled(request, path):
     """
     if not getattr(settings, 'SERVE_STATIC_IN_APP', False):
         raise Http404()
-    return serve(request, path, document_root=settings.STATIC_ROOT)
+    try:
+        return serve(request, path, document_root=settings.STATIC_ROOT)
+    except Http404:
+        # Django's static serve view does not resolve directory indexes. If a directory-style
+        # URL is requested, try the conventional index.html before returning 404.
+        normalized = path.rstrip('/')
+        if normalized and not normalized.endswith('index.html'):
+            return serve(request, f'{normalized}/index.html', document_root=settings.STATIC_ROOT)
+        raise
 
 
 _patterns = [

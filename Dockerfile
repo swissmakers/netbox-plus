@@ -42,13 +42,18 @@ ENV PATH="/opt/netbox/venv/bin:${PATH}" \
     VIRTUAL_ENV=/opt/netbox/venv \
     PYTHONDONTWRITEBYTECODE=1
 
-WORKDIR /opt/netbox/app
-
 COPY requirements.txt /tmp/netbox-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/netbox-requirements.txt gunicorn
 
-# Application tree
-COPY netbox/ /opt/netbox/app/
+WORKDIR /opt/netbox
+COPY netbox/ ./app/
+COPY mkdocs.yml .
+COPY docs ./docs
+ENV BUILD_PUBLIC=1
+RUN ln -snf app netbox \
+    && mkdocs build \
+    && rm -f netbox \
+    && rm -rf docs mkdocs.yml
 
 # Docker-specific Django configuration
 COPY docker/configuration_docker.py /opt/netbox/app/netbox/configuration_docker.py
@@ -57,6 +62,8 @@ COPY docker/entrypoint.sh /docker/entrypoint.sh
 RUN chmod +x /docker/entrypoint.sh \
     && mkdir -p /opt/netbox/app/static /opt/netbox/app/media \
     && chmod -R g+w /opt/netbox/app/static /opt/netbox/app/media
+
+WORKDIR /opt/netbox/app
 
 EXPOSE 8080
 

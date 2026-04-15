@@ -1,0 +1,81 @@
+# Multi-arch: Podman builds a manifest for linux/amd64 + linux/arm64 (UBI base must support the arch).
+# Gitea Actions emulates parts of the GitHub Actions API; `github.sha` is provided for compatibility.
+
+name: Build NetBox Plus multi-arch image and push to Harbor / Docker Hub
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Harbor path: <registry>/<HARBOR_PROJECT>/<IMAGE_NAME>:tag
+  IMAGE_NAME: netbox-plus
+
+jobs:
+  build:
+    runs-on: linux_amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable binfmt/QEMU for cross-arch RUN steps
+        run: |
+          podman run --privileged --rm docker.io/tonistiigi/binfmt --install all
+
+      - name: Login to Swissmakers Registry
+        if: ${{ secrets.HARBOR_REGISTRY && secrets.HARBOR_USERNAME && secrets.HARBOR_PASSWORD }}
+        env:
+          REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          ROBOT_USER: ${{ secrets.HARBOR_USERNAME }}
+          ROBOT_PASS: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          echo "$ROBOT_PASS" | podman login --username "$ROBOT_USER" --password-stdin "$REGISTRY"
+
+      - name: Login to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "$DH_TOKEN" | podman login docker.io --username "$DH_USER" --password-stdin
+
+      - name: Build multi-arch manifest
+        env:
+          LOCAL_MANIFEST: localhost/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          PLATFORMS: linux/amd64,linux/arm64
+        run: |
+          set -euo pipefail
+          # Explicit root for runners where defaults differ (e.g. act)
+          cd "${GITHUB_WORKSPACE:-$(pwd)}"
+          test -f Dockerfile || { echo "::error::Dockerfile missing at repo root"; ls -la; exit 1; }
+          test -f docker/entrypoint.sh || { echo "::error::docker/entrypoint.sh missing"; exit 1; }
+          test -f docker/configuration_docker.py || { echo "::error::docker/configuration_docker.py missing"; exit 1; }
+          test -d netbox || { echo "::error::netbox/ application directory missing"; exit 1; }
+          podman build --pull \
+            --platform "$PLATFORMS" \
+            --manifest "$LOCAL_MANIFEST" \
+            -f Dockerfile \
+            .
+          podman manifest inspect "$LOCAL_MANIFEST"
+
+      - name: Push to Swissmakers Registry (Harbor)
+        if: ${{ secrets.HARBOR_REGISTRY && secrets.HARBOR_USERNAME && secrets.HARBOR_PASSWORD && secrets.HARBOR_PROJECT }}
+        env:
+          REG: ${{ secrets.HARBOR_REGISTRY }}
+          PROJ: ${{ secrets.HARBOR_PROJECT }}
+          LOCAL_MANIFEST: localhost/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          DEST="docker://$REG/$PROJ/${{ env.IMAGE_NAME }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"
+
+      - name: Push to Docker Hub
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        env:
+          DH_NS: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_REPO: ${{ env.IMAGE_NAME }}
+          LOCAL_MANIFEST: localhost/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          DEST="docker://docker.io/$DH_NS/$DH_REPO"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:${{ github.sha }}"
+          podman manifest push --all "$LOCAL_MANIFEST" "$DEST:latest"

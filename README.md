@@ -14,9 +14,13 @@ On top of that, NetBox Plus will add Swissmakers improvements such as hardenings
 
 ## Container image
 
-This repository includes a ready-to-use container definition, based on the **Red Hat Universal Base Image 10 (UBI 10)** so you can run NetBox Plus directly in a hardened, enterprise-friendly base. See the `docker/` directory and `docker-compose.yml` for a full stack (PostgreSQL, Redis, web, workers).
+This repository includes a **Dockerfile** and **Compose** stack (PostgreSQL, Redis, Gunicorn, RQ workers) based on **Red Hat UBI** (UBI 9 by default; UBI 10 optional on capable CPUs). See `docker/` and `docker-compose.yml`.
 
-Quick start:
+### Pre-built image (Swissmakers)
+
+Official multi-arch builds are published to Docker Hub as **[`swissmakers/netbox-plus`](https://hub.docker.com/repository/docker/swissmakers/netbox-plus)**. Pull with `docker pull swissmakers/netbox-plus:latest` (or another published tag), set `NETBOX_IMAGE=swissmakers/netbox-plus:latest` in `.env`, then from the repo root run `docker compose pull` and `docker compose up -d`. Details: [Docker / Compose install docs](docs/installation/docker.md).
+
+### Build from source
 
 ```bash
 cp docker/.env.example .env

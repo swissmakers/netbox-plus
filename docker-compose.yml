@@ -7,6 +7,10 @@
 #
 # UI: http://localhost:8080
 #
+# Pre-built image: set NETBOX_IMAGE=swissmakers/netbox-plus:latest in .env, then
+#   podman compose pull && podman compose up -d
+#   https://hub.docker.com/repository/docker/swissmakers/netbox-plus
+#
 services:
   postgres:
     image: docker.io/library/postgres:16-alpine
@@ -42,7 +46,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # UBI 10 needs x86-64-v3; UBI 9 is the safe default for older CPUs (see docker/README.md).
+        # UBI 10 needs x86-64-v3; UBI 9 is the default to also support older CPUs (see docker/README.md).
         BASE_IMAGE: ${NETBOX_BASE_IMAGE:-registry.access.redhat.com/ubi9/ubi:latest}
     image: ${NETBOX_IMAGE:-netbox-plus:local}
     restart: unless-stopped

@@ -5,7 +5,28 @@ This stack uses:
 - **Dockerfile**: default `registry.access.redhat.com/ubi9/ubi:latest` (UBI 9) with Python 3.12, dependencies from `requirements.txt`, and Gunicorn. UBI 10 is optional via build-arg (see below).
 - **docker-compose.yml**: PostgreSQL 16, Redis 7, NetBox web (Gunicorn), and NetBox RQ worker (`high`, `default`, `low` queues).
 
-## Quick start
+## Pre-built image (Swissmakers / Docker Hub)
+
+Swissmakers publishes ready-to-use images to Docker Hub:
+
+**[hub.docker.com — `swissmakers/netbox-plus`](https://hub.docker.com/repository/docker/swissmakers/netbox-plus)**
+
+Use them with this Compose file by setting in `.env`:
+
+```env
+NETBOX_IMAGE=swissmakers/netbox-plus:latest
+```
+
+Then from the repository root:
+
+```bash
+docker compose pull netbox
+docker compose up -d
+```
+
+Use `docker compose up --build` when you want to **build** from the local `Dockerfile` instead of using the registry image.
+
+## Quick start (build locally)
 
 ```bash
 cp docker/.env.example .env

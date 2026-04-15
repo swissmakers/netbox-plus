@@ -1,27 +1,17 @@
 # Installation
 
-<div class="grid cards" markdown>
+The installation instructions provided here have been tested to work on Rocky Linux 10. The particular commands needed to install dependencies on other distributions may vary significantly. Unfortunately, this is outside the control of the NetBox maintainers. Please consult your distribution's documentation for assistance with any errors.
 
--   :material-clock-fast:{ .lg .middle } __Eager to Get Started?__
+For **NetBox Plus** using containers, Swissmakers provides an official image on Docker Hub and a Compose stack in the repository. See **[Docker / Compose (NetBox Plus)](docker.md)** for the pre-built image, pull commands, and how to set `NETBOX_IMAGE`.
 
-    ---
-
-    Check out the [NetBox Cloud Free Plan](https://netboxlabs.com/free-netbox-cloud/)! Skip the installation process and grab your own NetBox Cloud instance, preconfigured and ready to go in minutes. Completely free!
-
-    [:octicons-arrow-right-24: Sign Up](https://signup.netboxlabs.com/)
-
-</div>
-
-The installation instructions provided here have been tested to work on Ubuntu 24.04. The particular commands needed to install dependencies on other distributions may vary significantly. Unfortunately, this is outside the control of the NetBox maintainers. Please consult your distribution's documentation for assistance with any errors.
-
-The following sections detail how to set up a new instance of NetBox:
+The following sections detail how to set up a new instance of NetBox on a Linux host (traditional install):
 
 1. [PostgreSQL database](1-postgresql.md)
 2. [Redis](2-redis.md)
 3. [NetBox components](3-netbox.md)
 4. [Gunicorn](4a-gunicorn.md) or [uWSGI](4b-uwsgi.md)
 5. [HTTP server](5-http-server.md)
-6. [LDAP authentication](6-ldap.md) (optional)
+6. [LDAP authentication](6-ldap.md)
 
 ## Requirements
 

@@ -2,13 +2,13 @@
 #
 # Usage:
 #   cp docker/.env.example .env
-#   # Edit .env —> set NETBOX_SECRET_KEY and optional superuser vars
-#   docker compose up --build
+#   # Edit .env —> set NETBOX_SECRET_KEY (and NETBOX_IMAGE if not using the default)
+#   podman compose pull && podman compose up -d
 #
 # UI: http://localhost:8080
 #
-# Pre-built image: set NETBOX_IMAGE=swissmakers/netbox-plus:latest in .env, then
-#   podman compose pull && podman compose up -d
+# Default image is a pre-built NetBox Plus image on Docker Hub. Override NETBOX_IMAGE in .env if needed.
+# To use a local build instead, run `podman build -t netbox-plus:dev .` and set `NETBOX_IMAGE=localhost/netbox-plus:dev`.
 #   https://hub.docker.com/repository/docker/swissmakers/netbox-plus
 #
 services:
@@ -42,13 +42,7 @@ services:
       start_period: 5s
 
   netbox:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        # UBI 10 needs x86-64-v3; UBI 9 is the default to also support older CPUs (see docker/README.md).
-        BASE_IMAGE: ${NETBOX_BASE_IMAGE:-registry.access.redhat.com/ubi9/ubi:latest}
-    image: ${NETBOX_IMAGE:-netbox-plus:local}
+    image: ${NETBOX_IMAGE:-swissmakers/netbox-plus:latest}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -97,7 +91,7 @@ services:
       start_period: 180s
 
   netbox-worker:
-    image: ${NETBOX_IMAGE:-netbox-plus:local}
+    image: ${NETBOX_IMAGE:-swissmakers/netbox-plus:latest}
     restart: unless-stopped
     depends_on:
       postgres:

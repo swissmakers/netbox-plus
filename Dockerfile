@@ -1,5 +1,5 @@
 # NetBox Plus on Red Hat Universal Base Image (UBI).
-# Build from repository root: docker build -t netbox-plus:local .
+# Build from repository root: podman build -t netbox-plus:dev .
 #
 # Default is UBI 9 so the image runs on older x86_64 CPUs. UBI 10 userspace
 # requires x86-64-v3; on capable hardware you can use:

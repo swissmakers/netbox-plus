@@ -2,7 +2,7 @@
 
 The installation instructions provided here have been tested to work on Rocky Linux 10. The particular commands needed to install dependencies on other distributions may vary significantly. Unfortunately, this is outside the control of the NetBox maintainers. Please consult your distribution's documentation for assistance with any errors.
 
-For **NetBox Plus** using containers, Swissmakers provides an official image on Docker Hub and a Compose stack in the repository. See **[Docker / Compose (NetBox Plus)](docker.md)** for the pre-built image, pull commands, and how to set `NETBOX_IMAGE`.
+For **NetBox Plus** using containers, Swissmakers provides an official image on Docker Hub and a Compose stack in the repository. See **[Containers with Podman Compose (NetBox Plus)](docker.md)** for the pre-built image, `podman compose` commands, why Podman is recommended, and how to set `NETBOX_IMAGE`.
 
 The following sections detail how to set up a new instance of NetBox on a Linux host (traditional install):
 

@@ -93,7 +93,7 @@ nav:
         - Customization: 'features/customization.md'
     - Installation & Upgrade:
         - Installing NetBox: 'installation/index.md'
-        - Docker/Podman Compose (NetBox Plus): 'installation/docker.md'
+        - Podman Compose (NetBox Plus): 'installation/docker.md'
         - 1. PostgreSQL: 'installation/1-postgresql.md'
         - 2. Redis: 'installation/2-redis.md'
         - 3. NetBox: 'installation/3-netbox.md'

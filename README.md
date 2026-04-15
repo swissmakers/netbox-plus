@@ -44,6 +44,17 @@ podman compose up -d
 - **NetBox Plus authentication (LDAP / OIDC):** [Enterprise authentication](docs/administration/authentication/enterprise-auth.md), [LDAP installation](docs/installation/6-ldap.md)
 - **Upstream NetBox docs** (concepts and features): [docs.netbox.dev](https://docs.netbox.dev)
 
+## Screenshots
+
+- Home user interface
+<p align="center">
+  <img src="docs/media/screenshots/home-dark.png" alt="NetBox user interface screenshot" />
+</p>
+
+- LDAP authentication settings
+<p align="center">
+  <img src="docs/media/screenshots/ldap-settings.png" alt="NetBox LDAP interface screenshot" />
+</p>
 
 ## License
 
@@ -61,16 +72,3 @@ For **professional support, consulting, or SLAs** on NetBox Plus, contact **Swis
 ## Acknowledgements
 
 NetBox Plus builds on the work of the **NetBox community** and **NetBox Labs** / upstream contributors. We are grateful for the project they created and maintain upstream.
-
-
-## Screenshots
-
-- Home user interface
-<p align="center">
-  <img src="docs/media/screenshots/home-dark.png" alt="NetBox user interface screenshot" />
-</p>
-
-- LDAP authentication settings
-<p align="center">
-  <img src="docs/media/screenshots/ldap-settings.png" alt="NetBox LDAP interface screenshot" />
-</p>

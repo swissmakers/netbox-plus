@@ -1,0 +1,133 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"        # taeglich 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream-Ref (Branch oder Tag), z.B. main oder v4.4.3"
+        required: false
+        default: "main"
+      dry_run:
+        description: "Nur testen, nicht pushen"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/netbox-community/netbox.git
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (volle History)
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Git konfigurieren
+        run: |
+          git config user.name  "netbox-plus-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # noetig, damit "merge=ours" aus .gitattributes funktioniert
+          git config merge.ours.driver true
+
+      - name: Upstream holen
+        run: |
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream --tags --prune
+
+      - name: Upstream-Commit bestimmen
+        id: up
+        run: |
+          REF="${{ github.event.inputs.upstream_ref || 'main' }}"
+          SHA=$(git rev-parse --verify "upstream/$REF" 2>/dev/null \
+                || git rev-parse --verify "refs/tags/$REF")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Bereits aktuell - nichts zu tun."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Neue Upstream-Commits:"
+            git log --oneline HEAD.."$SHA" | head -50
+          fi
+
+      # Probelauf ohne Strategie-Option: nur um zu ERFAHREN, wo es kracht.
+      # Ohne diesen Schritt wuerde "-X ours" die Konflikte still schlucken.
+      - name: Konflikte ermitteln (Probe-Merge)
+        if: steps.up.outputs.needed == 'true'
+        id: probe
+        run: |
+          if git merge --no-commit --no-ff "${{ steps.up.outputs.sha }}" >/dev/null 2>&1; then
+            echo "conflicts=" >> "$GITHUB_OUTPUT"
+          else
+            FILES=$(git diff --name-only --diff-filter=U | sort)
+            {
+              echo "conflicts<<EOF"
+              echo "$FILES"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Konfliktdateien (werden zugunsten von netbox-plus aufgeloest):"
+            echo "$FILES"
+          fi
+          git merge --abort 2>/dev/null || git reset --hard HEAD
+
+      - name: Merge mit Vorrang fuer eigene Aenderungen
+        if: steps.up.outputs.needed == 'true'
+        run: |
+          set -e
+          # -X ours: bei kollidierenden Hunks gewinnt netbox-plus.
+          # Nicht-kollidierende Upstream-Aenderungen derselben Datei kommen trotzdem rein.
+          git merge --no-edit -X ours "${{ steps.up.outputs.sha }}" || true
+
+          # Rest aufraeumen: modify/delete- und rename-Konflikte loest -X ours NICHT.
+          UNMERGED=$(git diff --name-only --diff-filter=U || true)
+          if [ -n "$UNMERGED" ]; then
+            echo "$UNMERGED" | while IFS= read -r f; do
+              if git checkout --ours -- "$f" 2>/dev/null; then
+                git add -- "$f"          # unsere Version behalten
+              else
+                git rm -f --quiet -- "$f" # von uns geloescht -> geloescht lassen
+              fi
+            done
+          fi
+
+          if ! git diff --cached --quiet || [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit || true
+          fi
+
+          # Sicherheitsnetz: es darf nichts Ungemergtes uebrig bleiben
+          test -z "$(git diff --name-only --diff-filter=U)"
+
+      - name: Push
+        if: steps.up.outputs.needed == 'true' && github.event.inputs.dry_run != 'true'
+        run: git push origin "HEAD:$TARGET_BRANCH"
+
+      - name: Issue zur Nachkontrolle
+        if: steps.up.outputs.needed == 'true' && steps.probe.outputs.conflicts != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          gh issue create \
+            --title "Upstream-Sync: ${{ steps.up.outputs.ref }} automatisch aufgeloest" \
+            --label "upstream" \
+            --body "$(printf 'Upstream `%s` (`%s`) wurde gemergt. In folgenden Dateien gab es Konflikte, die **zugunsten von netbox-plus** aufgeloest wurden - bitte kurz pruefen, ob Upstream dort etwas Relevantes geaendert hat (Signaturen, Settings-Keys, Migrationen):\n\n```\n%s\n```\n\nUpstream-Diff der Dateien ansehen:\n```bash\ngit fetch upstream\ngit diff HEAD...upstream/%s -- <datei>\n```\n\n[Run-Log](%s/%s/actions/runs/%s)\n' \
+              "${{ steps.up.outputs.ref }}" "${{ steps.up.outputs.sha }}" \
+              "${{ steps.probe.outputs.conflicts }}" \
+              "${{ steps.up.outputs.ref }}" \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")"

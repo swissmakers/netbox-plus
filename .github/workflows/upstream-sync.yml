@@ -48,14 +48,18 @@ jobs:
         run: |
           git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
             || git remote set-url upstream "$UPSTREAM_URL"
-          git fetch upstream --tags --prune
+          # Upstream-Tags NICHT nach refs/tags/ - dort liegen die netbox-plus-Tags
+          git fetch --no-tags --prune --force upstream \
+            "+refs/heads/*:refs/remotes/upstream/*" \
+            "+refs/tags/*:refs/upstream-tags/*"
 
       - name: Upstream-Commit bestimmen
         id: up
         run: |
           REF="${{ github.event.inputs.upstream_ref || 'main' }}"
-          SHA=$(git rev-parse --verify "upstream/$REF" 2>/dev/null \
-                || git rev-parse --verify "refs/tags/$REF")
+          SHA=$(git rev-parse --verify "refs/remotes/upstream/$REF" 2>/dev/null \
+                || git rev-parse --verify "refs/upstream-tags/$REF" 2>/dev/null \
+                || { echo "Upstream-Ref '$REF' nicht gefunden" >&2; exit 1; })
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$SHA" HEAD; then

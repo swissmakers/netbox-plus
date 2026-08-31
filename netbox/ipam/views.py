@@ -1,9 +1,11 @@
+import django_filters
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Prefetch
 from django.db.models.expressions import RawSQL
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
+from django_filters.constants import EMPTY_VALUES
 
 from circuits.models import Provider
 from dcim.filtersets import InterfaceFilterSet
@@ -16,6 +18,7 @@ from netbox.ui.panels import (
     CommentsPanel,
     ContextTablePanel,
     ObjectsTablePanel,
+    PluginContentPanel,
     RelatedObjectsPanel,
     TemplatePanel,
 )
@@ -50,16 +53,19 @@ class VRFListView(generic.ObjectListView):
 @register_model_view(VRF)
 class VRFView(GetRelatedModelsMixin, generic.ObjectView):
     queryset = VRF.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.Layout(
         layout.Row(
             layout.Column(
                 panels.VRFPanel(),
                 TagsPanel(),
+                PluginContentPanel('left_page'),
             ),
             layout.Column(
                 RelatedObjectsPanel(),
                 CustomFieldsPanel(),
                 CommentsPanel(),
+                PluginContentPanel('right_page'),
             ),
         ),
         layout.Row(
@@ -68,6 +74,11 @@ class VRFView(GetRelatedModelsMixin, generic.ObjectView):
             ),
             layout.Column(
                 ContextTablePanel('export_targets_table', title=_('Export route targets')),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
             ),
         ),
     )
@@ -164,15 +175,18 @@ class RouteTargetListView(generic.ObjectListView):
 @register_model_view(RouteTarget)
 class RouteTargetView(generic.ObjectView):
     queryset = RouteTarget.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.Layout(
         layout.Row(
             layout.Column(
                 panels.RouteTargetPanel(),
                 TagsPanel(),
+                PluginContentPanel('left_page'),
             ),
             layout.Column(
                 CustomFieldsPanel(),
                 CommentsPanel(),
+                PluginContentPanel('right_page'),
             ),
         ),
         layout.Row(
@@ -205,6 +219,11 @@ class RouteTargetView(generic.ObjectView):
                     filters={'export_target_id': lambda ctx: ctx['object'].pk},
                     title=_('Exporting L2VPNs'),
                 ),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
             ),
         ),
     )
@@ -530,8 +549,70 @@ class AggregateView(generic.ObjectView):
     )
 
 
+class ChildAvailabilityMixin:
+    """
+    Mixin for ObjectChildrenView subclasses that render synthetic "available" rows
+    (available IP space, prefixes, or VLANs) and must suppress them when the request
+    activates a child object filter, so objects excluded by the filter are not
+    misrepresented as available space.
+    """
+
+    def _get_detection_filterset(self, request):
+        """
+        Return the bound FilterSet used to evaluate the request, or None if the view declares no
+        filterset. ObjectChildrenView.get() has already built one and validated its form while
+        resolving the child queryset, so reuse it rather than paying for a second FilterSet:
+        get_filters() regenerates every dynamic lookup variant and NetBoxModelFilterSet.__init__
+        queries the custom fields for the model. Build one only for direct calls where get() has
+        not run.
+        """
+        if self.filterset_instance is not None:
+            return self.filterset_instance
+        if self.filterset is None:
+            return None
+
+        return self.filterset(request.GET, request=request)
+
+    def _has_active_child_filters(self, request):
+        """
+        Return True if the request supplies a valid, non-empty value for any filter declared by
+        the view's filterset. Saved filters are expanded during filterset instantiation and
+        dynamic custom field filters are registered on the instance, so both are detected.
+        Permission constraints and parent scoping never appear in the request, so they cannot
+        affect the result. The result is memoized because a single request evaluates it from
+        both prep_table_data and get_extra_context.
+        """
+        if hasattr(self, '_active_child_filters'):
+            return self._active_child_filters
+
+        self._active_child_filters = False
+
+        # An empty request cannot activate a filter, so skip validating a form for nothing.
+        if not request.GET:
+            return False
+
+        filterset = self._get_detection_filterset(request)
+        if filterset is None:
+            return False
+
+        # A non-empty cleaned value means the request activated a declared filter. Emptiness
+        # follows each filter's own semantics, so absent multi-value fields stay inactive.
+        # This is a no-op for a reused FilterSet: .qs validated the form to build the queryset.
+        filterset.form.is_valid()
+        for name, value in filterset.form.cleaned_data.items():
+            if isinstance(filterset.filters[name], django_filters.MultipleChoiceFilter):
+                if value:  # mirrors MultipleChoiceFilter.filter()
+                    self._active_child_filters = True
+                    break
+            elif value not in EMPTY_VALUES:  # mirrors Filter.filter()
+                self._active_child_filters = True
+                break
+
+        return self._active_child_filters
+
+
 @register_model_view(Aggregate, 'prefixes')
-class AggregatePrefixesView(generic.ObjectChildrenView):
+class AggregatePrefixesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Aggregate.objects.all()
     child_model = Prefix
     table = tables.PrefixTable
@@ -555,13 +636,21 @@ class AggregatePrefixesView(generic.ObjectChildrenView):
         show_available = bool(request.GET.get('show_available', 'true') == 'true')
         show_assigned = bool(request.GET.get('show_assigned', 'true') == 'true')
 
+        if show_available and self._has_active_child_filters(request):
+            show_available = False
+
         return add_requested_prefixes(parent.prefix, queryset, show_available, show_assigned)
 
     def get_extra_context(self, request, instance):
+        show_available = (
+            bool(request.GET.get('show_available', 'true') == 'true') and
+            not self._has_active_child_filters(request)
+        )
+
         return {
             'bulk_querystring': f'within={instance.prefix}',
             'first_available_prefix': instance.get_first_available_prefix(),
-            'show_available': bool(request.GET.get('show_available', 'true') == 'true'),
+            'show_available': show_available,
             'show_assigned': bool(request.GET.get('show_assigned', 'true') == 'true'),
         }
 
@@ -612,7 +701,8 @@ class RoleListView(generic.ObjectListView):
     queryset = Role.objects.annotate(
         prefix_count=count_related(Prefix, 'role'),
         iprange_count=count_related(IPRange, 'role'),
-        vlan_count=count_related(VLAN, 'role')
+        vlan_count=count_related(VLAN, 'role'),
+        asn_count=count_related(ASN, 'role')
     )
     filterset = filtersets.RoleFilterSet
     filterset_form = forms.RoleFilterForm
@@ -752,7 +842,7 @@ class PrefixView(generic.ObjectView):
 
 
 @register_model_view(Prefix, 'prefixes')
-class PrefixPrefixesView(generic.ObjectChildrenView):
+class PrefixPrefixesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Prefix.objects.all()
     child_model = Prefix
     table = tables.PrefixTable
@@ -776,13 +866,21 @@ class PrefixPrefixesView(generic.ObjectChildrenView):
         show_available = bool(request.GET.get('show_available', 'true') == 'true')
         show_assigned = bool(request.GET.get('show_assigned', 'true') == 'true')
 
+        if show_available and self._has_active_child_filters(request):
+            show_available = False
+
         return add_requested_prefixes(parent.prefix, queryset, show_available, show_assigned)
 
     def get_extra_context(self, request, instance):
+        show_available = (
+            bool(request.GET.get('show_available', 'true') == 'true') and
+            not self._has_active_child_filters(request)
+        )
+
         return {
             'bulk_querystring': f"vrf_id={instance.vrf.pk if instance.vrf else '0'}&within={instance.prefix}",
             'first_available_prefix': instance.get_first_available_prefix(),
-            'show_available': bool(request.GET.get('show_available', 'true') == 'true'),
+            'show_available': show_available,
             'show_assigned': bool(request.GET.get('show_assigned', 'true') == 'true'),
         }
 
@@ -815,7 +913,7 @@ class PrefixIPRangesView(generic.ObjectChildrenView):
 
 
 @register_model_view(Prefix, 'ipaddresses', path='ip-addresses')
-class PrefixIPAddressesView(generic.ObjectChildrenView):
+class PrefixIPAddressesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Prefix.objects.all()
     child_model = IPAddress
     table = tables.AnnotatedIPAddressTable
@@ -833,9 +931,13 @@ class PrefixIPAddressesView(generic.ObjectChildrenView):
         return parent.get_child_ips().restrict(request.user, 'view').prefetch_related('vrf', 'tenant', 'tenant__group')
 
     def prep_table_data(self, request, queryset, parent):
-        if not request.GET.get('q') and not get_table_ordering(request, self.table):
-            return annotate_ip_space(parent)
-        return queryset
+        # Ordering is checked first: it reads request.GET directly, so a sorted request never
+        # builds the detection filterset.
+        if not get_table_ordering(request, self.table) and not self._has_active_child_filters(request):
+            ip_ranges = parent.get_child_ranges(mark_populated=True).restrict(request.user, 'view')
+            return annotate_ip_space(parent, ip_addresses=queryset, ip_ranges=ip_ranges)
+
+        return super().prep_table_data(request, queryset, parent)
 
     def get_extra_context(self, request, instance):
         return {
@@ -849,11 +951,21 @@ class PrefixIPAddressesView(generic.ObjectChildrenView):
 class PrefixEditView(generic.ObjectEditView):
     queryset = Prefix.objects.all()
     form = forms.PrefixForm
+    template_name = 'ipam/prefix_edit.html'
 
 
 @register_model_view(Prefix, 'delete')
 class PrefixDeleteView(generic.ObjectDeleteView):
     queryset = Prefix.objects.all()
+
+
+@register_model_view(Prefix, 'bulk_add', path='bulk-add', detail=False)
+class PrefixBulkCreateView(generic.BulkCreateView):
+    queryset = Prefix.objects.all()
+    form = forms.IPNetworkBulkCreateForm
+    model_form = forms.PrefixBulkAddForm
+    pattern_target = 'prefix'
+    template_name = 'ipam/prefix_bulk_add.html'
 
 
 @register_model_view(Prefix, 'bulk_import', path='import', detail=False)
@@ -1146,7 +1258,7 @@ class IPAddressDeleteView(generic.ObjectDeleteView):
 @register_model_view(IPAddress, 'bulk_add', path='bulk-add', detail=False)
 class IPAddressBulkCreateView(generic.BulkCreateView):
     queryset = IPAddress.objects.all()
-    form = forms.IPAddressBulkCreateForm
+    form = forms.IPNetworkBulkCreateForm
     model_form = forms.IPAddressBulkAddForm
     pattern_target = 'address'
     template_name = 'ipam/ipaddress_bulk_add.html'
@@ -1264,7 +1376,7 @@ class VLANGroupBulkDeleteView(generic.BulkDeleteView):
 
 
 @register_model_view(VLANGroup, 'vlans')
-class VLANGroupVLANsView(generic.ObjectChildrenView):
+class VLANGroupVLANsView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = VLANGroup.objects.all()
     child_model = VLAN
     table = tables.VLANTable
@@ -1284,9 +1396,11 @@ class VLANGroupVLANsView(generic.ObjectChildrenView):
         )
 
     def prep_table_data(self, request, queryset, parent):
-        if not get_table_ordering(request, self.table):
+        # Skip synthetic available rows under active filters: filtered-out VLANs would otherwise look available.
+        if not get_table_ordering(request, self.table) and not self._has_active_child_filters(request):
             return add_available_vlans(queryset, parent)
-        return queryset
+
+        return super().prep_table_data(request, queryset, parent)
 
 
 #
@@ -1306,6 +1420,7 @@ class VLANTranslationPolicyListView(generic.ObjectListView):
 @register_model_view(VLANTranslationPolicy)
 class VLANTranslationPolicyView(generic.ObjectView):
     queryset = VLANTranslationPolicy.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.VLANTranslationPolicyPanel(),
@@ -1320,6 +1435,7 @@ class VLANTranslationPolicyView(generic.ObjectView):
                 'ipam.vlantranslationrule',
                 filters={'policy_id': lambda ctx: ctx['object'].pk},
                 title=_('VLAN translation rules'),
+                exclude_columns=['policy'],
                 actions=[
                     actions.AddObject(
                         'ipam.vlantranslationrule',
@@ -1387,6 +1503,7 @@ class VLANTranslationRuleListView(generic.ObjectListView):
 @register_model_view(VLANTranslationRule)
 class VLANTranslationRuleView(generic.ObjectView):
     queryset = VLANTranslationRule.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.VLANTranslationRulePanel(),
@@ -1617,12 +1734,16 @@ class VLANView(generic.ObjectView):
                 'ipam.prefix',
                 filters={'vlan_id': lambda ctx: ctx['object'].pk},
                 title=_('Prefixes'),
+                exclude_columns=['vlan'],
                 actions=[
                     actions.AddObject(
                         'ipam.prefix',
                         url_params={
-                            'tenant': lambda ctx: ctx['object'].tenant.pk if ctx['object'].tenant else None,
-                            'site': lambda ctx: ctx['object'].site.pk if ctx['object'].site else None,
+                            'tenant': lambda ctx: ctx['object'].tenant_id,
+                            'scope_type': lambda ctx: (
+                                ContentType.objects.get_for_model(Site).pk if ctx['object'].site_id else None
+                            ),
+                            'scope': lambda ctx: ctx['object'].site_id,
                             'vlan': lambda ctx: ctx['object'].pk,
                         },
                         label=_('Add a Prefix'),
@@ -1683,6 +1804,16 @@ class VLANDeleteView(generic.ObjectDeleteView):
     queryset = VLAN.objects.all()
 
 
+@register_model_view(VLAN, 'bulk_add', path='bulk-add', detail=False)
+class VLANBulkCreateView(generic.BulkCreateView):
+    queryset = VLAN.objects.all()
+    form = forms.VLANIDBulkCreateForm
+    model_form = forms.VLANBulkAddForm
+    pattern_target = 'vid'
+    pattern_template_fields = ('name',)
+    template_name = 'ipam/vlan_bulk_add.html'
+
+
 @register_model_view(VLAN, 'bulk_import', path='import', detail=False)
 class VLANBulkImportView(generic.BulkImportView):
     queryset = VLAN.objects.all()
@@ -1725,6 +1856,7 @@ class ServiceTemplateListView(generic.ObjectListView):
 @register_model_view(ServiceTemplate)
 class ServiceTemplateView(generic.ObjectView):
     queryset = ServiceTemplate.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ServiceTemplatePanel(),

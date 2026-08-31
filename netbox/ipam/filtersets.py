@@ -289,6 +289,18 @@ class ASNFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         to_field_name='slug',
         label=_('Provider (slug)'),
     )
+    role_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=Role.objects.all(),
+        distinct=False,
+        label=_('Role (ID)'),
+    )
+    role = django_filters.ModelMultipleChoiceFilter(
+        field_name='role__slug',
+        queryset=Role.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Role (slug)'),
+    )
 
     class Meta:
         model = ASN
@@ -934,25 +946,28 @@ class FHRPGroupAssignmentFilterSet(ChangeLoggedModelFilterSet):
 @register_filterset
 class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
     scope_type = MultiValueContentTypeFilter()
-    region = django_filters.NumberFilter(
+    region = MultiValueNumberFilter(
         method='filter_scope'
     )
-    site_group = django_filters.NumberFilter(
+    site_group = MultiValueNumberFilter(
         method='filter_scope'
     )
-    site = django_filters.NumberFilter(
+    site = MultiValueNumberFilter(
         method='filter_scope'
     )
-    location = django_filters.NumberFilter(
+    location = MultiValueNumberFilter(
         method='filter_scope'
     )
-    rack = django_filters.NumberFilter(
+    rack_group = MultiValueNumberFilter(
         method='filter_scope'
     )
-    cluster_group = django_filters.NumberFilter(
+    rack = MultiValueNumberFilter(
         method='filter_scope'
     )
-    cluster = django_filters.NumberFilter(
+    cluster_group = MultiValueNumberFilter(
+        method='filter_scope'
+    )
+    cluster = MultiValueNumberFilter(
         method='filter_scope'
     )
     contains_vid = django_filters.NumberFilter(
@@ -962,7 +977,7 @@ class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
 
     class Meta:
         model = VLANGroup
-        fields = ('id', 'name', 'slug', 'description', 'scope_id')
+        fields = ('id', 'name', 'slug', 'description', 'scope_id', 'total_vlan_ids')
 
     def search(self, queryset, name, value):
         if not value.strip():
@@ -977,7 +992,7 @@ class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
         model_name = name.replace('_', '')
         return queryset.filter(
             scope_type=ContentType.objects.get(model=model_name),
-            scope_id=value
+            scope_id__in=value
         )
 
 
@@ -1054,8 +1069,12 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         queryset=Site.objects.all(),
         method='get_for_site'
     )
+    available_at_site_group = django_filters.ModelChoiceFilter(
+        queryset=SiteGroup.objects.all(),
+        method='get_for_site_group'
+    )
     available_on_device = django_filters.ModelChoiceFilter(
-        queryset=Device.objects.all(),
+        queryset=Device.objects.select_related('cluster'),
         method='get_for_device'
     )
     available_on_virtualmachine = django_filters.ModelChoiceFilter(
@@ -1116,6 +1135,10 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         return queryset.get_for_site(value)
 
     @extend_schema_field(OpenApiTypes.STR)
+    def get_for_site_group(self, queryset, name, value):
+        return queryset.get_for_site_group(value)
+
+    @extend_schema_field(OpenApiTypes.STR)
     def get_for_device(self, queryset, name, value):
         return queryset.get_for_device(value)
 
@@ -1127,19 +1150,17 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
     def filter_interface_id(self, queryset, name, value):
         if value is None:
             return queryset.none()
-        return queryset.filter(
-            Q(interfaces_as_tagged=value) |
-            Q(interfaces_as_untagged=value)
-        ).distinct()
+        tagged = queryset.filter(interfaces_as_tagged=value)
+        untagged = queryset.filter(interfaces_as_untagged=value)
+        return queryset.filter(pk__in=tagged.union(untagged).values('pk'))
 
     @extend_schema_field(OpenApiTypes.INT)
     def filter_vminterface_id(self, queryset, name, value):
         if value is None:
             return queryset.none()
-        return queryset.filter(
-            Q(vminterfaces_as_tagged=value) |
-            Q(vminterfaces_as_untagged=value)
-        ).distinct()
+        tagged = queryset.filter(vminterfaces_as_tagged=value)
+        untagged = queryset.filter(vminterfaces_as_untagged=value)
+        return queryset.filter(pk__in=tagged.union(untagged).values('pk'))
 
 
 @register_filterset

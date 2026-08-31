@@ -49,7 +49,7 @@ CABLE_LENGTH = """
 
 WEIGHT = """
 {% load helpers %}
-{% if value %}{{ value|floatformat:"-2" }} {{ record.weight_unit }}{% endif %}
+{% display_weight record.weight record.weight_unit record.abs_weight %}
 """
 
 DEVICE_LINK = """
@@ -565,7 +565,7 @@ DEVICEBAY_BUTTONS = """
         <a href="{% url 'dcim:devicebay_depopulate' pk=record.pk %}?return_url={% url 'dcim:device_devicebays' pk=object.pk %}" class="btn btn-danger btn-sm">
             <i class="mdi mdi-server-minus" aria-hidden="true" title="Remove device"></i>
         </a>
-    {% else %}
+    {% elif record.enabled %}
         <a href="{% url 'dcim:devicebay_populate' pk=record.pk %}?return_url={% url 'dcim:device_devicebays' pk=object.pk %}" class="btn btn-success btn-sm">
             <i class="mdi mdi-server-plus" aria-hidden="true" title="Install device"></i>
         </a>
@@ -579,7 +579,7 @@ MODULEBAY_BUTTONS = """
         <a href="{% url 'dcim:module_delete' pk=record.installed_module.pk %}?return_url={% url 'dcim:device_modulebays' pk=object.pk %}" class="btn btn-danger btn-sm">
             <i class="mdi mdi-server-minus" aria-hidden="true" title="Remove module"></i>
         </a>
-    {% else %}
+    {% elif record.enabled %}
         <a href="{% url 'dcim:module_add' %}?device={{ record.device_id }}&module_bay={{ record.pk }}&manufacturer={{ object.device_type.manufacturer_id }}&return_url={% url 'dcim:device_modulebays' pk=object.pk %}" class="btn btn-success btn-sm">
             <i class="mdi mdi-server-plus" aria-hidden="true" title="Install module"></i>
         </a>

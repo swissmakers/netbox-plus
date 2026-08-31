@@ -1,13 +1,23 @@
 import datetime
+import sys
+from types import ModuleType
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
-from django.test import Client
+from django.contrib.messages.storage.fallback import FallbackStorage
+from django.test import Client, RequestFactory, SimpleTestCase
 from django.test.utils import override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
+from social_core.exceptions import AuthFailed
 
-from core.models import ObjectType
+from core.choices import ManagedFileRootPathChoices
+from core.models import ManagedFile, ObjectType
 from dcim.models import Rack, Site
+from extras.models import ScriptModule
+from netbox.authentication import LDAPBackend
+from netbox.authentication.misc import _mirror_groups
+from netbox.middleware import SocialAuthExceptionMiddleware
 from users.constants import TOKEN_PREFIX
 from users.models import Group, ObjectPermission, Token, User
 from utilities.testing import TestCase
@@ -514,6 +524,84 @@ class ExternalAuthenticationTestCase(TestCase):
         )
 
 
+class LDAPMirrorGroupsTestCase(TestCase):
+    """
+    Test the custom _mirror_groups() patched onto django-auth-ldap's _LDAPUser.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username='ldapuser')
+        Group.objects.create(name='Group 1')
+
+    def _build_ldap_user(self, group_names):
+        """
+        Construct a mock _LDAPUser whose LDAP group search returns the given names.
+        """
+        ldap_user = MagicMock()
+        ldap_user._user = self.user
+        ldap_user._get_groups.return_value.get_group_names.return_value = group_names
+        # Disable allow/deny list handling
+        ldap_user.settings.MIRROR_GROUPS_EXCEPT = None
+        ldap_user.settings.MIRROR_GROUPS = None
+        return ldap_user
+
+    def test_mirror_groups_ignores_empty_names(self):
+        """
+        An LDAP group search returning an empty or null name must not attempt to
+        create a Group with a null name (see #21310).
+        """
+        ldap_user = self._build_ldap_user({'Group 1', '', None})
+
+        _mirror_groups(ldap_user)
+
+        # No group with a null or empty name should have been created
+        self.assertFalse(Group.objects.filter(name__isnull=True).exists())
+        self.assertFalse(Group.objects.filter(name='').exists())
+        # The user should be mirrored into the one valid, matching group
+        self.assertListEqual(
+            ['Group 1'],
+            list(self.user.groups.values_list('name', flat=True))
+        )
+
+
+class LDAPBackendTest(SimpleTestCase):
+    """The LDAP backend reads ldap_config.py from the active configuration directory."""
+
+    def test_backend_loads_ldap_config_from_configuration_dir(self):
+        with override_settings(CONFIGURATION_DIR='/srv/netbox/conf', NETBOX_INSTALL_MODE='checkout'):
+            backend, loader = self._build_backend()
+        loader.assert_called_once_with('/srv/netbox/conf', allow_legacy_fallback=True)
+        self.assertEqual(backend.settings.SERVER_URI, 'ldaps://example')
+
+    def test_backend_disables_legacy_fallback_for_wheel_installs(self):
+        with override_settings(CONFIGURATION_DIR='/opt/netbox/conf', NETBOX_INSTALL_MODE='wheel'):
+            backend, loader = self._build_backend()
+        loader.assert_called_once_with('/opt/netbox/conf', allow_legacy_fallback=False)
+        self.assertEqual(backend.settings.SERVER_URI, 'ldaps://example')
+
+    def _build_backend(self):
+        fake_ldap = ModuleType('ldap')
+        fake_ldap.set_option = MagicMock()
+        backend_module = ModuleType('django_auth_ldap.backend')
+        backend_module.LDAPSettings = type('LDAPSettings', (), {'_prefix': 'AUTH_LDAP_'})
+        package = ModuleType('django_auth_ldap')
+        package.backend = backend_module
+        ldap_config = ModuleType('netbox.ldap_config')
+        ldap_config.AUTH_LDAP_SERVER_URI = 'ldaps://example'
+        with (
+            patch.dict(sys.modules, {
+                'ldap': fake_ldap,
+                'django_auth_ldap': package,
+                'django_auth_ldap.backend': backend_module,
+            }),
+            patch('netbox.authentication.NBLDAPBackend', MagicMock(), create=True),
+            patch('netbox.authentication.load_ldap_config', return_value=ldap_config) as loader,
+        ):
+            backend = LDAPBackend()
+        return backend, loader
+
+
 class ObjectPermissionAPIViewTestCase(TestCase):
     client_class = APIClient
 
@@ -697,3 +785,104 @@ class ObjectPermissionAPIViewTestCase(TestCase):
         url = reverse('dcim-api:rack-detail', kwargs={'pk': self.racks[0].pk})
         response = self.client.delete(url, format='json', **self.header)
         self.assertEqual(response.status_code, 204)
+
+
+class ObjectPermissionProxyModelTestCase(TestCase):
+    """
+    Object-level permission checks against proxy models (e.g. extras.ScriptModule proxying
+    core.ManagedFile) must evaluate the permission rather than raise ValueError.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.managed_file = ManagedFile.objects.create(
+            file_root=ManagedFileRootPathChoices.SCRIPTS,
+            file_path='proxy_permission_test.py'
+        )
+        cls.script_module = ScriptModule.objects.get(pk=cls.managed_file.pk)
+
+    def _grant_scriptmodule_permission(self, constraints=None):
+        obj_perm = ObjectPermission(name='ScriptModule change', actions=['change'], constraints=constraints)
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(ScriptModule, for_concrete_model=False))
+
+    def test_has_perm_cross_app_proxy_model(self):
+        """An unconstrained proxy-model permission grants access to a proxy instance."""
+        self._grant_scriptmodule_permission()
+        self.assertTrue(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_cross_app_proxy_model_matching_constraints(self):
+        """A constrained proxy-model permission grants access when the instance matches."""
+        self._grant_scriptmodule_permission(constraints={'file_path': 'proxy_permission_test.py'})
+        self.assertTrue(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_cross_app_proxy_model_nonmatching_constraints(self):
+        """A constrained proxy-model permission denies access when the instance does not match."""
+        self._grant_scriptmodule_permission(constraints={'file_path': 'other.py'})
+        self.assertFalse(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_invalid_permission_object_pair(self):
+        """A permission checked against an object of an unrelated model denies instead of raising."""
+        site = Site.objects.create(name='Proxy Test Site', slug='proxy-test-site')
+        self._grant_scriptmodule_permission()
+        self.assertFalse(self.user.has_perm('extras.change_scriptmodule', site))
+
+    @override_settings(DEFAULT_PERMISSIONS={'extras.change_nosuchmodel': None})
+    def test_has_perm_unknown_model_permission(self):
+        """A permission naming a nonexistent model denies and logs a warning instead of raising."""
+        self._grant_scriptmodule_permission()
+        with self.assertLogs('netbox.auth.ObjectPermissionBackend', level='WARNING'):
+            self.assertFalse(self.user.has_perm('extras.change_nosuchmodel', self.script_module))
+
+
+class SocialAuthExceptionMiddlewareTestCase(SimpleTestCase):
+    """
+    Verify that SSO/SAML authentication failures are surfaced as a login-page message rather than
+    bubbling up as an HTTP 500 (see #22346).
+    """
+    GENERIC_MESSAGE = "Single sign-on failed. Please try again or contact your administrator."
+
+    class FakeStrategy:
+        # Mirror social_core's DjangoStrategy.setting(), which reads SOCIAL_AUTH_<NAME> from Django
+        # settings. This ensures the test exercises the real configured values (e.g.
+        # SOCIAL_AUTH_LOGIN_ERROR_URL) rather than hardcoded stand-ins.
+        def setting(self, name, default=None, backend=None):
+            return getattr(settings, f'SOCIAL_AUTH_{name}', default)
+
+    class FakeBackend:
+        name = 'saml'
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.middleware = SocialAuthExceptionMiddleware(lambda request: None)
+
+    def _make_request(self):
+        request = self.factory.get('/')
+        request.social_strategy = self.FakeStrategy()
+        request.backend = self.FakeBackend()
+        # Attach message storage (normally provided by MessageMiddleware)
+        setattr(request, 'session', {})
+        request._messages = FallbackStorage(request)
+        return request
+
+    def test_generic_message(self):
+        """
+        The raw exception text should never be surfaced to the user.
+        """
+        request = self._make_request()
+        exception = AuthFailed(self.FakeBackend(), 'raw internal SAML detail')
+        self.assertEqual(self.middleware.get_message(request, exception), self.GENERIC_MESSAGE)
+
+    def test_redirect_on_failure(self):
+        """
+        A SocialAuthBaseException should redirect to the login page with the generic message set.
+        """
+        request = self._make_request()
+        exception = AuthFailed(self.FakeBackend(), 'raw internal SAML detail')
+        response = self.middleware.process_exception(request, exception)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, settings.SOCIAL_AUTH_LOGIN_ERROR_URL)
+        self.assertEqual(response.url, settings.LOGIN_URL)
+        messages = [str(m) for m in request._messages]
+        self.assertEqual(messages, [self.GENERIC_MESSAGE])

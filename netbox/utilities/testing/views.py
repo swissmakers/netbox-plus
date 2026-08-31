@@ -3,7 +3,6 @@ import csv
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import ForeignKey
 from django.test import override_settings
 from django.urls import reverse
 from django.utils.translation import gettext as _
@@ -15,6 +14,7 @@ from netbox.models.features import ChangeLoggingMixin, CustomFieldsMixin
 from users.models import ObjectPermission
 
 from .base import ModelTestCase
+from .query_counts import assert_expected_query_count
 from .utils import add_custom_field_data, disable_warnings, get_random_string, post_data
 
 __all__ = (
@@ -192,8 +192,8 @@ class ViewTestCases:
                     changed_object_id=instance.pk
                 )
                 self.assertEqual(len(objectchanges), 1)
-                self.assertEqual(objectchanges[0].action, ObjectChangeActionChoices.ACTION_CREATE)
-                self.assertEqual(objectchanges[0].message, self.form_data['changelog_message'])
+                self.assertObjectChange(objectchanges[0], action=ObjectChangeActionChoices.ACTION_CREATE,
+                    message=self.form_data['changelog_message'])
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
         def test_create_object_with_constrained_permission(self):
@@ -299,8 +299,8 @@ class ViewTestCases:
                     changed_object_id=instance.pk
                 )
                 self.assertEqual(len(objectchanges), 1)
-                self.assertEqual(objectchanges[0].action, ObjectChangeActionChoices.ACTION_UPDATE)
-                self.assertEqual(objectchanges[0].message, self.form_data['changelog_message'])
+                self.assertObjectChange(objectchanges[0], action=ObjectChangeActionChoices.ACTION_UPDATE,
+                    message=self.form_data['changelog_message'])
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
         def test_edit_object_with_constrained_permission(self):
@@ -394,8 +394,8 @@ class ViewTestCases:
                     changed_object_id=instance.pk
                 )
                 self.assertEqual(len(objectchanges), 1)
-                self.assertEqual(objectchanges[0].action, ObjectChangeActionChoices.ACTION_DELETE)
-                self.assertEqual(objectchanges[0].message, form_data['changelog_message'])
+                self.assertObjectChange(objectchanges[0], action=ObjectChangeActionChoices.ACTION_DELETE,
+                    message=form_data['changelog_message'])
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
         def test_delete_object_with_constrained_permission(self):
@@ -470,7 +470,9 @@ class ViewTestCases:
             obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
 
             # Try GET with model-level permission
-            self.assertHttpStatus(self.client.get(self._get_url('list')), 200)
+            with assert_expected_query_count(self, 'list_objects_with_permission'):
+                response = self.client.get(self._get_url('list'))
+            self.assertHttpStatus(response, 200)
 
         def test_list_objects_with_constrained_permission(self):
             instance1, instance2 = self._get_queryset().all()[:2]
@@ -508,6 +510,31 @@ class ViewTestCases:
             response = self.client.get(f'{url}?export')
             self.assertHttpStatus(response, 200)
             self.assertEqual(response.get('Content-Type'), 'text/csv; charset=utf-8')
+
+            # Test table-based export
+            response = self.client.get(f'{url}?export=table')
+            self.assertHttpStatus(response, 200)
+            self.assertEqual(response.get('Content-Type'), 'text/csv; charset=utf-8')
+
+        @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], LOGIN_REQUIRED=False)
+        def test_export_objects_anonymous(self):
+            # Ensure we are logged out.
+            self.client.logout()
+
+            # Some models (e.g. the users model) always require to be logged in, so we skip them here.
+            ct = ContentType.objects.get_for_model(self.model)
+            if (ct.app_label, ct.model) in settings.EXEMPT_EXCLUDE_MODELS:
+                return
+
+            url = self._get_url('list')
+
+            # Test default CSV (or sometimes YAML) export
+            response = self.client.get(f'{url}?export')
+            self.assertHttpStatus(response, 200)
+            if hasattr(self.model, 'to_yaml'):
+                self.assertEqual(response.get('Content-Type'), 'text/yaml')
+            else:
+                self.assertEqual(response.get('Content-Type'), 'text/csv; charset=utf-8')
 
             # Test table-based export
             response = self.client.get(f'{url}?export=table')
@@ -716,7 +743,55 @@ class ViewTestCases:
                 self.assertEqual(len(objectchanges), expected_new_objects)
 
                 for oc in objectchanges:
-                    self.assertEqual(oc.message, data['changelog_message'])
+                    self.assertObjectChange(oc, action=ObjectChangeActionChoices.ACTION_CREATE,
+                        message=data['changelog_message'])
+
+        @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+        def test_bulk_update_objects_without_change_permission(self):
+            # Bulk import rows carrying an object ID update existing objects. This must require the 'change'
+            # permission, matching the REST API; the 'add' permission alone must not permit updates.
+            if not hasattr(self, 'csv_update_data'):
+                raise NotImplementedError(_("The test must define csv_update_data."))
+
+            initial_count = self._get_queryset().count()
+            array, csv_data = self._get_update_csv_data()
+            data = {
+                'format': ImportFormatChoices.CSV,
+                'data': csv_data,
+                'csv_delimiter': CSVDelimiterChoices.AUTO,
+            }
+
+            # Assign only the 'add' permission
+            obj_perm = ObjectPermission(
+                name='Test permission',
+                actions=['add']
+            )
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+            # Take a snapshot of the objects targeted for update
+            reader = csv.DictReader(array, delimiter=',')
+            check_data = list(reader)
+            before = {
+                line['id']: self.model.objects.get(id=line['id'])
+                for line in check_data
+            }
+
+            # The import must be rejected with a permissions error (form re-rendered) and no object modified
+            response = self.client.post(self._get_url('bulk_import'), data)
+            self.assertHttpStatus(response, 200)
+            self.assertContains(response, 'Remove the ID column to create new objects instead.')
+            self.assertEqual(initial_count, self._get_queryset().count())
+            for line in check_data:
+                obj = self.model.objects.get(id=line['id'])
+                for attr in line:
+                    if attr == 'id':
+                        continue
+                    # Skip relational fields (FK/M2M), consistent with test_bulk_update_objects_with_permission
+                    if self.model._meta.get_field(attr).is_relation:
+                        continue
+                    self.assertEqual(getattr(obj, attr), getattr(before[line['id']], attr))
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
         def test_bulk_update_objects_with_permission(self):
@@ -731,10 +806,10 @@ class ViewTestCases:
                 'csv_delimiter': CSVDelimiterChoices.AUTO,
             }
 
-            # Assign model-level permission
+            # Updating existing objects requires both 'add' (to reach the view) and 'change' (to update)
             obj_perm = ObjectPermission(
                 name='Test permission',
-                actions=['add']
+                actions=['add', 'change']
             )
             obj_perm.save()
             obj_perm.users.add(self.user)
@@ -744,17 +819,25 @@ class ViewTestCases:
             self.assertHttpStatus(self.client.post(self._get_url('bulk_import'), data), 302)
             self.assertEqual(initial_count, self._get_queryset().count())
 
+            # Verify that each object was actually updated to match the value specified in the CSV
             reader = csv.DictReader(array, delimiter=',')
             check_data = list(reader)
             for line in check_data:
                 obj = self.model.objects.get(id=line["id"])
-                for attr, value in line.items():
-                    if attr != "id":
-                        field = self.model._meta.get_field(attr)
-                        value = getattr(obj, attr)
-                        # cannot verify FK fields as don't know what name the CSV maps to
-                        if value is not None and not isinstance(field, ForeignKey):
-                            self.assertEqual(value, value)
+                for attr, expected in line.items():
+                    if attr == "id":
+                        continue
+                    field = self.model._meta.get_field(attr)
+                    # Skip relational fields (FK/M2M): the CSV value can't be mapped to a comparable attribute
+                    if field.is_relation:
+                        continue
+                    actual = getattr(obj, attr)
+                    # Only verify simple scalar values against the raw CSV string; skip lists and other complex
+                    # representations that the import form transforms (e.g. choice-set extra_choices).
+                    if not isinstance(actual, (str, int, float)):
+                        continue
+                    # Compare case-insensitively to tolerate values normalized on save (e.g. MAC addresses)
+                    self.assertEqual(str(actual).lower(), str(expected).lower())
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
         def test_bulk_import_objects_with_constrained_permission(self, post_import_callback=None):
@@ -868,8 +951,8 @@ class ViewTestCases:
                 )
                 self.assertEqual(len(objectchanges), len(pk_list))
                 for oc in objectchanges:
-                    self.assertEqual(oc.action, ObjectChangeActionChoices.ACTION_UPDATE)
-                    self.assertEqual(oc.message, data['changelog_message'])
+                    self.assertObjectChange(oc, action=ObjectChangeActionChoices.ACTION_UPDATE,
+                        message=data['changelog_message'])
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
         def test_bulk_edit_objects_with_constrained_permission(self):
@@ -964,8 +1047,8 @@ class ViewTestCases:
                 )
                 self.assertEqual(len(objectchanges), len(pk_list))
                 for oc in objectchanges:
-                    self.assertEqual(oc.action, ObjectChangeActionChoices.ACTION_DELETE)
-                    self.assertEqual(oc.message, data['changelog_message'])
+                    self.assertObjectChange(oc, action=ObjectChangeActionChoices.ACTION_DELETE,
+                        message=data['changelog_message'])
 
         def test_bulk_delete_objects_with_constrained_permission(self):
             pk_list = self._get_queryset().values_list('pk', flat=True)
@@ -1031,6 +1114,7 @@ class ViewTestCases:
             data = {
                 'pk': pk_list,
                 '_apply': True,  # Form button
+                'field_names': ['name'],
             }
             data.update(self.rename_data)
 
@@ -1049,12 +1133,49 @@ class ViewTestCases:
                 self.assertEqual(instance.name, f'{objects[i].name}X')
 
         @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+        def test_bulk_rename_objects_with_changelog_message(self):
+            if not issubclass(self.model, ChangeLoggingMixin):
+                self.skipTest("Model does not support change logging")
+            objects = self._get_queryset().all()[:3]
+            pk_list = [obj.pk for obj in objects]
+            data = {
+                'pk': pk_list,
+                '_apply': True,
+                'changelog_message': 'Bulk rename test message',
+                'field_names': ['name'],
+            }
+            data.update(self.rename_data)
+
+            # Assign model-level permission
+            obj_perm = ObjectPermission(
+                name='Test permission',
+                actions=['change']
+            )
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+            self.assertHttpStatus(self.client.post(self._get_url('bulk_rename'), data), 302)
+
+            # Verify changelog message was recorded on each renamed object
+            object_type = ObjectType.objects.get_for_model(self.model)
+            for pk in pk_list:
+                oc = ObjectChange.objects.filter(
+                    changed_object_type=object_type,
+                    changed_object_id=pk,
+                    action=ObjectChangeActionChoices.ACTION_UPDATE,
+                ).order_by('-time').first()
+                self.assertIsNotNone(oc)
+                self.assertEqual(oc.message, 'Bulk rename test message')
+
+        @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
         def test_bulk_rename_objects_with_constrained_permission(self):
             objects = self._get_queryset().all()[:3]
             pk_list = [obj.pk for obj in objects]
             data = {
                 'pk': pk_list,
                 '_apply': True,  # Form button
+                'field_names': ['name'],
             }
             data.update(self.rename_data)
 
@@ -1080,6 +1201,59 @@ class ViewTestCases:
             self.assertHttpStatus(self.client.post(self._get_url('bulk_rename'), data), 302)
             for i, instance in enumerate(self._get_queryset().filter(pk__in=pk_list)):
                 self.assertEqual(instance.name, f'{objects[i].name}X')
+
+        @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+        def test_bulk_rename_label_field(self):
+            """When field_names=['label'] is submitted, labels (not names) are updated."""
+            if 'label' not in {f.name for f in self.model._meta.fields}:
+                self.skipTest("Model does not have a label field")
+
+            objects = self._get_queryset().all()[:3]
+            pk_list = [obj.pk for obj in objects]
+            original_labels = [obj.label for obj in objects]
+            data = {
+                'pk': pk_list,
+                'field_names': ['label'],
+                '_apply': True,
+            }
+            data.update(self.rename_data)
+
+            obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+            self.assertHttpStatus(self.client.post(self._get_url('bulk_rename'), data), 302)
+            for i, instance in enumerate(self._get_queryset().filter(pk__in=pk_list)):
+                self.assertEqual(instance.label, f'{original_labels[i]}X')
+                self.assertEqual(instance.name, objects[i].name)
+
+        @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+        def test_bulk_rename_name_and_label_fields(self):
+            """When field_names=['name', 'label'] is submitted, both fields are updated simultaneously."""
+            if 'label' not in {f.name for f in self.model._meta.fields}:
+                self.skipTest("Model does not have a label field")
+
+            objects = self._get_queryset().all()[:3]
+            pk_list = [obj.pk for obj in objects]
+            original_names = [obj.name for obj in objects]
+            original_labels = [obj.label for obj in objects]
+            data = {
+                'pk': pk_list,
+                'field_names': ['name', 'label'],
+                '_apply': True,
+            }
+            data.update(self.rename_data)
+
+            obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+            self.assertHttpStatus(self.client.post(self._get_url('bulk_rename'), data), 302)
+            for i, instance in enumerate(self._get_queryset().filter(pk__in=pk_list)):
+                self.assertEqual(instance.name, f'{original_names[i]}X')
+                self.assertEqual(instance.label, f'{original_labels[i]}X')
 
     class PrimaryObjectViewTestCase(
         GetObjectViewTestCase,

@@ -45,7 +45,7 @@ Sets content for the top banner in the user interface.
 
 !!! tip
     If you'd like the top and bottom banners to match, set the following:
-    
+
     ```python
     BANNER_TOP = 'Your banner text'
     BANNER_BOTTOM = BANNER_TOP
@@ -70,6 +70,23 @@ Default: `True`
 Enables anonymous census reporting. To opt out of census reporting, set this to `False`.
 
 This data enables the project maintainers to estimate how many NetBox deployments exist and track the adoption of new versions over time. Census reporting effects a single HTTP request each time a worker starts. The only data reported by this function are the NetBox version, Python version, and a pseudorandom unique identifier.
+
+---
+
+## CHANGELOG_RETAIN_CREATE_LAST_UPDATE
+
+!!! tip "Dynamic Configuration Parameter"
+
+Default: `False`
+
+When pruning expired changelog entries (per `CHANGELOG_RETENTION`), retain each non-deleted object's original `create`
+change record and its most recent `update` change record. If an object has a `delete` change record, its changelog
+entries are pruned normally according to `CHANGELOG_RETENTION`.
+
+!!! note
+    For objects without a `delete` change record, the original `create` record and most recent `update` record are
+    exempt from pruning. All other changelog records (including intermediate `update` records and all `delete` records)
+    remain subject to pruning per `CHANGELOG_RETENTION`.
 
 ---
 
@@ -103,6 +120,18 @@ If enabled, a change log record will not be created when an object is updated wi
 Default: `2621440` (2.5 MB)
 
 The maximum size (in bytes) of an incoming HTTP request (i.e. `GET` or `POST` data). Requests which exceed this size will raise a `RequestDataTooBig` exception.
+
+---
+
+## STREAMING_EXPORTS
+
+!!! note "This parameter was introduced in NetBox v4.6."
+
+Default: `False`
+
+When set to `True`, CSV bulk exports are returned as a streaming HTTP response, emitting rows to the client as they are rendered rather than buffering the entire dataset in memory first. This can significantly reduce memory usage and time-to-first-byte for very large exports.
+
+Because streaming responses do not have a `Content-Length` header and defer errors until after the response has begun, this behavior is opt-in.
 
 ---
 
@@ -161,7 +190,21 @@ Setting this to `True` will display a "maintenance mode" banner at the top of ev
 
 Default: `https://maps.google.com/?q=` (Google Maps)
 
-This specifies the URL to use when presenting a map of a physical location by street address or GPS coordinates. The URL must accept either a free-form street address or a comma-separated pair of numeric coordinates appended to it. Set this to `None` to disable the "map it" button within the UI.
+This specifies the URL to use when presenting a map of a physical location by street address or GPS coordinates. Set this to `None` to disable the "map it" button within the UI.
+
+**For street addresses**, the URL must accept a free-form address string appended directly to it.
+
+**For GPS coordinates**, two formats are supported:
+
+* **Simple prefix** (default behavior): The latitude and longitude are appended as a comma-separated pair. For example, `https://maps.google.com/?q=` produces `https://maps.google.com/?q=48.858,2.294`.
+* **Coordinate placeholders**: Include `{lat}` and/or `{lon}` anywhere in the URL. Only these two literal placeholders are supported. For example:
+
+```
+MAPS_URL = "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}"
+```
+
+!!! note
+    When `MAPS_URL` contains `{lat}` or `{lon}` placeholders, the "map it" button will only appear on pages with GPS coordinates — address-based map links will be suppressed, since the coordinate-format URL cannot be used with a plain address string.
 
 ---
 
@@ -171,7 +214,9 @@ This specifies the URL to use when presenting a map of a physical location by st
 
 Default: `1000`
 
-A web user or API consumer can request an arbitrary number of objects by appending the "limit" parameter to the URL (e.g. `?limit=1000`). This parameter defines the maximum acceptable limit. Setting this to `0` or `None` will allow a client to retrieve _all_ matching objects at once with no limit by specifying `?limit=0`.
+Defines the maximum number of objects that may be returned in a single page across the web UI, REST API, and GraphQL API. Setting `MAX_PAGE_SIZE` to `0` or `None` removes the limit.
+
+See the [REST API](../integrations/rest-api.md#pagination) and [GraphQL API](../integrations/graphql-api.md#pagination) pagination documentation for details.
 
 ---
 

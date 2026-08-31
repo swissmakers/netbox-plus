@@ -142,6 +142,11 @@ EMAIL = {
     'FROM_EMAIL': '',
 }
 
+# Return CSV bulk exports as a streaming HTTP response, which avoids buffering the entire dataset in memory before
+# sending it to the client. This is recommended for very large exports, but it alters the response behavior so it is
+# disabled by default.
+STREAMING_EXPORTS = False
+
 # Exempt certain models from the enforcement of view permissions. Models listed here will be viewable by all users and
 # by anonymous users. List models in the form `<app>.<model>`. Add '*' to this list to exempt all models.
 EXEMPT_VIEW_PERMISSIONS = [
@@ -156,10 +161,6 @@ EXEMPT_VIEW_PERMISSIONS = [
 #     'https': 'http://10.10.1.10:1080',
 # }
 
-# IP addresses recognized as internal to the system. The debugging toolbar will be available only to clients accessing
-# NetBox from an internal IP.
-INTERNAL_IPS = ('127.0.0.1', '::1')
-
 # Enable custom logging. Please see the Django documentation for detailed guidance on configuring custom logs:
 #   https://docs.djangoproject.com/en/stable/topics/logging/
 LOGGING = {}
@@ -168,11 +169,8 @@ LOGGING = {}
 # authenticated to NetBox indefinitely.
 LOGIN_PERSISTENCE = False
 
-# Setting this to False will permit unauthenticated users to access most areas of NetBox (but not make any changes).
-LOGIN_REQUIRED = True
-
 # The length of time (in seconds) for which a user will remain logged into the web UI before being prompted to
-# re-authenticate. (Default: 1209600 [14 days])
+# re-authenticate. If set to None (the default), Django's SESSION_COOKIE_AGE is used (two weeks).
 LOGIN_TIMEOUT = None
 
 # Hide the login form. Useful when only allowing SSO authentication.
@@ -183,7 +181,7 @@ LOGOUT_REDIRECT_URL = 'home'
 
 # The file path where uploaded media such as image attachments are stored. A trailing slash is not needed. Note that
 # the default value of this setting is derived from the installed location.
-# MEDIA_ROOT = '/opt/netbox/netbox/media'
+# MEDIA_ROOT = '/path/to/netbox/media'
 
 # Expose Prometheus monitoring metrics at the HTTP endpoint '/metrics'
 METRICS_ENABLED = False
@@ -218,14 +216,14 @@ RELEASE_CHECK_URL = None
 
 # The file path where custom reports will be stored. A trailing slash is not needed. Note that the default value of
 # this setting is derived from the installed location.
-# REPORTS_ROOT = '/opt/netbox/netbox/reports'
+# REPORTS_ROOT = '/path/to/netbox/reports'
 
 # Maximum execution time for background tasks, in seconds.
 RQ_DEFAULT_TIMEOUT = 300
 
 # The file path where custom scripts will be stored. A trailing slash is not needed. Note that the default value of
 # this setting is derived from the installed location.
-# SCRIPTS_ROOT = '/opt/netbox/netbox/scripts'
+# SCRIPTS_ROOT = '/path/to/netbox/scripts'
 
 # The name to use for the session cookie.
 SESSION_COOKIE_NAME = 'sessionid'

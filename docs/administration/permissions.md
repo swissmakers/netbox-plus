@@ -20,7 +20,9 @@ There are four core actions that can be permitted for each type of object within
 * **Change** - Modify an existing object
 * **Delete** - Delete an existing object
 
-In addition to these, permissions can also grant custom actions that may be required by a specific model or plugin. For example, the `run` permission for scripts allows a user to execute custom scripts. These can be specified when granting a permission in the "additional actions" field.
+In addition to these, permissions can also grant custom actions that may be required by a specific model or plugin. For example, the `sync` action for data sources allows a user to synchronize data from a remote source, and the `render_config` action for devices and virtual machines allows rendering configuration templates.
+
+Some models have registered actions that appear as checkboxes in the "Actions" section when creating or editing a permission. These are shown in a flat list alongside the built-in CRUD actions. Additional actions (such as those not yet registered by a plugin, or for backwards compatibility) can be entered manually in the "Additional actions" field.
 
 !!! note
     Internally, all actions granted by a permission (both built-in and custom) are stored as strings in an array field named `actions`.
@@ -28,6 +30,9 @@ In addition to these, permissions can also grant custom actions that may be requ
 ## Constraints
 
 Constraints are expressed as a JSON object or list representing a [Django query filter](https://docs.djangoproject.com/en/stable/ref/models/querysets/#field-lookups). This is the same syntax that you would pass to the QuerySet `filter()` method when performing a query using the Django ORM. As with query filters, double underscores can be used to traverse related objects or invoke lookup expressions. Some example queries and their corresponding definitions are shown below.
+
+!!! note
+    Constraint definitions must be valid JSON. Because a backslash (`\`) is an escape character in a JSON string, a backslash that is part of a string value must itself be escaped. For example, a regular expression containing `\.` must be entered as `\\.` in the constraint definition.
 
 All attributes defined within a single JSON object are applied with a logical AND. For example, suppose you assign a permission for the site model with the following constraints.
 
@@ -81,6 +86,7 @@ While permissions are typically assigned to specific groups and/or users, it is 
 | `{"status": "active", "role": "testing"}` | Status is active **AND** role is testing |
 | `{"name__startswith": "Foo"}` | Name starts with "Foo" (case-sensitive) |
 | `{"name__iendswith": "bar"}` | Name ends with "bar" (case-insensitive) |
+| `{"name__regex": "^foo\\.bar$"}` | Name matches the regular expression `^foo\.bar$` |
 | `{"vid__gte": 100, "vid__lt": 200}` | VLAN ID is greater than or equal to 100 **AND** less than 200 |
 | `[{"vid__lt": 200}, {"status": "reserved"}]` | VLAN ID is less than 200 **OR** status is reserved |
 

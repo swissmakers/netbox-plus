@@ -1,13 +1,70 @@
+import warnings
 from unittest.mock import patch
 
+from django import forms
 from django.template.loader import render_to_string
 from django.test import TestCase, override_settings
 
-from utilities.templatetags.builtins.tags import badge, static_with_params
+from core.models import ObjectType
+from dcim.models import Site
+from extras.choices import CustomFieldTypeChoices
+from extras.models import CustomField, CustomFieldChoiceSet
+from utilities.forms.rendering import FieldSet, InlineFields
+from utilities.templatetags.builtins.tags import badge, customfield_value, static_with_params
+from utilities.templatetags.form_helpers import any_required, render_field_with_aria, render_fieldset
 from utilities.templatetags.helpers import _humanize_capacity, humanize_speed
 
 
-class StaticWithParamsTest(TestCase):
+class CustomFieldValueTagTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        object_type = ObjectType.objects.get_for_model(Site)
+        choice_set = CustomFieldChoiceSet.objects.create(
+            name='Choice Set 1',
+            extra_choices=(('a', 'Option A'), ('b', 'Option B')),
+            choice_colors={'a': 'red'},
+        )
+
+        cls.select_field = CustomField.objects.create(
+            name='select_field',
+            type=CustomFieldTypeChoices.TYPE_SELECT,
+            choice_set=choice_set,
+        )
+        cls.select_field.object_types.set([object_type])
+
+        cls.multiselect_field = CustomField.objects.create(
+            name='multiselect_field',
+            type=CustomFieldTypeChoices.TYPE_MULTISELECT,
+            choice_set=choice_set,
+        )
+        cls.multiselect_field.object_types.set([object_type])
+
+    def test_select_choice_context_includes_color(self):
+        context = customfield_value(self.select_field, 'a')
+
+        self.assertEqual(context['value'], 'Option A')
+        self.assertEqual(context['color'], 'red')
+
+    def test_multiselect_choice_context_includes_colors(self):
+        context = customfield_value(self.multiselect_field, ['a', 'b'])
+
+        self.assertTrue(context['value_has_colors'])
+        self.assertEqual(
+            context['value'],
+            [
+                ('Option A', 'red'),
+                ('Option B', None),
+            ],
+        )
+
+    def test_multiselect_choice_context_without_colors_preserves_plain_labels(self):
+        context = customfield_value(self.multiselect_field, ['b'])
+
+        self.assertFalse(context['value_has_colors'])
+        self.assertEqual(context['value'], ['Option B'])
+
+
+class StaticWithParamsTestCase(TestCase):
     """
     Test the static_with_params template tag functionality.
     """
@@ -49,8 +106,76 @@ class StaticWithParamsTest(TestCase):
                 self.assertIn('v=new_version', result)
                 self.assertNotIn('v=old_version', result)
 
+    @override_settings(STATIC_URL='https://s3.example.com/netbox/static/')
+    def test_static_with_params_sigv4_presigned_url(self):
+        """Test that parameters are not appended to an AWS signature v4 presigned URL."""
+        signed_url = (
+            'https://s3.example.com/netbox/static/test.js'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=ABC123%2F20260827%2Fus-east-1%2Fs3%2Faws4_request'
+            '&X-Amz-Date=20260827T141543Z'
+            '&X-Amz-Expires=3600'
+            '&X-Amz-SignedHeaders=host'
+            '&X-Amz-Signature=7a5af16a67d2bc7dc15b77fab733cafdc1344414d884fcf2e0b997b0b78dabca'
+        )
+        with patch('utilities.templatetags.builtins.tags.static') as mock_static:
+            mock_static.return_value = signed_url
 
-class BadgeTest(TestCase):
+            result = static_with_params('test.js', v='1.0.0')
+
+            # The signed URL must be returned verbatim: appending a parameter would be included in
+            # the signature calculation performed by the storage backend, invalidating the signature.
+            self.assertEqual(result, signed_url)
+            self.assertNotIn('v=1.0.0', result)
+
+    @override_settings(STATIC_URL='https://s3.example.com/netbox/static/')
+    def test_static_with_params_sigv2_presigned_url(self):
+        """Test that parameters are not appended to an AWS signature v2 presigned URL."""
+        signed_url = (
+            'https://s3.example.com/netbox/static/test.js'
+            '?AWSAccessKeyId=ABC123&Signature=hR9%2F5pRTOWo%3D&Expires=1748635659'
+        )
+        with patch('utilities.templatetags.builtins.tags.static') as mock_static:
+            mock_static.return_value = signed_url
+
+            result = static_with_params('test.js', v='1.0.0')
+
+            self.assertEqual(result, signed_url)
+            self.assertNotIn('v=1.0.0', result)
+
+    @override_settings(STATIC_URL='https://storage.example.com/netbox/static/')
+    def test_static_with_params_gcs_presigned_url(self):
+        """Test that parameters are not appended to a Google Cloud Storage v4 signed URL."""
+        signed_url = (
+            'https://storage.example.com/netbox/static/test.js'
+            '?X-Goog-Algorithm=GOOG4-RSA-SHA256'
+            '&X-Goog-Credential=netbox%40example.iam.gserviceaccount.com%2F20260827%2Fauto%2Fstorage'
+            '%2Fgoog4_request'
+            '&X-Goog-Date=20260827T141543Z'
+            '&X-Goog-Expires=3600'
+            '&X-Goog-SignedHeaders=host'
+            '&X-Goog-Signature=4bd3a1f0'
+        )
+        with patch('utilities.templatetags.builtins.tags.static') as mock_static:
+            mock_static.return_value = signed_url
+
+            result = static_with_params('test.js', v='1.0.0')
+
+            self.assertEqual(result, signed_url)
+            self.assertNotIn('v=1.0.0', result)
+
+    @override_settings(STATIC_URL='https://s3.example.com/netbox/static/')
+    def test_static_with_params_unsigned_s3_url(self):
+        """Test that parameters are appended to an unsigned (public bucket) S3 URL."""
+        with patch('utilities.templatetags.builtins.tags.static') as mock_static:
+            mock_static.return_value = 'https://s3.example.com/netbox/static/test.js'
+
+            result = static_with_params('test.js', v='1.0.0')
+
+            self.assertEqual(result, 'https://s3.example.com/netbox/static/test.js?v=1.0.0')
+
+
+class BadgeTestCase(TestCase):
     """
     Test the badge template tag functionality.
     """
@@ -64,7 +189,7 @@ class BadgeTest(TestCase):
         self.assertIn('>Role<', html)
 
 
-class HumanizeCapacityTest(TestCase):
+class HumanizeCapacityTestCase(TestCase):
     """
     Test the _humanize_capacity function for correct SI/IEC unit label selection.
     """
@@ -107,7 +232,7 @@ class HumanizeCapacityTest(TestCase):
         self.assertEqual(_humanize_capacity(2000), '2.00 GB')
 
 
-class HumanizeSpeedTest(TestCase):
+class HumanizeSpeedTestCase(TestCase):
     """
     Test the humanize_speed filter for correct unit selection and decimal formatting.
     """
@@ -189,3 +314,103 @@ class HumanizeSpeedTest(TestCase):
     def test_trailing_zeros_stripped(self):
         """Ensure trailing fractional zeros are stripped (5.500 → 5.5)."""
         self.assertEqual(humanize_speed(5_500_000), '5.5 Gbps')
+
+
+class RenderFieldWithAriaTestCase(TestCase):
+    """
+    Test the render_field_with_aria template tag.
+    """
+
+    def test_aria_describedby_includes_errors_and_helptext(self):
+        class TestForm(forms.Form):
+            name = forms.CharField(help_text='Hello', required=True)
+
+        form = TestForm({'name': ''})
+        self.assertFalse(form.is_valid())
+
+        html = render_field_with_aria(form['name'])
+
+        self.assertIn('aria-invalid="true"', html)
+        self.assertIn('id_name_errors', html)
+        self.assertIn('id_name_helptext', html)
+
+    def test_element_id_overrides_widget_id(self):
+        class TestForm(forms.Form):
+            name = forms.CharField()
+
+        form = TestForm()
+        html = render_field_with_aria(form['name'], element_id='custom-id')
+
+        self.assertIn('id="custom-id"', html)
+        self.assertNotIn('id="id_name"', html)
+
+    @override_settings(DEBUG=True)
+    def test_missing_label_emits_debug_warning(self):
+        class TestForm(forms.Form):
+            dns_name = forms.CharField(label='')
+
+        form = TestForm()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            html = render_field_with_aria(form['dns_name'])
+
+        messages = [str(w.message) for w in caught]
+        self.assertTrue(
+            any('TestForm.dns_name' in m for m in messages),
+            f'Expected a warning naming TestForm.dns_name; got: {messages}',
+        )
+        # No aria-label should be synthesized — an untranslated English fallback
+        # would degrade accessibility under non-English locales.
+        self.assertNotIn('aria-label', html)
+
+
+class AnyRequiredTestCase(TestCase):
+    """
+    Test the any_required template filter.
+    """
+
+    class TestForm(forms.Form):
+        required_field = forms.CharField(required=True)
+        optional_field = forms.CharField(required=False)
+
+    def test_returns_true_when_any_field_required(self):
+        form = self.TestForm()
+        self.assertTrue(any_required([form['optional_field'], form['required_field']]))
+
+    def test_returns_false_when_no_field_required(self):
+        form = self.TestForm()
+        self.assertFalse(any_required([form['optional_field']]))
+
+    def test_returns_false_for_empty_list(self):
+        self.assertFalse(any_required([]))
+
+
+class RenderFieldsetInlineRequiredTestCase(TestCase):
+    """
+    Verify the shared label for an InlineFields row receives the `required`
+    CSS class when at least one inline field is required.
+    """
+
+    class TestForm(forms.Form):
+        required_field = forms.CharField(required=True)
+        optional_field = forms.CharField(required=False)
+        another_optional = forms.CharField(required=False)
+
+    def _render(self, fieldset):
+        context = render_fieldset(self.TestForm(), fieldset)
+        return render_to_string('form_helpers/render_fieldset.html', context)
+
+    def test_inline_label_marked_required_when_any_field_required(self):
+        fieldset = FieldSet(
+            InlineFields('optional_field', 'required_field', label='Combined'),
+        )
+        html = self._render(fieldset)
+        self.assertIn('col-form-label text-lg-end required', html)
+
+    def test_inline_label_not_marked_required_when_no_field_required(self):
+        fieldset = FieldSet(
+            InlineFields('optional_field', 'another_optional', label='Combined'),
+        )
+        html = self._render(fieldset)
+        self.assertNotIn('col-form-label text-lg-end required', html)

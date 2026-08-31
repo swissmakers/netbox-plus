@@ -9,10 +9,12 @@ from django.http import Http404, HttpResponse, HttpResponseBadRequest, HttpRespo
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.decorators import method_decorator
+from django.utils.http import content_disposition_header
 from django.utils.module_loading import import_string
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.cache import never_cache
 from django.views.generic import View
-from jinja2.exceptions import TemplateError
 
 from core.choices import ManagedFileRootPathChoices
 from core.models import Job
@@ -39,7 +41,7 @@ from utilities.paginator import EnhancedPaginator, get_paginate_count
 from utilities.query import count_related
 from utilities.querydict import normalize_querydict
 from utilities.request import copy_safe_request
-from utilities.rqworker import get_workers_for_queue
+from utilities.rqworker import any_workers_for_queue
 from utilities.templatetags.builtins.filters import render_markdown
 from utilities.views import ContentTypePermissionRequiredMixin, get_action_url, register_model_view
 from virtualization.models import VirtualMachine
@@ -66,6 +68,7 @@ class CustomFieldListView(generic.ObjectListView):
 @register_model_view(CustomField)
 class CustomFieldView(generic.ObjectView):
     queryset = CustomField.objects.select_related('choice_set')
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.CustomFieldPanel(),
@@ -149,6 +152,7 @@ class CustomFieldChoiceSetListView(generic.ObjectListView):
 @register_model_view(CustomFieldChoiceSet)
 class CustomFieldChoiceSetView(generic.ObjectView):
     queryset = CustomFieldChoiceSet.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.CustomFieldChoiceSetPanel(),
@@ -166,7 +170,15 @@ class CustomFieldChoiceSetView(generic.ObjectView):
             page_number = request.GET.get('page', 1)
         except ValueError:
             page_number = 1
-        paginator = EnhancedPaginator(instance.choices, per_page)
+        choice_rows = [
+            {
+                'value': value,
+                'label': label,
+                'color': instance.get_choice_color(value),
+            }
+            for value, label in instance.choices
+        ]
+        paginator = EnhancedPaginator(choice_rows, per_page)
         try:
             choices = paginator.page(page_number)
         except EmptyPage:
@@ -232,6 +244,7 @@ class CustomLinkListView(generic.ObjectListView):
 @register_model_view(CustomLink)
 class CustomLinkView(generic.ObjectView):
     queryset = CustomLink.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.CustomLinkPanel(),
@@ -297,8 +310,10 @@ class ExportTemplateListView(generic.ObjectListView):
 
 
 @register_model_view(ExportTemplate)
+@method_decorator(never_cache, name='dispatch')
 class ExportTemplateView(generic.ObjectView):
     queryset = ExportTemplate.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ExportTemplatePanel(),
@@ -373,6 +388,7 @@ class SavedFilterListView(SharedObjectViewMixin, generic.ObjectListView):
 @register_model_view(SavedFilter)
 class SavedFilterView(SharedObjectViewMixin, generic.ObjectView):
     queryset = SavedFilter.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.SavedFilterPanel(),
@@ -444,6 +460,7 @@ class TableConfigListView(SharedObjectViewMixin, generic.ObjectListView):
 @register_model_view(TableConfig)
 class TableConfigView(SharedObjectViewMixin, generic.ObjectView):
     queryset = TableConfig.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.TableConfigPanel(),
@@ -467,6 +484,14 @@ class TableConfigEditView(SharedObjectViewMixin, generic.ObjectEditView):
     queryset = TableConfig.objects.all()
     form = forms.TableConfigForm
     template_name = 'extras/tableconfig_edit.html'
+
+    def get(self, request, *args, **kwargs):
+        # The add view requires the object_type & table parameters from the source table view
+        if not kwargs and not (request.GET.get('object_type') and request.GET.get('table')):
+            messages.warning(request, _('Table configurations must be created from an object list view.'))
+            return redirect('home')
+
+        return super().get(request, *args, **kwargs)
 
     def alter_object(self, obj, request, url_args, url_kwargs):
         if not obj.pk:
@@ -546,6 +571,7 @@ class NotificationGroupListView(generic.ObjectListView):
 @register_model_view(NotificationGroup)
 class NotificationGroupView(generic.ObjectView):
     queryset = NotificationGroup.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.NotificationGroupPanel(),
@@ -739,6 +765,7 @@ class WebhookListView(generic.ObjectListView):
 @register_model_view(Webhook)
 class WebhookView(generic.ObjectView):
     queryset = Webhook.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.WebhookPanel(),
@@ -808,6 +835,7 @@ class EventRuleListView(generic.ObjectListView):
 @register_model_view(EventRule)
 class EventRuleView(generic.ObjectView):
     queryset = EventRule.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.EventRulePanel(),
@@ -879,6 +907,7 @@ class TagListView(generic.ObjectListView):
 @register_model_view(Tag)
 class TagView(generic.ObjectView):
     queryset = Tag.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.TagPanel(),
@@ -968,8 +997,10 @@ class ConfigContextProfileListView(generic.ObjectListView):
 
 
 @register_model_view(ConfigContextProfile)
+@method_decorator(never_cache, name='dispatch')
 class ConfigContextProfileView(generic.ObjectView):
     queryset = ConfigContextProfile.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ConfigContextProfilePanel(),
@@ -1042,8 +1073,10 @@ class ConfigContextListView(generic.ObjectListView):
 
 
 @register_model_view(ConfigContext)
+@method_decorator(never_cache, name='dispatch')
 class ConfigContextView(generic.ObjectView):
     queryset = ConfigContext.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ConfigContextPanel(),
@@ -1127,6 +1160,7 @@ class ConfigContextBulkSyncDataView(generic.BulkSyncDataView):
     queryset = ConfigContext.objects.all()
 
 
+@method_decorator(never_cache, name='dispatch')
 class ObjectConfigContextView(generic.ObjectView):
     base_template = None
     template_name = 'extras/object_configcontext.html'
@@ -1171,8 +1205,10 @@ class ConfigTemplateListView(generic.ObjectListView):
 
 
 @register_model_view(ConfigTemplate)
+@method_decorator(never_cache, name='dispatch')
 class ConfigTemplateView(generic.ObjectView):
     queryset = ConfigTemplate.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ConfigTemplatePanel(),
@@ -1231,6 +1267,7 @@ class ConfigTemplateBulkSyncDataView(generic.BulkSyncDataView):
     queryset = ConfigTemplate.objects.all()
 
 
+@method_decorator(never_cache, name='dispatch')
 class ObjectRenderConfigView(generic.ObjectView):
     base_template = None
     template_name = 'extras/object_render_config.html'
@@ -1245,7 +1282,7 @@ class ObjectRenderConfigView(generic.ObjectView):
             content = context['rendered_config'] or context['error_message']
             response = HttpResponse(content, content_type='text')
             filename = f"{instance.name or 'config'}.txt"
-            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            response['Content-Disposition'] = content_disposition_header(as_attachment=True, filename=filename)
             return response
 
         return render(
@@ -1268,14 +1305,24 @@ class ObjectRenderConfigView(generic.ObjectView):
         context_data = instance.get_config_context()
         context_data.update(self.get_extra_context_data(request, instance))
 
+        # Check for an optional config_template_id override in the query params
+        config_template = None
+        error_message = ''
+        if config_template_id := request.GET.get('config_template_id'):
+            try:
+                config_template = ConfigTemplate.objects.restrict(request.user, 'view').get(pk=config_template_id)
+            except (ConfigTemplate.DoesNotExist, ValueError):
+                error_message = _("Config template with ID {id} not found.").format(id=config_template_id)
+        else:
+            config_template = instance.get_config_template()
+
         # Render the config template
         rendered_config = None
-        error_message = ''
-        if config_template := instance.get_config_template():
+        if config_template:
             try:
                 rendered_config = config_template.render(context=context_data)
-            except TemplateError as e:
-                error_message = _("An error occurred while rendering the template: {error}").format(error=e)
+            except Exception as e:
+                error_message = config_template.format_render_error(e)
 
         return {
             'base_template': self.base_template,
@@ -1302,6 +1349,7 @@ class ImageAttachmentListView(generic.ObjectListView):
 @register_model_view(ImageAttachment)
 class ImageAttachmentView(generic.ObjectView):
     queryset = ImageAttachment.objects.all()
+    template_name = 'generic/object.html'
     layout = layout.SimpleLayout(
         left_panels=[
             panels.ImageAttachmentPanel(),
@@ -1597,6 +1645,7 @@ class DashboardWidgetDeleteView(LoginRequiredMixin, View):
 class ScriptModuleCreateView(generic.ObjectEditView):
     queryset = ScriptModule.objects.all()
     form = forms.ScriptFileForm
+    default_return_url = 'extras:script_list'
 
     def alter_object(self, obj, *args, **kwargs):
         obj.file_root = ManagedFileRootPathChoices.SCRIPTS
@@ -1698,7 +1747,7 @@ class ScriptView(BaseScriptView):
         form = script_class.as_form(post_data, request.FILES)
 
         # Allow execution only if RQ worker process is running
-        if not get_workers_for_queue('default'):
+        if not any_workers_for_queue('default'):
             messages.error(request, _("Unable to run script: RQ worker process not running."))
         elif form.is_valid():
             ScriptJob = import_string("extras.jobs.ScriptJob")
@@ -1707,6 +1756,7 @@ class ScriptView(BaseScriptView):
                 user=request.user,
                 schedule_at=form.cleaned_data.pop('_schedule_at'),
                 interval=form.cleaned_data.pop('_interval'),
+                notifications=form.cleaned_data.pop('_notifications'),
                 data=form.cleaned_data,
                 request=copy_safe_request(request),
                 job_timeout=script.python_class.job_timeout,
@@ -1771,6 +1821,9 @@ class ScriptResultView(TableMixin, generic.ObjectView):
     def get_required_permission(self):
         return 'extras.view_script'
 
+    def get_queryset(self, request):
+        return Job.objects.restrict(request.user, 'view')
+
     def get_table(self, job, request, bulk_actions=True):
         data = []
         tests = None
@@ -1831,7 +1884,7 @@ class ScriptResultView(TableMixin, generic.ObjectView):
 
     def get(self, request, **kwargs):
         table = None
-        job = get_object_or_404(Job.objects.all(), pk=kwargs.get('job_pk'))
+        job = get_object_or_404(self.queryset, pk=kwargs.get('job_pk'))
 
         # If a direct export output has been requested, return the job data content as a
         # downloadable file.
@@ -1839,7 +1892,7 @@ class ScriptResultView(TableMixin, generic.ObjectView):
             content = (job.data.get("output") or "").encode()
             response = HttpResponse(content, content_type='text')
             filename = f"{job.object.name or 'script-output'}_{job.completed.strftime('%Y-%m-%d_%H%M%S')}.txt"
-            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            response['Content-Disposition'] = content_disposition_header(as_attachment=True, filename=filename)
             return response
 
         if job.completed:

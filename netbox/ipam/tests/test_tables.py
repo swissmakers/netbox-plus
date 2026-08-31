@@ -1,4 +1,4 @@
-from django.test import RequestFactory, TestCase
+from django.test import TestCase
 from netaddr import IPNetwork
 
 from ipam.models import FHRPGroupAssignment, IPAddress, IPRange, Prefix
@@ -7,7 +7,7 @@ from ipam.utils import annotate_ip_space
 from utilities.testing import TableTestCases
 
 
-class AnnotatedIPAddressTableTest(TestCase):
+class AnnotatedIPAddressTableTestCase(TestCase):
 
     @classmethod
     def setUpTestData(cls):
@@ -24,7 +24,8 @@ class AnnotatedIPAddressTableTest(TestCase):
         cls.ip_range = IPRange.objects.create(
             start_address=IPNetwork('10.1.1.2/24'),
             end_address=IPNetwork('10.1.1.10/24'),
-            status='active'
+            status='active',
+            mark_populated=True,
         )
 
     def test_ipaddress_has_checkbox_iprange_does_not(self):
@@ -32,14 +33,18 @@ class AnnotatedIPAddressTableTest(TestCase):
         table = AnnotatedIPAddressTable(data, orderable=False)
         table.columns.show('pk')
 
-        request = RequestFactory().get('/')
-        html = table.as_html(request)
+        ipaddress_row = next(
+            row for row in table.rows
+            if isinstance(row.record, IPAddress) and row.record.pk == self.ip_address.pk
+        )
+        iprange_row = next(
+            row for row in table.rows
+            if isinstance(row.record, IPRange) and row.record.pk == self.ip_range.pk
+        )
 
-        ipaddress_checkbox_count = html.count(f'name="pk" value="{self.ip_address.pk}"')
-        self.assertEqual(ipaddress_checkbox_count, 1)
-
-        iprange_checkbox_count = html.count(f'name="pk" value="{self.ip_range.pk}"')
-        self.assertEqual(iprange_checkbox_count, 0)
+        self.assertIn('name="pk"', ipaddress_row.get_cell('pk'))
+        self.assertIn(f'value="{self.ip_address.pk}"', ipaddress_row.get_cell('pk'))
+        self.assertNotIn('name="pk"', iprange_row.get_cell('pk'))
 
     def test_annotate_ip_space_ipv4_non_pool_excludes_network_and_broadcast(self):
         prefix = Prefix.objects.create(
@@ -175,43 +180,43 @@ class AnnotatedIPAddressTableTest(TestCase):
 # Table ordering tests
 #
 
-class VRFTableTest(TableTestCases.StandardTableTestCase):
+class VRFTableTestCase(TableTestCases.StandardTableTestCase):
     table = VRFTable
 
 
-class RouteTargetTableTest(TableTestCases.StandardTableTestCase):
+class RouteTargetTableTestCase(TableTestCases.StandardTableTestCase):
     table = RouteTargetTable
 
 
-class RIRTableTest(TableTestCases.StandardTableTestCase):
+class RIRTableTestCase(TableTestCases.StandardTableTestCase):
     table = RIRTable
 
 
-class AggregateTableTest(TableTestCases.StandardTableTestCase):
+class AggregateTableTestCase(TableTestCases.StandardTableTestCase):
     table = AggregateTable
 
 
-class RoleTableTest(TableTestCases.StandardTableTestCase):
+class RoleTableTestCase(TableTestCases.StandardTableTestCase):
     table = RoleTable
 
 
-class PrefixTableTest(TableTestCases.StandardTableTestCase):
+class PrefixTableTestCase(TableTestCases.StandardTableTestCase):
     table = PrefixTable
 
 
-class IPRangeTableTest(TableTestCases.StandardTableTestCase):
+class IPRangeTableTestCase(TableTestCases.StandardTableTestCase):
     table = IPRangeTable
 
 
-class IPAddressTableTest(TableTestCases.StandardTableTestCase):
+class IPAddressTableTestCase(TableTestCases.StandardTableTestCase):
     table = IPAddressTable
 
 
-class FHRPGroupTableTest(TableTestCases.StandardTableTestCase):
+class FHRPGroupTableTestCase(TableTestCases.StandardTableTestCase):
     table = FHRPGroupTable
 
 
-class FHRPGroupAssignmentTableTest(TableTestCases.StandardTableTestCase):
+class FHRPGroupAssignmentTableTestCase(TableTestCases.StandardTableTestCase):
     table = FHRPGroupAssignmentTable
 
     # No ObjectListView exists for this table; it is only rendered inline on
@@ -221,33 +226,33 @@ class FHRPGroupAssignmentTableTest(TableTestCases.StandardTableTestCase):
     ]
 
 
-class VLANGroupTableTest(TableTestCases.StandardTableTestCase):
+class VLANGroupTableTestCase(TableTestCases.StandardTableTestCase):
     table = VLANGroupTable
 
 
-class VLANTableTest(TableTestCases.StandardTableTestCase):
+class VLANTableTestCase(TableTestCases.StandardTableTestCase):
     table = VLANTable
 
 
-class VLANTranslationPolicyTableTest(TableTestCases.StandardTableTestCase):
+class VLANTranslationPolicyTableTestCase(TableTestCases.StandardTableTestCase):
     table = VLANTranslationPolicyTable
 
 
-class VLANTranslationRuleTableTest(TableTestCases.StandardTableTestCase):
+class VLANTranslationRuleTableTestCase(TableTestCases.StandardTableTestCase):
     table = VLANTranslationRuleTable
 
 
-class ASNRangeTableTest(TableTestCases.StandardTableTestCase):
+class ASNRangeTableTestCase(TableTestCases.StandardTableTestCase):
     table = ASNRangeTable
 
 
-class ASNTableTest(TableTestCases.StandardTableTestCase):
+class ASNTableTestCase(TableTestCases.StandardTableTestCase):
     table = ASNTable
 
 
-class ServiceTemplateTableTest(TableTestCases.StandardTableTestCase):
+class ServiceTemplateTableTestCase(TableTestCases.StandardTableTestCase):
     table = ServiceTemplateTable
 
 
-class ServiceTableTest(TableTestCases.StandardTableTestCase):
+class ServiceTableTestCase(TableTestCases.StandardTableTestCase):
     table = ServiceTable

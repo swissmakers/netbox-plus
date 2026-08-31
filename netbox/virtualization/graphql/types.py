@@ -3,8 +3,10 @@ from typing import TYPE_CHECKING, Annotated
 import strawberry
 import strawberry_django
 
+from dcim.models import Location, Region, Site, SiteGroup
 from extras.graphql.mixins import ConfigContextMixin, ContactsMixin
 from ipam.graphql.mixins import IPAddressesMixin, VLANGroupsMixin
+from netbox.graphql.optimization import build_gfk_prefetch
 from netbox.graphql.scalars import BigInt
 from netbox.graphql.types import NetBoxObjectType, OrganizationalObjectType, PrimaryObjectType
 from users.graphql.mixins import OwnerMixin
@@ -34,6 +36,7 @@ __all__ = (
     'VMInterfaceType',
     'VirtualDiskType',
     'VirtualMachineType',
+    'VirtualMachineTypeType',
 )
 
 
@@ -58,7 +61,18 @@ class ClusterType(ContactsMixin, VLANGroupsMixin, PrimaryObjectType):
     virtual_machines: list[Annotated["VirtualMachineType", strawberry.lazy('virtualization.graphql.types')]]
     devices: list[Annotated["DeviceType", strawberry.lazy('dcim.graphql.types')]]
 
-    @strawberry_django.field
+    @strawberry_django.field(
+        prefetch_related=build_gfk_prefetch(
+            'scope',
+            [
+                Region,
+                SiteGroup,
+                Site,
+                Location,
+            ],
+        ),
+        only=['scope_type', 'scope_id'],
+    )
     def scope(self) -> Annotated[
         Annotated['LocationType', strawberry.lazy('dcim.graphql.types')]
         | Annotated['RegionType', strawberry.lazy('dcim.graphql.types')]
@@ -92,6 +106,19 @@ class ClusterTypeType(OrganizationalObjectType):
 
 
 @strawberry_django.type(
+    models.VirtualMachineType,
+    fields='__all__',
+    filters=VirtualMachineTypeFilter,
+    pagination=True
+)
+class VirtualMachineTypeType(PrimaryObjectType):
+    virtual_machine_count: BigInt
+    default_platform: Annotated['PlatformType', strawberry.lazy('dcim.graphql.types')] | None
+
+    instances: list[Annotated['VirtualMachineType', strawberry.lazy('virtualization.graphql.types')]]
+
+
+@strawberry_django.type(
     models.VirtualMachine,
     fields='__all__',
     filters=VirtualMachineFilter,
@@ -101,6 +128,7 @@ class VirtualMachineType(ConfigContextMixin, ContactsMixin, PrimaryObjectType):
     interface_count: BigInt
     virtual_disk_count: BigInt
     interface_count: BigInt
+    virtual_machine_type: Annotated['VirtualMachineTypeType', strawberry.lazy('virtualization.graphql.types')] | None
     config_template: Annotated["ConfigTemplateType", strawberry.lazy('extras.graphql.types')] | None
     site: Annotated["SiteType", strawberry.lazy('dcim.graphql.types')] | None
     cluster: Annotated["ClusterType", strawberry.lazy('virtualization.graphql.types')] | None

@@ -59,7 +59,7 @@ See the [`DATABASES`](#databases) configuration below for usage.
 
 ## DATABASES
 
-NetBox requires access to a PostgreSQL 14 or later database service to store data. This service can run locally on the NetBox server or on a remote system. Databases are defined as named dictionaries:
+NetBox requires access to a PostgreSQL 14 or later database service to store data. Note that support for PostgreSQL 14 is deprecated and will be removed in NetBox v4.7; PostgreSQL 15 or later will be required. This service can run locally on the NetBox server or on a remote system. Databases are defined as named dictionaries:
 
 ```python
 DATABASES = {
@@ -145,6 +145,9 @@ REDIS = {
 !!! warning
     It is highly recommended to keep the task and cache databases separate. Using the same database number on the
     same Redis instance for both may result in queued background tasks being lost during cache flushing events.
+
+!!! danger "Redis is a trusted component"
+    NetBox's background workers deserialize and execute jobs read from the `tasks` Redis database, so any party with write access to it can run arbitrary code on a worker. Redis must be treated as trusted infrastructure, on par with the PostgreSQL database: keep it bound to a private network and require authentication.
 
 ### UNIX Socket Support
 

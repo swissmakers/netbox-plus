@@ -44,9 +44,9 @@ ADVISORY_LOCK_KEYS = {
     'job-schedules': 110100,
 }
 
-# TODO: Remove in NetBox v4.5
+# TODO: Remove in NetBox v4.7
 # Legacy default view action permission mapping
-DEFAULT_ACTION_PERMISSIONS = {
+_DEFAULT_ACTION_PERMISSIONS = {
     'add': {'add'},
     'export': {'view'},
     'bulk_import': {'add'},
@@ -54,9 +54,30 @@ DEFAULT_ACTION_PERMISSIONS = {
     'bulk_delete': {'delete'},
 }
 
+
+def __getattr__(name):
+    if name == 'DEFAULT_ACTION_PERMISSIONS':
+        import warnings
+        warnings.warn(
+            f"{name} is deprecated and will be removed in NetBox v4.7. "
+            "Define action permissions via ObjectAction subclasses instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_ACTION_PERMISSIONS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # General-purpose tokens
 CENSOR_TOKEN = '********'
 CENSOR_TOKEN_CHANGED = '***CHANGED***'
 
 # Placeholder text for empty tables
 EMPTY_TABLE_TEXT = 'No results found'
+
+# Batch size for deleting a JobsMixin object's associated jobs during cascade deletion. Job
+# cannot be fast-deleted (a global pre_delete receiver forces per-instance signals), so deleting
+# in chunks bounds the work per delete cycle rather than building one huge collection and running
+# one long DELETE. 1000 matches EXPORT_CHUNK_SIZE and, in benchmarking a 200k-job deletion, was
+# the fastest of 100/1000/5000 while keeping peak memory flat. See #22812.
+JOB_DELETE_BATCH_SIZE = 1000

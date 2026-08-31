@@ -1,6 +1,9 @@
 import logging
+import os
+import traceback
 from abc import ABC, abstractmethod
 from datetime import timedelta
+from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
@@ -20,6 +23,11 @@ __all__ = (
     'JobRunner',
     'system_job',
 )
+
+# The installation root, e.g. "/opt/netbox/". Used to strip absolute path
+# prefixes from traceback file paths before recording them in the job log.
+# jobs.py lives at <root>/netbox/netbox/jobs.py, so parents[2] is the root.
+_INSTALL_ROOT = str(Path(__file__).resolve().parents[2]) + os.sep
 
 
 def system_job(interval):
@@ -107,6 +115,13 @@ class JobRunner(ABC):
             job.terminate(status=JobStatusChoices.STATUS_FAILED)
 
         except Exception as e:
+            tb_str = traceback.format_exc().replace(_INSTALL_ROOT, '')
+            tb_record = logging.makeLogRecord({
+                'levelno': logging.ERROR,
+                'levelname': 'ERROR',
+                'msg': tb_str,
+            })
+            job.log(tb_record)
             job.terminate(status=JobStatusChoices.STATUS_ERRORED, error=repr(e))
             if type(e) is JobTimeoutException:
                 logger.error(e)
@@ -121,14 +136,37 @@ class JobRunner(ABC):
                 )
                 if job.object and getattr(job.object, "python_class", None):
                     kwargs["job_timeout"] = job.object.python_class.job_timeout
-                cls.enqueue(
+
+                enqueue_kwargs = dict(
                     instance=job.object,
                     name=job.name,
                     user=job.user,
                     schedule_at=new_scheduled_time,
                     interval=job.interval,
+                    notifications=job.notifications,
                     **kwargs,
                 )
+
+                if cls in registry['system_jobs']:
+                    # System jobs are also scheduled by `enqueue_once()` at worker startup,
+                    # which races with this finally block and can produce duplicate schedules
+                    # (see #22232). Acquire the same advisory lock used by `enqueue_once()`
+                    # and skip rescheduling if a successor is already enqueued.
+                    #
+                    # This branch is limited to system jobs because generic recurring jobs
+                    # (e.g. scheduled scripts) may have multiple legitimate schedules sharing
+                    # the same runner/object/interval but differing in their runtime kwargs.
+                    with advisory_lock(ADVISORY_LOCK_KEYS['job-schedules']):
+                        successor_exists = Job.objects.filter(
+                            name=cls.name,
+                            object_id__isnull=True,
+                            status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES,
+                            interval=job.interval,
+                        ).exclude(pk=job.pk).exists()
+                        if not successor_exists:
+                            cls.enqueue(**enqueue_kwargs)
+                else:
+                    cls.enqueue(**enqueue_kwargs)
 
     @classmethod
     def get_jobs(cls, instance=None):

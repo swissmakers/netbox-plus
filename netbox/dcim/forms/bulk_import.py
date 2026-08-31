@@ -8,6 +8,7 @@ from django.utils.translation import gettext_lazy as _
 from dcim.choices import *
 from dcim.constants import *
 from dcim.models import *
+from dcim.utils import reconcile_port_mappings
 from extras.models import ConfigTemplate
 from ipam.choices import VLANQinQRoleChoices
 from ipam.models import VLAN, VRF, IPAddress, VLANGroup
@@ -34,6 +35,7 @@ from wireless.choices import WirelessRoleChoices
 from .common import ModuleCommonForm
 
 __all__ = (
+    'CableBundleImportForm',
     'CableImportForm',
     'ConsolePortImportForm',
     'ConsoleServerPortImportForm',
@@ -57,6 +59,7 @@ __all__ = (
     'PowerOutletImportForm',
     'PowerPanelImportForm',
     'PowerPortImportForm',
+    'RackGroupImportForm',
     'RackImportForm',
     'RackReservationImportForm',
     'RackRoleImportForm',
@@ -187,6 +190,13 @@ class LocationImportForm(NestedGroupModelImportForm):
             self.fields['parent'].queryset = self.fields['parent'].queryset.filter(**params)
 
 
+class RackGroupImportForm(OrganizationalModelImportForm):
+
+    class Meta:
+        model = RackGroup
+        fields = ('name', 'slug', 'description', 'owner', 'comments', 'tags')
+
+
 class RackRoleImportForm(OrganizationalModelImportForm):
 
     class Meta:
@@ -261,6 +271,13 @@ class RackImportForm(PrimaryModelImportForm):
         to_field_name='name',
         help_text=_('Name of assigned tenant')
     )
+    group = CSVModelChoiceField(
+        label=_('Rack group'),
+        queryset=RackGroup.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Name of assigned group')
+    )
     status = CSVChoiceField(
         label=_('Status'),
         choices=RackStatusChoices,
@@ -318,10 +335,10 @@ class RackImportForm(PrimaryModelImportForm):
     class Meta:
         model = Rack
         fields = (
-            'site', 'location', 'name', 'facility_id', 'tenant', 'status', 'role', 'rack_type', 'form_factor', 'serial',
-            'asset_tag', 'width', 'u_height', 'desc_units', 'outer_width', 'outer_height', 'outer_depth', 'outer_unit',
-            'mounting_depth', 'airflow', 'weight', 'max_weight', 'weight_unit', 'description', 'owner', 'comments',
-            'tags',
+            'site', 'location', 'group', 'name', 'facility_id', 'tenant', 'status', 'role', 'rack_type', 'form_factor',
+            'serial', 'asset_tag', 'width', 'u_height', 'desc_units', 'outer_width', 'outer_height', 'outer_depth',
+            'outer_unit', 'mounting_depth', 'airflow', 'weight', 'max_weight', 'weight_unit', 'description', 'owner',
+            'comments', 'tags',
         )
 
     def __init__(self, data=None, *args, **kwargs):
@@ -1102,12 +1119,99 @@ class FrontPortImportForm(OwnerCSVMixin, NetBoxModelImportForm):
         choices=PortTypeChoices,
         help_text=_('Physical medium classification')
     )
+    rear_port = CSVModelChoiceField(
+        label=_('Rear port'),
+        queryset=RearPort.objects.all(),
+        to_field_name='name',
+        help_text=_('Corresponding rear port (mapped to the front port\'s first position)')
+    )
+    rear_port_position = forms.IntegerField(
+        label=_('Rear port position'),
+        required=False,
+        help_text=_('Mapped position on the corresponding rear port (defaults to 1)')
+    )
 
     class Meta:
         model = FrontPort
         fields = (
-            'device', 'name', 'label', 'type', 'color', 'mark_connected', 'positions', 'description', 'owner', 'tags'
+            'device', 'name', 'label', 'type', 'color', 'mark_connected', 'positions', 'rear_port',
+            'rear_port_position', 'description', 'owner', 'tags'
         )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Limit RearPort choices to those belonging to this device (or VC master)
+        if self.is_bound and 'device' in self.data:
+            try:
+                device = self.fields['device'].to_python(self.data['device'])
+            except forms.ValidationError:
+                device = None
+        else:
+            try:
+                device = self.instance.device
+            except Device.DoesNotExist:
+                device = None
+
+        if device:
+            self.fields['rear_port'].queryset = RearPort.objects.filter(
+                device__in=[device, device.get_vc_master()]
+            )
+        else:
+            self.fields['rear_port'].queryset = RearPort.objects.none()
+
+    def clean(self):
+        super().clean()
+
+        rear_port = self.cleaned_data.get('rear_port')
+        rear_port_position = self.cleaned_data.get('rear_port_position') or 1
+        if not rear_port:
+            return
+
+        # Validate the rear port position against the selected rear port
+        if rear_port_position > rear_port.positions:
+            raise forms.ValidationError({
+                'rear_port_position': _(
+                    "Invalid rear port position ({rear_port_position}): Rear port {name} has only {positions} "
+                    "positions."
+                ).format(
+                    rear_port_position=rear_port_position,
+                    name=rear_port.name,
+                    positions=rear_port.positions
+                )
+            })
+
+        # Ensure the target rear port position isn't already occupied. reconcile_port_mappings() creates the
+        # mapping via create() (bypassing validate_unique()), so without this check a collision would surface
+        # as an uncaught IntegrityError (HTTP 500) rather than a row-level validation error.
+        occupied = PortMapping.objects.filter(
+            rear_port=rear_port, rear_port_position=rear_port_position
+        ).exclude(front_port=self.instance.pk)
+        if occupied.exists():
+            raise forms.ValidationError({
+                'rear_port_position': _(
+                    "Rear port {name} position {rear_port_position} is already occupied."
+                ).format(
+                    name=rear_port.name,
+                    rear_port_position=rear_port_position
+                )
+            })
+
+    def _save_m2m(self):
+        super()._save_m2m()
+
+        # Map the front port's first position to the specified rear port & position
+        if rear_port := self.cleaned_data.get('rear_port'):
+            reconcile_port_mappings(
+                PortMapping,
+                parent_field='front_port',
+                parent=self.instance,
+                desired=[{
+                    'front_port_position': 1,
+                    'rear_port_id': rear_port.pk,
+                    'rear_port_position': self.cleaned_data.get('rear_port_position') or 1,
+                }],
+            )
 
 
 class RearPortImportForm(OwnerCSVMixin, NetBoxModelImportForm):
@@ -1138,7 +1242,13 @@ class ModuleBayImportForm(OwnerCSVMixin, NetBoxModelImportForm):
 
     class Meta:
         model = ModuleBay
-        fields = ('device', 'name', 'label', 'position', 'description', 'owner', 'tags')
+        fields = ('device', 'name', 'label', 'position', 'enabled', 'description', 'owner', 'tags')
+
+    def clean_enabled(self):
+        # Make sure enabled is True when it's not included in the uploaded data
+        if 'enabled' not in self.data:
+            return True
+        return self.cleaned_data['enabled']
 
 
 class DeviceBayImportForm(OwnerCSVMixin, NetBoxModelImportForm):
@@ -1160,7 +1270,7 @@ class DeviceBayImportForm(OwnerCSVMixin, NetBoxModelImportForm):
 
     class Meta:
         model = DeviceBay
-        fields = ('device', 'name', 'label', 'installed_device', 'description', 'owner', 'tags')
+        fields = ('device', 'name', 'label', 'enabled', 'installed_device', 'description', 'owner', 'tags')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1187,6 +1297,12 @@ class DeviceBayImportForm(OwnerCSVMixin, NetBoxModelImportForm):
             ).exclude(pk=device.pk)
         else:
             self.fields['installed_device'].queryset = Device.objects.none()
+
+    def clean_enabled(self):
+        # Make sure enabled is True when it's not included in the uploaded data
+        if 'enabled' not in self.data:
+            return True
+        return self.cleaned_data['enabled']
 
 
 class InventoryItemImportForm(OwnerCSVMixin, NetBoxModelImportForm):
@@ -1397,6 +1513,12 @@ class MACAddressImportForm(PrimaryModelImportForm):
 # Cables
 #
 
+class CableBundleImportForm(PrimaryModelImportForm):
+    class Meta:
+        model = CableBundle
+        fields = ('name', 'description', 'owner', 'comments', 'tags')
+
+
 class CableImportForm(PrimaryModelImportForm):
     # Termination A
     side_a_site = CSVModelChoiceField(
@@ -1490,6 +1612,13 @@ class CableImportForm(PrimaryModelImportForm):
         to_field_name='name',
         help_text=_('Assigned tenant')
     )
+    bundle = CSVModelChoiceField(
+        label=_('Bundle'),
+        queryset=CableBundle.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Cable bundle name'),
+    )
     length_unit = CSVChoiceField(
         label=_('Length unit'),
         choices=CableLengthUnitChoices,
@@ -1508,7 +1637,7 @@ class CableImportForm(PrimaryModelImportForm):
         fields = [
             'side_a_site', 'side_a_device', 'side_a_power_panel', 'side_a_type', 'side_a_name',
             'side_b_site', 'side_b_device', 'side_b_power_panel', 'side_b_type', 'side_b_name',
-            'type', 'status', 'profile', 'tenant', 'label', 'color', 'length', 'length_unit',
+            'type', 'status', 'profile', 'tenant', 'bundle', 'label', 'color', 'length', 'length_unit',
             'description', 'owner', 'comments', 'tags',
         ]
 
@@ -1542,7 +1671,8 @@ class CableImportForm(PrimaryModelImportForm):
 
         :param side: 'a' or 'b'
         """
-        assert side in 'ab', f"Invalid side designation: {side}"
+        if side not in ('a', 'b'):
+            raise ValueError(_("Invalid side designation: {side}").format(side=side))
 
         device = self.cleaned_data.get(f'side_{side}_device')
         power_panel = self.cleaned_data.get(f'side_{side}_power_panel')

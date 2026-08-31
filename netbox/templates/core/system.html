@@ -3,6 +3,7 @@
 {% load helpers %}
 {% load i18n %}
 {% load render_table from django_tables2 %}
+{% load humanize %}
 
 {% block title %}{% trans "System" %}{% endblock %}
 
@@ -32,6 +33,11 @@
     <li class="nav-item" role="presentation">
       <a class="nav-link" id="objects-tab" data-bs-toggle="tab" data-bs-target="#objects-panel" type="button" role="tab">
         {% trans "Object Counts" %}
+      </a>
+    </li>
+    <li class="nav-item" role="presentation">
+      <a class="nav-link" id="database-tab" data-bs-toggle="tab" data-bs-target="#database-panel" type="button" role="tab">
+        {% trans "Database" %}
       </a>
     </li>
   </ul>
@@ -88,7 +94,6 @@
               <th scope="row">{% trans "RQ workers" %}</th>
               <td>
                 <a href="{% url 'core:background_queue_list' %}">{{ stats.rq_worker_count }}</a>
-                ({% trans "default queue" %})
               </td>
             </tr>
             <tr>
@@ -171,6 +176,16 @@
           </table>
         </div>
       </div>
+    </div>
+  </div>
+  {# Database panel #}
+  <div class="tab-pane" id="database-panel" role="tabpanel" aria-labelledby="database-tab"
+       hx-get="{% url 'core:system_db_schema' %}"
+       hx-trigger="show.bs.tab from:#database-tab once"
+       hx-swap="innerHTML">
+    <div class="text-center text-muted py-5">
+      <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+      {% trans "Loading database schema…" %}
     </div>
   </div>
 {% endblock content %}

@@ -17,6 +17,7 @@ from netbox.models.features import (
     TagsMixin,
 )
 from netbox.models.mixins import DistanceMixin
+from utilities.string import title
 
 from .base import BaseCircuitType
 
@@ -144,6 +145,9 @@ class Circuit(ContactsMixin, ImageAttachmentsMixin, DistanceMixin, PrimaryModel)
                 name='%(app_label)s_%(class)s_unique_provideraccount_cid'
             ),
         )
+        indexes = (
+            models.Index(fields=('provider', 'provider_account', 'cid')),  # Default ordering
+        )
         verbose_name = _('circuit')
         verbose_name_plural = _('circuits')
 
@@ -220,6 +224,9 @@ class CircuitGroupAssignment(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin,
                 fields=('member_type', 'member_id', 'group'),
                 name='%(app_label)s_%(class)s_unique_member_group'
             ),
+        )
+        indexes = (
+            models.Index(fields=('group', 'member_type', 'member_id', 'priority', 'id')),  # Default ordering
         )
         verbose_name = _('Circuit group assignment')
         verbose_name_plural = _('Circuit group assignments')
@@ -361,6 +368,13 @@ class CircuitTermination(
         return reverse('circuits:circuittermination', args=[self.pk])
 
     def clean(self):
+        if self.termination_type and not (self.termination or self.termination_id):
+            termination_type = self.termination_type.model_class()
+            raise ValidationError(
+                _("Please select a {termination_type}.").format(
+                    termination_type=_(title(termination_type._meta.verbose_name))
+                )
+            )
         super().clean()
 
         if self.termination is None:

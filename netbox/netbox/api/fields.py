@@ -1,4 +1,3 @@
-from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.backends.postgresql.psycopg_any import NumericRange
 from django.utils.translation import gettext as _
@@ -8,6 +7,8 @@ from netaddr import IPNetwork
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework.relations import PrimaryKeyRelatedField, RelatedField
+
+from utilities.data import get_inclusive_integer_range_bounds
 
 __all__ = (
     'AttributesField',
@@ -110,7 +111,8 @@ class ContentTypeField(RelatedField):
     def to_internal_value(self, data):
         try:
             app_label, model = data.split('.')
-            return ContentType.objects.get_by_natural_key(app_label=app_label, model=model)
+            # Scoped to the field's declared queryset, not the raw ContentType table (#22748).
+            return self.get_queryset().get(app_label=app_label, model=model)
         except ObjectDoesNotExist:
             self.fail('does_not_exist', content_type=data)
         except (AttributeError, TypeError, ValueError):
@@ -173,7 +175,7 @@ class IntegerRangeSerializer(serializers.Serializer):
         return NumericRange(data[0], data[1] + 1, bounds='[)')
 
     def to_representation(self, instance):
-        return instance.lower, instance.upper - 1
+        return get_inclusive_integer_range_bounds(instance)
 
 
 class AttributesField(serializers.JSONField):

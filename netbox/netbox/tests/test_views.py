@@ -2,13 +2,23 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
-from django.test import Client, override_settings
+from django.contrib.contenttypes.models import ContentType
+from django.http import HttpResponse
+from django.test import Client, TransactionTestCase, override_settings
 from django.urls import reverse
 
-from dcim.models import Site
+from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusChoices
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site, VirtualChassis
+from extras.events import enqueue_event
+from extras.models import ImageAttachment
+from extras.validators import CustomValidator
+from ipam.choices import VLANStatusChoices
+from ipam.models import VLAN, VLANGroup
 from netbox.constants import EMPTY_TABLE_TEXT
 from netbox.search.backends import search_backend
+from users.models import User
 from utilities.testing import TestCase
+from utilities.views import get_action_url
 
 
 class HomeViewTestCase(TestCase):
@@ -64,8 +74,8 @@ class SearchViewTestCase(TestCase):
         self.assertNotIn('Site Echo', content)
         self.assertNotIn('Site Foxtrot', content)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_search_no_results(self):
+        self.add_permissions('dcim.view_site')
         url = reverse('search')
         params = {
             'q': 'xxxxxxxxx',  # Matches nothing
@@ -79,6 +89,27 @@ class SearchViewTestCase(TestCase):
 
 
 class MediaViewTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        site = Site.objects.create(name='Site 1', slug='site-1')
+        ct = ContentType.objects.get_for_model(Site)
+        cls.image_attachment = ImageAttachment.objects.create(
+            object_type=ct,
+            object_id=site.pk,
+            name='Test Image',
+            image='image-attachments/site_1_test.jpg',
+            image_height=100,
+            image_width=100,
+        )
+
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        cls.device_type = DeviceType.objects.create(
+            model='Device Type 1',
+            slug='device-type-1',
+            manufacturer=manufacturer,
+            front_image='devicetype-images/front.jpg',
+        )
 
     def test_media_login_required(self):
         url = reverse('media', kwargs={'path': 'foo.txt'})

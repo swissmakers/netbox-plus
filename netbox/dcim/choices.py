@@ -1027,6 +1027,7 @@ class InterfaceTypeChoices(ChoiceSet):
     TYPE_100GE_CXP = '100gbase-x-cxp'
     TYPE_100GE_CPAK = '100gbase-x-cpak'
     TYPE_100GE_DSFP = '100gbase-x-dsfp'
+    TYPE_100GE_SFP112 = '100gbase-x-sfp112'
     TYPE_100GE_SFP_DD = '100gbase-x-sfpdd'
     TYPE_100GE_QSFP28 = '100gbase-x-qsfp28'
     TYPE_100GE_QSFP_DD = '100gbase-x-qsfpdd'
@@ -1102,7 +1103,7 @@ class InterfaceTypeChoices(ChoiceSet):
     TYPE_64GFC_SFP_PLUS = '64gfc-sfpp'
     TYPE_128GFC_QSFP28 = '128gfc-qsfp28'
 
-    # InfiniBand
+    # InfiniBand 1X
     TYPE_INFINIBAND_SDR = 'infiniband-sdr'
     TYPE_INFINIBAND_DDR = 'infiniband-ddr'
     TYPE_INFINIBAND_QDR = 'infiniband-qdr'
@@ -1112,6 +1113,17 @@ class InterfaceTypeChoices(ChoiceSet):
     TYPE_INFINIBAND_HDR = 'infiniband-hdr'
     TYPE_INFINIBAND_NDR = 'infiniband-ndr'
     TYPE_INFINIBAND_XDR = 'infiniband-xdr'
+
+    # InfiniBand 4X
+    TYPE_INFINIBAND_SDR_4X = 'infiniband-sdr-4x'
+    TYPE_INFINIBAND_DDR_4X = 'infiniband-ddr-4x'
+    TYPE_INFINIBAND_QDR_4X = 'infiniband-qdr-4x'
+    TYPE_INFINIBAND_FDR10_4X = 'infiniband-fdr10-4x'
+    TYPE_INFINIBAND_FDR_4X = 'infiniband-fdr-4x'
+    TYPE_INFINIBAND_EDR_4X = 'infiniband-edr-4x'
+    TYPE_INFINIBAND_HDR_4X = 'infiniband-hdr-4x'
+    TYPE_INFINIBAND_NDR_4X = 'infiniband-ndr-4x'
+    TYPE_INFINIBAND_XDR_4X = 'infiniband-xdr-4x'
 
     # Serial
     TYPE_T1 = 't1'
@@ -1152,6 +1164,7 @@ class InterfaceTypeChoices(ChoiceSet):
     TYPE_SUMMITSTACK128 = 'extreme-summitstack-128'
     TYPE_SUMMITSTACK256 = 'extreme-summitstack-256'
     TYPE_SUMMITSTACK512 = 'extreme-summitstack-512'
+    TYPE_HPE_SYNERGY_INTERCONNECT = 'hpe-synergy-interconnect-link'
 
     # Other
     TYPE_OTHER = 'other'
@@ -1339,6 +1352,7 @@ class InterfaceTypeChoices(ChoiceSet):
                 (TYPE_100GE_DSFP, 'DSFP (100GE)'),
                 (TYPE_100GE_QSFP28, 'QSFP28 (100GE)'),
                 (TYPE_100GE_QSFP_DD, 'QSFP-DD (100GE)'),
+                (TYPE_100GE_SFP112, 'SFP112 (100GE)'),
                 (TYPE_100GE_SFP_DD, 'SFP-DD (100GE)'),
                 (TYPE_200GE_CFP2, 'CFP2 (200GE)'),
                 (TYPE_200GE_QSFP56, 'QSFP56 (200GE)'),
@@ -1429,7 +1443,7 @@ class InterfaceTypeChoices(ChoiceSet):
             )
         ),
         (
-            'InfiniBand',
+            'InfiniBand 1X',
             (
                 (TYPE_INFINIBAND_SDR, 'SDR (2 Gbps)'),
                 (TYPE_INFINIBAND_DDR, 'DDR (4 Gbps)'),
@@ -1439,7 +1453,21 @@ class InterfaceTypeChoices(ChoiceSet):
                 (TYPE_INFINIBAND_EDR, 'EDR (25 Gbps)'),
                 (TYPE_INFINIBAND_HDR, 'HDR (50 Gbps)'),
                 (TYPE_INFINIBAND_NDR, 'NDR (100 Gbps)'),
-                (TYPE_INFINIBAND_XDR, 'XDR (250 Gbps)'),
+                (TYPE_INFINIBAND_XDR, 'XDR (200 Gbps)'),
+            )
+        ),
+        (
+            'InfiniBand 4X',
+            (
+                (TYPE_INFINIBAND_SDR_4X, 'SDR 4X (8 Gbps)'),
+                (TYPE_INFINIBAND_DDR_4X, 'DDR 4X (16 Gbps)'),
+                (TYPE_INFINIBAND_QDR_4X, 'QDR 4X (32 Gbps)'),
+                (TYPE_INFINIBAND_FDR10_4X, 'FDR10 4X (40 Gbps)'),
+                (TYPE_INFINIBAND_FDR_4X, 'FDR 4X (56 Gbps)'),
+                (TYPE_INFINIBAND_EDR_4X, 'EDR 4X (100 Gbps)'),
+                (TYPE_INFINIBAND_HDR_4X, 'HDR 4X (200 Gbps)'),
+                (TYPE_INFINIBAND_NDR_4X, 'NDR 4X (400 Gbps)'),
+                (TYPE_INFINIBAND_XDR_4X, 'XDR 4X (800 Gbps)'),
             )
         ),
         (
@@ -1495,6 +1523,7 @@ class InterfaceTypeChoices(ChoiceSet):
                 (TYPE_SUMMITSTACK128, 'Extreme SummitStack-128'),
                 (TYPE_SUMMITSTACK256, 'Extreme SummitStack-256'),
                 (TYPE_SUMMITSTACK512, 'Extreme SummitStack-512'),
+                (TYPE_HPE_SYNERGY_INTERCONNECT, 'HPE Synergy Interconnect Link'),
             )
         ),
         (
@@ -1637,6 +1666,10 @@ class PortTypeChoices(ChoiceSet):
     TYPE_LC_PC = 'lc-pc'
     TYPE_LC_UPC = 'lc-upc'
     TYPE_LC_APC = 'lc-apc'
+    TYPE_MU = 'mu'
+    TYPE_MU_PC = 'mu-pc'
+    TYPE_MU_UPC = 'mu-upc'
+    TYPE_MU_APC = 'mu-apc'
     TYPE_MTRJ = 'mtrj'
     TYPE_MPO = 'mpo'
     TYPE_LSH = 'lsh'
@@ -1650,6 +1683,7 @@ class PortTypeChoices(ChoiceSet):
     TYPE_SPLICE = 'splice'
     TYPE_CS = 'cs'
     TYPE_SN = 'sn'
+    TYPE_MDC = 'mdc'
     TYPE_SMA_905 = 'sma-905'
     TYPE_SMA_906 = 'sma-906'
     TYPE_URM_P2 = 'urm-p2'
@@ -1700,6 +1734,10 @@ class PortTypeChoices(ChoiceSet):
                 (TYPE_LC_PC, 'LC/PC'),
                 (TYPE_LC_UPC, 'LC/UPC'),
                 (TYPE_LC_APC, 'LC/APC'),
+                (TYPE_MU, 'MU'),
+                (TYPE_MU_PC, 'MU/PC'),
+                (TYPE_MU_UPC, 'MU/UPC'),
+                (TYPE_MU_APC, 'MU/APC'),
                 (TYPE_LSH, 'LSH'),
                 (TYPE_LSH_PC, 'LSH/PC'),
                 (TYPE_LSH_UPC, 'LSH/UPC'),
@@ -1717,6 +1755,7 @@ class PortTypeChoices(ChoiceSet):
                 (TYPE_ST, 'ST'),
                 (TYPE_CS, 'CS'),
                 (TYPE_SN, 'SN'),
+                (TYPE_MDC, 'MDC'),
                 (TYPE_SMA_905, 'SMA 905'),
                 (TYPE_SMA_906, 'SMA 906'),
                 (TYPE_URM_P2, 'URM-P2'),
@@ -1779,6 +1818,7 @@ class CableProfileChoices(ChoiceSet):
     BREAKOUT_1C2P_2C1P = 'breakout-1c2p-2c1p'
     BREAKOUT_1C4P_4C1P = 'breakout-1c4p-4c1p'
     BREAKOUT_1C6P_6C1P = 'breakout-1c6p-6c1p'
+    BREAKOUT_1C8P_8C1P = 'breakout-1c8p-8c1p'
     BREAKOUT_2C4P_8C1P_SHUFFLE = 'breakout-2c4p-8c1p-shuffle'
 
     CHOICES = (
@@ -1819,6 +1859,7 @@ class CableProfileChoices(ChoiceSet):
                 (BREAKOUT_1C2P_2C1P, _('1C2P:2C1P breakout')),
                 (BREAKOUT_1C4P_4C1P, _('1C4P:4C1P breakout')),
                 (BREAKOUT_1C6P_6C1P, _('1C6P:6C1P breakout')),
+                (BREAKOUT_1C8P_8C1P, _('1C8P:8C1P breakout')),
                 (BREAKOUT_2C4P_8C1P_SHUFFLE, _('2C4P:8C1P breakout (shuffle)')),
             ),
         ),

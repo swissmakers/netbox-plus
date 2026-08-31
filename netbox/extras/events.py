@@ -125,7 +125,13 @@ def enqueue_event(queue, instance, request, event_type):
     app_label = instance._meta.app_label
     model_name = instance._meta.model_name
 
-    assert instance.pk is not None
+    if instance.pk is None:
+        raise ValueError(
+            _("Cannot enqueue an event for an unsaved {app_label}.{model} instance.").format(
+                app_label=app_label,
+                model=model_name,
+            )
+        )
     key = f'{app_label}.{model_name}:{instance.pk}'
 
     if key in queue:
@@ -181,9 +187,26 @@ def process_event_rules(event_rules, object_type, event):
         if not event_rule.eval_conditions(event['data']):
             continue
 
+        # Guard against action_data that is valid JSON but not a dict
+        # (e.g. a bare string or number). Existing rows with bad data are
+        # tolerated at runtime; validation on EventRule.clean() prevents
+        # new ones.
+        if event_rule.action_data is None:
+            action_data = {}
+        elif isinstance(event_rule.action_data, dict):
+            action_data = event_rule.action_data
+        else:
+            logger.warning(
+                _('Ignoring invalid action_data on event rule "{rule}" (got {data_type})').format(
+                    rule=event_rule,
+                    data_type=type(event_rule.action_data).__name__,
+                )
+            )
+            action_data = {}
+
         # Merge rule-specific action_data with the event payload.
         # Copy to avoid mutating the rule's stored action_data dict.
-        event_data = {**(event_rule.action_data or {}), **event['data']}
+        event_data = {**action_data, **event['data']}
 
         # Webhooks
         if event_rule.action_type == EventRuleActionChoices.WEBHOOK:
@@ -230,11 +253,13 @@ def process_event_rules(event_rules, object_type, event):
                 'name': script.name,
                 'user': event['user'],
                 'data': event_data,
+                'notifications': script.notifications_default,
+                'job_timeout': script.job_timeout,
             }
             if 'snapshots' in event:
                 params['snapshots'] = event['snapshots']
             if 'request' in event:
-                params['request'] = copy_safe_request(event['request'])
+                params['request'] = copy_safe_request(event['request'], include_files=False)
 
             # Enqueue the job
             ScriptJob.enqueue(**params)

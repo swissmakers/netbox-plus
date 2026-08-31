@@ -138,6 +138,13 @@ class ASNImportForm(PrimaryModelImportForm):
         to_field_name='name',
         help_text=_('Assigned RIR')
     )
+    role = CSVModelChoiceField(
+        label=_('Role'),
+        queryset=Role.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Functional role')
+    )
     tenant = CSVModelChoiceField(
         label=_('Tenant'),
         queryset=Tenant.objects.all(),
@@ -148,7 +155,7 @@ class ASNImportForm(PrimaryModelImportForm):
 
     class Meta:
         model = ASN
-        fields = ('asn', 'rir', 'tenant', 'description', 'owner', 'comments', 'tags')
+        fields = ('asn', 'rir', 'role', 'tenant', 'description', 'owner', 'comments', 'tags')
 
 
 class RoleImportForm(OrganizationalModelImportForm):
@@ -422,8 +429,8 @@ class IPAddressImportForm(PrimaryModelImportForm):
         ipaddress = super().save(*args, **kwargs)
 
         # Set as primary for device/VM
-        if self.cleaned_data.get('is_primary') is not None:
-            parent = self.cleaned_data.get('device') or self.cleaned_data.get('virtual_machine')
+        parent = self.cleaned_data.get('device') or self.cleaned_data.get('virtual_machine')
+        if parent and self.cleaned_data.get('is_primary') is not None:
             if self.cleaned_data.get('is_primary'):
                 parent.snapshot()
                 if self.instance.address.version == 4:
@@ -443,8 +450,8 @@ class IPAddressImportForm(PrimaryModelImportForm):
                     parent.save()
 
         # Set as OOB for device
-        if self.cleaned_data.get('is_oob') is not None:
-            parent = self.cleaned_data.get('device')
+        parent = self.cleaned_data.get('device')
+        if parent and self.cleaned_data.get('is_oob') is not None:
             if self.cleaned_data.get('is_oob'):
                 parent.snapshot()
                 parent.oob_ip = ipaddress

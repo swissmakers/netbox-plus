@@ -10,7 +10,9 @@ from django.utils import timezone
 from django.utils.functional import classproperty
 from django.utils.translation import gettext as _
 
+from core.choices import JobNotificationChoices
 from extras.choices import LogLevelChoices
+from extras.constants import SCRIPT_MODULE_NAME_PREFIX
 from extras.models import ScriptModule
 from ipam.formfields import IPAddressFormField, IPNetworkFormField
 from ipam.validators import MaxPrefixLengthValidator, MinPrefixLengthValidator, prefix_validator
@@ -233,10 +235,12 @@ class ObjectVar(ScriptVariable):
     :param null_option: The label to use as a "null" selection option (optional)
     :param selector: Include an advanced object selection widget to assist the user in identifying the desired
         object (optional)
+    :param quick_add: Include a widget to quickly create a new related object for assignment. (optional)
     """
     form_field = DynamicModelChoiceField
 
-    def __init__(self, model, query_params=None, context=None, null_option=None, selector=False, *args, **kwargs):
+    def __init__(self, model, query_params=None, context=None, null_option=None, selector=False, quick_add=False,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.field_attrs.update({
@@ -245,6 +249,7 @@ class ObjectVar(ScriptVariable):
             'context': context,
             'null_option': null_option,
             'selector': selector,
+            'quick_add': quick_add,
         })
 
 
@@ -321,7 +326,7 @@ class BaseScript:
         self._current_test = None  # Tracks the current test method being run (if any)
 
         # Initiate the log
-        self.logger = logging.getLogger(f"netbox.scripts.{self.__module__}.{self.__class__.__name__}")
+        self.logger = logging.getLogger(f"netbox.scripts.{self.full_name}")
 
         # Declare the placeholder for the current request
         self.request = None
@@ -345,7 +350,12 @@ class BaseScript:
 
     @classproperty
     def module(self):
-        return self.__module__
+        # Strip the internal prefix applied when the module is loaded (see #22566) so that
+        # user-facing names (full_name, logger namespaces) reflect the original script filename.
+        name = self.__module__
+        if name.startswith(SCRIPT_MODULE_NAME_PREFIX):
+            name = name[len(SCRIPT_MODULE_NAME_PREFIX):]
+        return name
 
     @classproperty
     def class_name(self):
@@ -357,7 +367,7 @@ class BaseScript:
 
     @classmethod
     def root_module(cls):
-        return cls.__module__.split(".")[0]
+        return cls.module.split(".")[0]
 
     # Author-defined attributes
 
@@ -388,6 +398,10 @@ class BaseScript:
     @classproperty
     def scheduling_enabled(self):
         return getattr(self.Meta, 'scheduling_enabled', True)
+
+    @classproperty
+    def notifications_default(self):
+        return getattr(self.Meta, 'notifications_default', JobNotificationChoices.NOTIFICATION_ALWAYS)
 
     @property
     def filename(self):
@@ -491,7 +505,10 @@ class BaseScript:
             fieldsets.append((_('Script Data'), fields))
 
         # Append the default fieldset if defined in the Meta class
-        exec_parameters = ('_schedule_at', '_interval', '_commit') if self.scheduling_enabled else ('_commit',)
+        if self.scheduling_enabled:
+            exec_parameters = ('_schedule_at', '_interval', '_commit', '_notifications')
+        else:
+            exec_parameters = ('_commit', '_notifications')
         fieldsets.append((_('Script Execution Parameters'), exec_parameters))
 
         return fieldsets
@@ -510,6 +527,9 @@ class BaseScript:
 
         # Set initial "commit" checkbox state based on the script's Meta parameter
         form.fields['_commit'].initial = self.commit_default
+
+        # Set initial "notifications" selection based on the script's Meta parameter
+        form.fields['_notifications'].initial = self.notifications_default
 
         # Hide fields if scheduling has been disabled
         if not self.scheduling_enabled:

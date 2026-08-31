@@ -66,6 +66,7 @@ class ASNRangePanel(panels.ObjectAttributesPanel):
 class ASNPanel(panels.ObjectAttributesPanel):
     asn = attrs.TextAttr('asn_with_asdot', label=_('AS Number'))
     rir = attrs.RelatedObjectAttr('rir', linkify=True, label=_('RIR'))
+    role = attrs.RelatedObjectAttr('role', linkify=True)
     tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
     description = attrs.TextAttr('description')
 
@@ -143,7 +144,7 @@ class PrefixPanel(panels.ObjectAttributesPanel):
         template_name='ipam/prefix/attrs/aggregate.html',
         label=_('Aggregate'),
     )
-    scope = attrs.GenericForeignKeyAttr('scope', linkify=True)
+    scope = attrs.GenericForeignKeyAttr('scope', linkify=True, nested=True, max_depth=3)
     vlan = attrs.RelatedObjectAttr('vlan', linkify=True, label=_('VLAN'), grouped_by='group')
     status = attrs.ChoiceAttr('status')
     role = attrs.RelatedObjectAttr('role', linkify=True)
@@ -154,7 +155,7 @@ class PrefixPanel(panels.ObjectAttributesPanel):
 class VLANGroupPanel(panels.ObjectAttributesPanel):
     name = attrs.TextAttr('name')
     description = attrs.TextAttr('description')
-    scope = attrs.GenericForeignKeyAttr('scope', linkify=True)
+    scope = attrs.GenericForeignKeyAttr('scope', linkify=True, nested=True, max_depth=3)
     vid_ranges = attrs.TemplatedAttr(
         'vid_ranges_items',
         template_name='ipam/vlangroup/attrs/vid_ranges.html',
@@ -228,11 +229,9 @@ class VLANCustomerVLANsPanel(panels.ObjectsTablePanel):
             ],
         )
 
-    def render(self, context):
+    def should_render(self, context):
         obj = context.get('object')
-        if not obj or obj.qinq_role != 'svlan':
-            return ''
-        return super().render(context)
+        return False if (obj is None or obj.qinq_role != 'svlan') else True
 
 
 class ServiceTemplatePanel(panels.ObjectAttributesPanel):

@@ -1,21 +1,44 @@
 import io
+import os
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.base import ContentFile
 from django.core.files.storage import Storage
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.forms import ValidationError
 from django.test import TestCase, tag
+from django.test.utils import CaptureQueriesContext
+from jinja2 import DebugUndefined, StrictUndefined, TemplateError, TemplateSyntaxError, UndefinedError
 from PIL import Image
 
+from core.events import OBJECT_CREATED
 from core.models import AutoSyncRecord, DataSource, ObjectType
 from dcim.models import Device, DeviceRole, DeviceType, Location, Manufacturer, Platform, Region, Site, SiteGroup
-from extras.models import ConfigContext, ConfigContextProfile, ConfigTemplate, ImageAttachment, Tag, TaggedItem
+from extras.constants import DEFAULT_MIME_TYPE
+from extras.models import (
+    ConfigContext,
+    ConfigContextProfile,
+    ConfigTemplate,
+    EventRule,
+    ExportTemplate,
+    ImageAttachment,
+    TableConfig,
+    Tag,
+    TaggedItem,
+    Webhook,
+)
+from extras.models.mixins import RenderTemplateMixin
 from tenancy.models import Tenant, TenantGroup
 from utilities.exceptions import AbortRequest
+from utilities.jinja2 import env_filter, render_jinja2, sanitize_http_header
+from utilities.tables import get_table_for_model
 from virtualization.models import Cluster, ClusterGroup, ClusterType, VirtualMachine
 
 
@@ -57,7 +80,17 @@ class OverwriteStyleMemoryStorage(Storage):
         return f'https://example.invalid/{name}'
 
 
-class ImageAttachmentTests(TestCase):
+class UnreadableSizeMemoryStorage(OverwriteStyleMemoryStorage):
+    """
+    Like OverwriteStyleMemoryStorage, but size() raises OSError to model a storage backend that is
+    transiently unavailable (e.g. an S3 outage) when reading file size.
+    """
+
+    def size(self, name):
+        raise OSError('storage unavailable')
+
+
+class ImageAttachmentTestCase(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.ct_rack = ContentType.objects.get_by_natural_key('dcim', 'rack')
@@ -174,8 +207,245 @@ class ImageAttachmentTests(TestCase):
 
         self.assertCountEqual(storage.files.keys(), {base_name, suffixed_name})
 
+    def test_save_populates_image_size_on_create(self):
+        """
+        save() populates image_size from the uploaded file on creation.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
 
-class TagTest(TestCase):
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('size-on-create.png'),
+            )
+            ia.save()
+
+            self.assertIsNotNone(ia.image_size)
+            self.assertEqual(ia.image_size, ia.image.size)
+
+    def test_size_property_returns_stored_value_without_storage_access(self):
+        """
+        The size property returns the cached image_size rather than the file's actual size. The stub's empty
+        file reports size 0, so asserting the distinct stored value proves the property used the cached value.
+        """
+        ia = self._stub_image_attachment(self.site.pk, 'image-attachments/site_1_no-file.png')
+        self.assertEqual(ia._read_image_size(), 0)  # the stub's empty file genuinely reports 0
+        ia.image_size = 9999
+
+        self.assertEqual(ia.size, 9999)
+
+    def test_size_property_falls_back_to_storage_when_unset(self):
+        """
+        For legacy rows where image_size is NULL, the size property falls back to reading storage
+        (rather than reporting 0 bytes).
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('fallback.png'),
+            )
+            ia.save()
+
+            # Simulate a legacy row that predates the image_size field.
+            ia.image_size = None
+            self.assertEqual(ia.size, ia.image.size)
+            self.assertGreater(ia.size, 0)
+
+    def test_save_does_not_clobber_existing_size_on_storage_error(self):
+        """
+        When the storage backend raises on a size read (modeled by a real Storage subclass, not a mock),
+        save() must not overwrite an existing image_size with None.
+        """
+        field = ImageAttachment._meta.get_field('image')
+
+        # Create a row with a real, readable size.
+        with patch.object(field, 'storage', OverwriteStyleMemoryStorage()):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('keep-size.png'),
+            )
+            ia.save()
+            original_size = ia.image_size
+            self.assertIsNotNone(original_size)
+
+        # Reload from the DB so the FieldFile has no cached size and must consult storage (as it would for a
+        # row loaded fresh in production). With the backend unable to report size, the read fails (returns None),
+        # and save() must keep the previously-stored value rather than clobbering it with None.
+        with patch.object(field, 'storage', UnreadableSizeMemoryStorage()):
+            reloaded = ImageAttachment.objects.get(pk=ia.pk)
+            self.assertIsNone(reloaded._read_image_size())  # the read genuinely fails (returns None)
+            # Make the image look replaced by perturbing the cached identity (different name component).
+            reloaded._orig_image_key = ('image-attachments/site_1_old.png', reloaded.image_height, reloaded.image_width)
+            reloaded.save()
+
+            # In-memory value is preserved, and the persisted value is unchanged.
+            self.assertEqual(reloaded.image_size, original_size)
+            self.assertEqual(ImageAttachment.objects.get(pk=ia.pk).image_size, original_size)
+
+    def test_save_recomputes_image_size_when_image_replaced(self):
+        """
+        Replacing the image on an existing row recomputes image_size (Cable-style change detection).
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('original.png'),
+            )
+            ia.save()
+            original_size = ia.image_size
+            self.assertIsNotNone(original_size)
+
+            # Replace the image with a larger file and save again.
+            larger = SimpleUploadedFile(
+                name='replacement.png',
+                content=self._uploaded_png('replacement.png').read() + b'\x00' * 100,
+                content_type='image/png',
+            )
+            ia.image = larger
+            ia.save()
+
+            self.assertEqual(ia.image_size, ia.image.size)
+            self.assertNotEqual(ia.image_size, original_size)
+
+    def test_image_identity_includes_dimensions(self):
+        """
+        The change-detection key combines the image name with its dimensions, so a replacement that reuses the
+        same name but changes dimensions produces a different key (which name alone would not).
+        """
+        ia = self._stub_image_attachment(self.site.pk, 'image-attachments/site_1_same.png')
+        ia.image_height, ia.image_width = 10, 10
+        key_small = ia._image_identity()
+
+        # Same name, different dimensions (as Django would set when a same-named file is replaced).
+        ia.image_height, ia.image_width = 40, 40
+        key_large = ia._image_identity()
+
+        self.assertEqual(key_small[0], key_large[0])   # name component unchanged
+        self.assertNotEqual(key_small, key_large)      # but the key differs, so save() will recompute
+
+    def test_save_recomputes_image_size_when_dimensions_change_under_same_name(self):
+        """
+        When the image is replaced by a file with the same stored name but different dimensions, save()
+        recomputes image_size. Name-only detection would miss this; the dimension component catches it.
+        Simulates the same-name case by priming the cached identity with the old dimensions.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('same-name.png'),
+            )
+            ia.save()
+            name = ia.image.name
+
+            # Force the cached identity to reflect the SAME name but different (old) dimensions, then bump the
+            # current dimensions to mimic a same-name replacement with a differently-sized image.
+            ia._orig_image_key = (name, ia.image_height + 5, ia.image_width + 5)
+            ia.save()
+
+            self.assertEqual(ia.image.name, name)                 # name unchanged
+            self.assertEqual(ia.image_size, ia.image.size)        # size recomputed despite same name
+
+    def test_save_without_touching_image_does_not_recompute_or_read_storage(self):
+        """
+        Editing an existing row without replacing the image leaves image_size untouched and does not
+        hit storage. Directly guards against the change-detection comparison misfiring.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                name='Original',
+                image=self._uploaded_png('untouched.png'),
+            )
+            ia.save()
+            stored_size = ia.image_size
+
+            # Reload from the DB so the cached image identity is set from the persisted value, then edit only the name.
+            reloaded = ImageAttachment.objects.get(pk=ia.pk)
+            reloaded.name = 'Renamed'
+            with patch.object(ImageAttachment, '_read_image_size', side_effect=AssertionError('storage accessed')):
+                reloaded.save()
+
+            self.assertEqual(reloaded.image_size, stored_size)
+
+    def test_save_populates_image_size_via_constructor_kwarg(self):
+        """
+        The non-UI create path (constructor kwarg / REST / bulk) populates image_size correctly,
+        confirming change detection behaves when image is passed as a FieldFile.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('kwarg.png'),
+            )
+            ia.save()
+
+            self.assertIsNotNone(ia.image_size)
+            self.assertEqual(ia.image_size, ia.image.size)
+
+
+class TableConfigTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.site_ct = ContentType.objects.get_for_model(Site)
+        cls.table_name = get_table_for_model(Site).__name__
+
+    def test_clean_accepts_ordering_none(self):
+        """clean() must accept ordering=None (field is null=True)."""
+        tc = TableConfig(
+            object_type=self.site_ct,
+            table=self.table_name,
+            name='No ordering',
+            columns=['name'],
+            # ordering left unset (defaults to None)
+        )
+        # Must not raise TypeError: 'NoneType' object is not iterable
+        tc.full_clean()
+
+    def test_clean_without_object_type(self):
+        """full_clean() on an instance missing its object type must raise ValidationError."""
+        tc = TableConfig(
+            table=self.table_name,
+            name='No object type',
+            columns=['name'],
+        )
+        with self.assertRaises(ValidationError):
+            tc.full_clean()
+
+    def test_clean_accepts_columns_none(self):
+        """full_clean() must report missing columns rather than raise TypeError."""
+        tc = TableConfig(
+            object_type=self.site_ct,
+            table=self.table_name,
+            name='No columns',
+        )
+        with self.assertRaises(ValidationError):
+            tc.full_clean()
+
+
+class TagTestCase(TestCase):
 
     def test_default_ordering_weight_then_name_is_set(self):
         Tag.objects.create(name='Tag 1', slug='tag-1', weight=3000)
@@ -234,7 +504,7 @@ class TagTest(TestCase):
             sitegroup.tags.add(tag)
 
 
-class ConfigContextTest(TestCase):
+class ConfigContextTestCase(TestCase):
     """
     These test cases deal with the weighting, ordering, and deep merge logic of config context data.
 
@@ -762,15 +1032,19 @@ class ConfigContextTest(TestCase):
                 if hasattr(node, 'children'):
                     for child in node.children:
                         try:
-                            if child.rhs.query.model is TaggedItem:
-                                subqueries.append(child.rhs.query)
+                            # In Django 6.0+, rhs is a Query directly; older Django wraps it in Subquery
+                            rhs_query = getattr(child.rhs, 'query', child.rhs)
+                            if rhs_query.model is TaggedItem:
+                                subqueries.append(rhs_query)
                         except AttributeError:
                             traverse(child)
             traverse(where_node)
             return subqueries
 
+        # In Django 6.0+, the annotation is a Query directly; older Django wraps it in Subquery
+        annotation_query = getattr(config_annotation, 'query', config_annotation)
         # Find subqueries in the WHERE clause that should have DISTINCT
-        tag_subqueries = find_tag_subqueries(config_annotation.query.where)
+        tag_subqueries = find_tag_subqueries(annotation_query.where)
         distinct_subqueries = [sq for sq in tag_subqueries if sq.distinct]
 
         # Verify we found at least one DISTINCT subquery for tags
@@ -778,7 +1052,7 @@ class ConfigContextTest(TestCase):
         self.assertTrue(distinct_subqueries[0].distinct)
 
 
-class ConfigTemplateTest(TestCase):
+class ConfigTemplateTestCase(TestCase):
     """
     TODO: These test cases deal with the weighting, ordering, and deep merge logic of config context data.
     """
@@ -889,3 +1163,727 @@ class ConfigTemplateTest(TestCase):
                 object_id=config_template.pk
             )
             self.assertEqual(autosync_records.count(), 0, "AutoSyncRecord should be deleted after detaching")
+
+
+class ConfigTemplateDebugTestCase(TestCase):
+    """
+    Tests for the ConfigTemplate debug field and its effect on template rendering error output.
+    """
+
+    def _make_template(self, template_code, debug=False):
+        t = ConfigTemplate(
+            name=f"DebugTestTemplate-{debug}",
+            template_code=template_code,
+            debug=debug,
+        )
+        t.save()
+        return t
+
+    def test_debug_default_is_false(self):
+        t = ConfigTemplate(name="t", template_code="hello")
+        self.assertFalse(t.debug)
+
+    def test_template_error_non_debug_no_traceback(self):
+        """In non-debug mode, a TemplateError raises with no traceback exposure."""
+        t = self._make_template("{{ unclosed", debug=False)
+        with self.assertRaises(TemplateError):
+            t.render({})
+
+    def test_template_error_debug_mode_raises(self):
+        """In debug mode, a TemplateError still raises (callers handle display)."""
+        t = self._make_template("{{ unclosed", debug=True)
+        with self.assertRaises(TemplateError):
+            t.render({})
+
+    def test_render_jinja2_debug_extension_enabled(self):
+        """When debug=True, the Jinja2 debug extension is loaded in the environment."""
+        # The {% debug %} tag is only available when the debug extension is loaded.
+        output = render_jinja2("{% debug %}", {}, debug=True)
+        self.assertIsInstance(output, str)
+
+    def test_render_jinja2_debug_extension_not_loaded_by_default(self):
+        """When debug=False, the {% debug %} tag is not available."""
+        with self.assertRaises(TemplateSyntaxError):
+            render_jinja2("{% debug %}", {}, debug=False)
+
+    def test_format_render_error_debug_redacts_install_path(self):
+        """format_render_error() strips the repo install-path prefix from debug tracebacks."""
+        t = ConfigTemplate(name='redact-test', template_code='hello', debug=True)
+        try:
+            raise ValueError("deliberate test error")
+        except ValueError as exc:
+            result = t.format_render_error(exc)
+        install_root = os.path.dirname(settings.BASE_DIR) + os.sep
+        self.assertIn('Traceback', result)
+        self.assertNotIn(install_root, result)
+        # Also verify the venv prefix is stripped when running inside a virtualenv.
+        if sys.prefix != sys.base_prefix:
+            venv_root = sys.prefix + os.sep
+            if venv_root != install_root:
+                self.assertNotIn(venv_root, result)
+
+    def test_format_render_error_non_debug_returns_concise_message(self):
+        """format_render_error() returns a one-line message (no traceback) when debug=False."""
+        t = ConfigTemplate(name='nodebug-test', template_code='hello', debug=False)
+        try:
+            raise TemplateError("bad template")
+        except TemplateError as exc:
+            result = t.format_render_error(exc)
+        self.assertNotIn('Traceback', result)
+        self.assertIn('TemplateError', result)
+
+
+class JinjaEnvFilterTestCase(TestCase):
+    """
+    Tests for the env() Jinja2 filter and the JINJA_ENVIRONMENT_PARAMS configuration parameter.
+    """
+
+    def test_env_filter_returns_value_for_matching_name(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN'), 'secret')
+
+    def test_env_filter_returns_none_for_unmatched_name(self):
+        with patch.dict('os.environ', {'NETBOX_OTHER_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            self.assertIsNone(env_filter('NETBOX_OTHER_TOKEN'))
+
+    def test_env_filter_wildcard_match(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN_1': 'one', 'NETBOX_TEST_TOKEN_2': 'two'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN_*']):
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN_1'), 'one')
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN_2'), 'two')
+
+    def test_env_filter_returns_none_for_missing_env_var(self):
+        with self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_MISSING_VAR']):
+            self.assertIsNone(env_filter('NETBOX_MISSING_VAR'))
+
+    def test_env_filter_empty_whitelist_returns_none(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=[]):
+            self.assertIsNone(env_filter('NETBOX_TEST_TOKEN'))
+
+    def test_env_filter_registered_by_default(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            output = render_jinja2("{{ 'NETBOX_TEST_TOKEN' | env }}", {})
+            self.assertEqual(output, 'secret')
+
+    def test_user_defined_filter_overrides_default(self):
+        with self.settings(JINJA2_FILTERS={'env': lambda name: 'overridden'}):
+            output = render_jinja2("{{ 'NETBOX_TEST_TOKEN' | env }}", {})
+            self.assertEqual(output, 'overridden')
+
+
+class SanitizeHTTPHeaderFilterTestCase(TestCase):
+    """
+    Tests for the sanitize_http_header() Jinja2 filter (exposed as `header_safe`) and the render_jinja2()
+    `filters` argument used to make it available.
+    """
+
+    def test_strips_crlf(self):
+        self.assertEqual(sanitize_http_header('legit\r\nX-Injected: evil'), 'legitX-Injected: evil')
+
+    def test_strips_control_characters(self):
+        self.assertEqual(sanitize_http_header('foo\x00\x1f\x7fbar'), 'foobar')
+
+    def test_preserves_normal_value(self):
+        self.assertEqual(sanitize_http_header('application/json'), 'application/json')
+
+    def test_coerces_non_string(self):
+        self.assertEqual(sanitize_http_header(42), '42')
+
+    def test_available_via_render_filters_argument(self):
+        output = render_jinja2(
+            "{{ value | header_safe }}",
+            {'value': 'a\r\nb'},
+            filters={'header_safe': sanitize_http_header},
+        )
+        self.assertEqual(output, 'ab')
+
+    def test_render_filters_take_precedence_over_user_config(self):
+        # A per-render filter cannot be shadowed by a user-configured filter of the same name
+        with self.settings(JINJA2_FILTERS={'header_safe': lambda v: 'shadowed'}):
+            output = render_jinja2(
+                "{{ value | header_safe }}",
+                {'value': 'a\r\nb'},
+                filters={'header_safe': sanitize_http_header},
+            )
+            self.assertEqual(output, 'ab')
+
+    def test_not_registered_without_filters_argument(self):
+        # The filter must not leak into general-purpose rendering
+        with self.assertRaises(TemplateError):
+            render_jinja2("{{ 'x' | header_safe }}", {})
+
+
+class ExportTemplateContextTestCase(TestCase):
+    """
+    Tests for ExportTemplate.get_context() including public model population.
+    """
+
+    def test_get_context_includes_public_models(self):
+        et = ExportTemplate(name='test', template_code='test')
+        ctx = et.get_context()
+
+        self.assertIs(ctx['dcim']['Site'], Site)
+        self.assertIs(ctx['dcim']['Device'], Device)
+
+    def test_get_context_includes_queryset(self):
+        et = ExportTemplate(name='test', template_code='test')
+        qs = Site.objects.all()
+        ctx = et.get_context(queryset=qs)
+
+        self.assertIs(ctx['queryset'], qs)
+
+    def test_get_context_applies_extra_context(self):
+        et = ExportTemplate(name='test', template_code='test')
+        ctx = et.get_context(context={'custom_key': 'custom_value'})
+
+        self.assertEqual(ctx['custom_key'], 'custom_value')
+        self.assertIs(ctx['dcim']['Site'], Site)
+
+    def test_config_template_get_context_includes_public_models(self):
+        ct = ConfigTemplate(name='test', template_code='test')
+        ctx = ct.get_context()
+
+        self.assertIs(ctx['dcim']['Site'], Site)
+
+
+def finalize_none_to_dash(value):
+    """
+    Module-level helper used by RenderTemplateMixinRenderTestCase.test_environment_params_finalize_path_import.
+    Exported so it can be referenced by dotted path from a Jinja environment_params value.
+    """
+    return '-' if value is None else value
+
+
+class RenderTemplateMixinRenderTestCase(TestCase):
+    """
+    Tests for RenderTemplateMixin.render() and get_environment_params(), exercised via ConfigTemplate.
+    """
+
+    def test_render_basic_context(self):
+        t = ConfigTemplate(name='basic', template_code='Hello {{ name }}')
+        self.assertEqual(t.render({'name': 'world'}), 'Hello world')
+
+    def test_render_normalizes_crlf(self):
+        t = ConfigTemplate(name='crlf', template_code='line1\r\nline2\r\nline3')
+        self.assertEqual(t.render({}), 'line1\nline2\nline3')
+
+    def test_render_passes_environment_params(self):
+        # With trim_blocks + lstrip_blocks, block tags don't emit their surrounding whitespace.
+        template_code = '{% if x %}\n    {% if y %}\n        VALUE\n    {% endif %}\n{% endif %}'
+        plain = ConfigTemplate(name='plain', template_code=template_code)
+        trimmed = ConfigTemplate(
+            name='trimmed',
+            template_code=template_code,
+            environment_params={'trim_blocks': True, 'lstrip_blocks': True},
+        )
+        ctx = {'x': True, 'y': True}
+        self.assertNotEqual(plain.render(ctx), trimmed.render(ctx))
+        self.assertEqual(trimmed.render(ctx).strip(), 'VALUE')
+
+    def test_configtemplate_autoescape_always_disabled(self):
+        """
+        ConfigTemplate renders plain text (network configs, scripts); autoescape must stay off
+        even if environment_params explicitly requests it (#22652).
+        """
+        t = ConfigTemplate(name='autoescape', template_code='{{ value }}', environment_params={'autoescape': True})
+        self.assertEqual(t.render({'value': '<script>'}), '<script>')
+
+    def test_exporttemplate_autoescape_is_configurable(self):
+        """
+        Unlike ConfigTemplate, ExportTemplate output may legitimately be HTML, so an explicit
+        autoescape=True in environment_params must be honored rather than forced off.
+        """
+        et = ExportTemplate(
+            name='autoescape', template_code='{{ value }}', environment_params={'autoescape': True}
+        )
+        self.assertEqual(et.render({'value': '<script>'}), '&lt;script&gt;')
+
+    def test_environment_params_undefined_path_import(self):
+        # Default Undefined renders nothing for a missing variable.
+        default = ConfigTemplate(name='default', template_code='{{ missing }}')
+        self.assertEqual(default.render({}), '')
+
+        # StrictUndefined (resolved from its dotted path) raises on access.
+        strict = ConfigTemplate(
+            name='strict',
+            template_code='{{ missing }}',
+            environment_params={'undefined': 'jinja2.StrictUndefined'},
+        )
+        with self.assertRaises(UndefinedError):
+            strict.render({})
+
+    def test_environment_params_finalize_legacy_resolution(self):
+        """
+        Existing finalize values continue to resolve via import_string() as a
+        legacy carve-out (CVE-2026-29514). New use is blocked by clean().
+        """
+        t = ConfigTemplate(
+            name='finalize',
+            template_code='{{ v }}',
+            environment_params={'finalize': 'extras.tests.test_models.finalize_none_to_dash'},
+        )
+        self.assertEqual(t.render({'v': None}), '-')
+        self.assertEqual(t.render({'v': 'abc'}), 'abc')
+
+    def test_get_environment_params_handles_none(self):
+        # The environment_params field may be cleared; ensure the mixin returns a dict (not None).
+        # ConfigTemplate always forces autoescape off (#22652).
+        t = ConfigTemplate(name='empty', template_code='ok', environment_params=None)
+        self.assertEqual(t.get_environment_params(), {'autoescape': False})
+
+    def test_get_environment_params_resolves_path_imports(self):
+        t = ConfigTemplate(
+            name='resolve',
+            template_code='ok',
+            environment_params={'undefined': 'jinja2.StrictUndefined', 'trim_blocks': True},
+        )
+        params = t.get_environment_params()
+        self.assertIs(params['undefined'], StrictUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_get_environment_params_does_not_mutate_field(self):
+        # Resolving path imports must not replace the string values stored on the model field.
+        t = ConfigTemplate(
+            name='no-mutate',
+            template_code='ok',
+            environment_params={'undefined': 'jinja2.StrictUndefined'},
+        )
+        t.get_environment_params()
+        t.get_environment_params()
+        self.assertEqual(t.environment_params, {'undefined': 'jinja2.StrictUndefined'})
+
+
+class RenderTemplateMixinResponseTestCase(TestCase):
+    """
+    Tests for RenderTemplateMixin.render_to_response() HTTP behavior.
+    """
+
+    def test_response_default_mime_type(self):
+        t = ConfigTemplate(name='t', template_code='ok')
+        response = t.render_to_response({})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], DEFAULT_MIME_TYPE)
+
+    def test_response_custom_mime_type(self):
+        t = ConfigTemplate(name='t', template_code='{}', mime_type='application/json')
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Type'], 'application/json')
+
+    def test_response_attachment_with_file_name(self):
+        t = ConfigTemplate(
+            name='t', template_code='ok', file_name='router1', file_extension='cfg', as_attachment=True,
+        )
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="router1.cfg"')
+
+    def test_response_attachment_filename_from_queryset(self):
+        Site.objects.create(name='Site 1', slug='site-1')
+        t = ExportTemplate(
+            name='t',
+            template_code='{% for obj in queryset %}{{ obj.name }}{% endfor %}',
+            file_extension='txt',
+            as_attachment=True,
+        )
+        response = t.render_to_response(queryset=Site.objects.all())
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+
+    def test_response_attachment_filename_from_empty_queryset(self):
+        """An empty (but non-None) queryset must still yield a model-derived filename."""
+        t = ExportTemplate(
+            name='t',
+            template_code='{% for obj in queryset %}{{ obj.name }}{% endfor %}',
+            file_extension='txt',
+            as_attachment=True,
+        )
+        response = t.render_to_response(queryset=Site.objects.none())
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+
+    def test_response_attachment_does_not_force_queryset_evaluation(self):
+        """A template that never references `queryset` must not force it to be evaluated."""
+        Site.objects.bulk_create([Site(name=f'Site {i}', slug=f'site-{i}') for i in range(5)])
+        t = ExportTemplate(
+            name='t',
+            template_code='static output',  # deliberately does not reference `queryset`
+            file_extension='txt',
+            as_attachment=True,
+        )
+        with CaptureQueriesContext(connection) as ctx:
+            t.render_to_response(queryset=Site.objects.all())
+
+        table = Site._meta.db_table
+        site_queries = [q for q in ctx.captured_queries if table in q['sql']]
+        self.assertEqual(
+            site_queries, [],
+            f"render_to_response() queried {table} even though the template never "
+            f"references `queryset`:\n{site_queries}"
+        )
+
+    def test_response_attachment_filename_from_device_context(self):
+        t = ConfigTemplate(name='t', template_code='ok', as_attachment=True)
+        device = SimpleNamespace(name='router1')
+        response = t.render_to_response(context={'device': device})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="router1"')
+
+    def test_response_attachment_fallback_filename(self):
+        # No file_name, no queryset, no device/vm key in context: filename falls back to "output".
+        t = ConfigTemplate(name='t', template_code='ok', as_attachment=True)
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="output"')
+
+    def test_response_as_attachment_false_omits_disposition(self):
+        t = ConfigTemplate(name='t', template_code='ok', file_name='router1', as_attachment=False)
+        response = t.render_to_response({})
+        self.assertNotIn('Content-Disposition', response)
+
+    def test_response_body_matches_render(self):
+        t = ConfigTemplate(name='t', template_code='Hello {{ name }}')
+        rendered = t.render({'name': 'world'})
+        response = t.render_to_response({'name': 'world'})
+        self.assertEqual(response.content.decode(), rendered)
+
+
+class ExportTemplateRenderTestCase(TestCase):
+    """
+    Tests for ExportTemplate.render() with a queryset bound into the template context.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        Site.objects.bulk_create([
+            Site(name='Site A', slug='site-a'),
+            Site(name='Site B', slug='site-b'),
+            Site(name='Site C', slug='site-c'),
+        ])
+
+    def test_render_iterates_queryset(self):
+        t = ExportTemplate(
+            name='sites',
+            template_code='{% for obj in queryset %}{{ obj.name }}\n{% endfor %}',
+        )
+        queryset = Site.objects.order_by('name')
+        output = t.render(queryset=queryset)
+        self.assertEqual(output, 'Site A\nSite B\nSite C\n')
+
+    def test_render_to_response_for_queryset(self):
+        t = ExportTemplate(
+            name='sites',
+            template_code='{% for obj in queryset %}{{ obj.name }}\n{% endfor %}',
+            file_extension='txt',
+        )
+        response = t.render_to_response(queryset=Site.objects.order_by('name'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], DEFAULT_MIME_TYPE)
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+        self.assertEqual(response.content.decode(), 'Site A\nSite B\nSite C\n')
+
+
+class WebhookTestCase(TestCase):
+    """Tests for Webhook.clean()'s validation of payload_url (#22828)."""
+
+    def test_payload_url_accepts_literal_url(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_rejects_non_url(self):
+        webhook = Webhook(name='Webhook 1', payload_url='not-a-url-at-all')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_disallowed_scheme(self):
+        webhook = Webhook(name='Webhook 1', payload_url='file:///etc/passwd')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_accepts_jinja2_template(self):
+        """A templated payload_url must not be rejected merely for not being a literal URL."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://{{ data.name }}.example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_accepts_template_using_a_registered_filter(self):
+        webhook = Webhook(name='Webhook 1', payload_url="http://example.com/{{ 'HOME' | env }}")
+        webhook.clean()
+
+    def test_payload_url_rejects_malformed_template_syntax(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://{{ data.name }.example.com/hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_template_with_unregistered_filter(self):
+        webhook = Webhook(
+            name='Webhook 1', payload_url='http://example.com/{{ data.name | totally_unregistered_filter }}'
+        )
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_accepts_single_label_host(self):
+        """A Docker/Kubernetes-style internal service name is a legitimate webhook target (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://webhook-receiver:8080/hook')
+        webhook.clean()
+
+    def test_payload_url_accepts_underscore_in_hostname(self):
+        """requests accepts an underscore in a hostname even though Django's URLValidator does not (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://my_host.example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_rejects_missing_host(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http:///hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_templated_disallowed_scheme(self):
+        """A literal, disallowed scheme must be rejected even when the rest of the URL is templated (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='file:///{{ data.name }}')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_blank_payload_url_produces_a_single_error(self):
+        """clean() must not add its own error on top of clean_fields()'s for a blank value (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.full_clean()
+        self.assertEqual(cm.exception.message_dict['payload_url'], ['This field cannot be blank.'])
+
+    def test_none_payload_url_does_not_raise_typeerror(self):
+        webhook = Webhook(name='Webhook 1', payload_url=None)
+        webhook.clean()
+
+    def test_payload_url_accepts_fully_templated_value(self):
+        """A value with no literal scheme at all (the scheme itself is templated) must still be usable (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='{{ data.custom_fields.callback_url }}')
+        webhook.clean()
+
+    def test_payload_url_rejects_malformed_bracketed_host_gracefully(self):
+        """A malformed netloc must raise ValidationError, not an uncaught ValueError from urlsplit() (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://[2001:db8::1/hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+
+class EventRuleTestCase(TestCase):
+
+    def test_action_data_clean_accepts_dict(self):
+        """
+        clean() should accept a JSON object (or null) as action_data.
+        """
+        for value in ({'key': 'value'}, None):
+            rule = EventRule(name='test', event_types=[OBJECT_CREATED], action_data=value)
+            rule.clean()
+
+    def test_action_data_clean_rejects_non_dict(self):
+        """
+        clean() should reject action_data that is valid JSON but not an object (#21989).
+        """
+        for value in ('test', 42, [1, 2, 3], True):
+            rule = EventRule(name='test', event_types=[OBJECT_CREATED], action_data=value)
+            with self.assertRaises(ValidationError) as cm:
+                rule.clean()
+            self.assertIn('action_data', cm.exception.message_dict)
+
+
+class JinjaEnvironmentParamsCleanTestCase(TestCase):
+    """Tests for RenderTemplateMixin.clean() validation of environment_params."""
+
+    def _make_template(self, environment_params):
+        return ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params=environment_params,
+        )
+
+    def test_allowed_scalar_params_pass(self):
+        template = self._make_template({'trim_blocks': True, 'lstrip_blocks': True})
+        template.clean()
+
+    def test_autoescape_boolean_passes(self):
+        template = self._make_template({'autoescape': True})
+        template.clean()
+
+    def test_valid_undefined_passes(self):
+        for value in (
+            'jinja2.Undefined',
+            'jinja2.ChainableUndefined',
+            'jinja2.DebugUndefined',
+            'jinja2.StrictUndefined',
+        ):
+            template = self._make_template({'undefined': value})
+            template.clean()
+
+    def test_invalid_undefined_rejected(self):
+        template = self._make_template({'undefined': 'subprocess.getoutput'})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_unknown_key_rejected(self):
+        template = self._make_template({'extensions': ['os']})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_finalize_blocked_from_new_use(self):
+        template = self._make_template({'finalize': 'subprocess.getoutput'})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_empty_params_pass(self):
+        template = self._make_template({})
+        template.clean()
+
+    def test_none_params_pass(self):
+        template = self._make_template(None)
+        template.clean()
+
+    def test_exporttemplate_clean_rejects_unknown_key(self):
+        """MRO smoke test: ExportTemplate.clean() reaches RenderTemplateMixin.clean()."""
+        obj = ExportTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params={'loader': 'some.loader'},
+        )
+        with self.assertRaises(ValidationError) as cm:
+            obj.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_configtemplate_clean_rejects_finalize(self):
+        """MRO smoke test: ConfigTemplate.clean() reaches RenderTemplateMixin.clean()."""
+        obj = ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params={'finalize': 'subprocess.getoutput'},
+        )
+        with self.assertRaises(ValidationError) as cm:
+            obj.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+
+class JinjaEnvironmentParamsFilterTestCase(TestCase):
+    """Tests for RenderTemplateMixin._filter_environment_params()."""
+
+    def test_allowed_keys_pass_through(self):
+        params = {'trim_blocks': True, 'autoescape': False}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, params)
+
+    def test_unknown_keys_stripped(self):
+        params = {'extensions': ['os'], 'loader': 'x', 'trim_blocks': True}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, {'trim_blocks': True})
+
+    def test_finalize_preserved_as_legacy(self):
+        params = {'finalize': 'some.module.func', 'trim_blocks': True}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._filter_environment_params({}), {})
+
+
+class JinjaEnvironmentParamsResolveTestCase(TestCase):
+    """Tests for RenderTemplateMixin._resolve_mapped_params()."""
+
+    def test_undefined_resolved_to_class(self):
+        params = {'undefined': 'jinja2.StrictUndefined'}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertIs(result['undefined'], StrictUndefined)
+
+    def test_unrecognized_undefined_value_passed_through(self):
+        params = {'undefined': 'not.a.real.class'}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertEqual(result['undefined'], 'not.a.real.class')
+
+    def test_scalar_params_passed_through(self):
+        params = {'trim_blocks': True, 'autoescape': False}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertEqual(result, params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._resolve_mapped_params({}), {})
+
+
+class JinjaEnvironmentParamsFinalizeTestCase(TestCase):
+    """Tests for RenderTemplateMixin._resolve_finalize() legacy carve-out."""
+
+    def test_finalize_string_resolved_via_import_string(self):
+        params = {'finalize': 'extras.tests.test_models.finalize_none_to_dash'}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertIs(result['finalize'], finalize_none_to_dash)
+
+    def test_finalize_non_string_passed_through(self):
+        params = {'finalize': 42}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertEqual(result['finalize'], 42)
+
+    def test_no_finalize_key_unchanged(self):
+        params = {'trim_blocks': True}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertEqual(result, {'trim_blocks': True})
+
+    def test_invalid_import_path_raises_import_error(self):
+        params = {'finalize': 'nonexistent.module.func'}
+        with self.assertRaises(ImportError):
+            RenderTemplateMixin._resolve_finalize(params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._resolve_finalize({}), {})
+
+
+class JinjaEnvironmentParamsIntegrationTestCase(TestCase):
+    """Integration tests for get_environment_params() end-to-end."""
+
+    def _make_template(self, environment_params):
+        return ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params=environment_params,
+        )
+
+    def test_full_pipeline_with_undefined(self):
+        template = self._make_template({'undefined': 'jinja2.StrictUndefined', 'trim_blocks': True})
+        params = template.get_environment_params()
+        self.assertIs(params['undefined'], StrictUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_full_pipeline_strips_unknown_and_resolves(self):
+        template = self._make_template({
+            'extensions': ['os'],
+            'undefined': 'jinja2.DebugUndefined',
+            'trim_blocks': True,
+        })
+        params = template.get_environment_params()
+        self.assertNotIn('extensions', params)
+        self.assertIs(params['undefined'], DebugUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_full_pipeline_finalize_resolves(self):
+        template = self._make_template({
+            'finalize': 'extras.tests.test_models.finalize_none_to_dash',
+        })
+        params = template.get_environment_params()
+        self.assertIs(params['finalize'], finalize_none_to_dash)
+
+    def test_does_not_mutate_stored_value(self):
+        template = self._make_template({'undefined': 'jinja2.StrictUndefined'})
+        template.get_environment_params()
+        self.assertEqual(template.environment_params['undefined'], 'jinja2.StrictUndefined')
+
+    def test_none_environment_params(self):
+        # ConfigTemplate always forces autoescape off (#22652).
+        template = self._make_template(None)
+        self.assertEqual(template.get_environment_params(), {'autoescape': False})
+
+    def test_empty_environment_params(self):
+        # ConfigTemplate always forces autoescape off (#22652).
+        template = self._make_template({})
+        self.assertEqual(template.get_environment_params(), {'autoescape': False})

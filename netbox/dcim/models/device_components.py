@@ -4,8 +4,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelatio
 from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
-from django.db.models import Sum
+from django.db import models, router
 from django.utils.translation import gettext_lazy as _
 from mptt.models import MPTTModel, TreeForeignKey
 
@@ -16,6 +15,7 @@ from dcim.models.base import PortMappingBase
 from dcim.models.mixins import InterfaceValidationMixin
 from netbox.choices import ColorChoices
 from netbox.models import NetBoxModel, OrganizationalModel
+from netbox.models.features import ChangeLoggingMixin
 from netbox.models.mixins import OwnerMixin
 from utilities.fields import ColorField, NaturalOrderingField
 from utilities.mptt import TreeManager
@@ -255,13 +255,37 @@ class CabledObjectModel(models.Model):
 
     @cached_property
     def link_peers(self):
-        if self.cable:
-            return [
-                peer.termination
-                for peer in self.cable.terminations.all()
-                if peer.cable_end != self.cable_end
-            ]
-        return []
+        if not self.cable:
+            return []
+
+        if self.cable.profile:
+            return self._get_profile_link_peers()
+
+        return [peer.termination for peer in self.cable.terminations.all() if peer.cable_end != self.cable_end]
+
+    def _get_profile_link_peers(self):
+        if self.cable_end is None or self.cable_connector is None or not self.cable_positions:
+            return []
+
+        profile = self.cable.profile_class()
+        peer_terminations = {
+            (peer.connector, position): peer.termination
+            for peer in self.cable.terminations.all()
+            if peer.cable_end == self.opposite_cable_end and peer.connector is not None
+            for position in peer.positions or []
+        }
+        link_peers = []
+
+        for position in self.cable_positions:
+            mapped_position = profile.get_mapped_position(self.cable_end, self.cable_connector, position)
+            if mapped_position is None:
+                continue
+
+            peer = peer_terminations.get(mapped_position)
+            if peer is not None and peer not in link_peers:
+                link_peers.append(peer)
+
+        return link_peers
 
     @property
     def _occupied(self):
@@ -361,12 +385,27 @@ class PathEndpoint(models.Model):
         a stale in-memory `_path` relation while the database already points to
         a different CablePath (or to no path at all).
 
-        If the cached relation points to a CablePath that has just been
-        deleted, refresh only the `_path` field from the database and retry.
-        This keeps the fix cheap and narrowly scoped to the denormalized FK.
+        Two stale cases are repaired by refreshing only the `_path` field
+        from the database:
+
+        1. The endpoint is linked (by cable or wireless link) but `_path` is
+           unset, because the instance was loaded before its path was traced
+           (e.g. while queued for event serialization during link creation).
+        2. The cached relation points to a CablePath row that has just been
+           deleted.
+
+        Repairing case 1 costs one query per access for a linked endpoint
+        whose path is genuinely absent in the database. That state is
+        transient outside of tracing failures, so no result caching is
+        attempted here.
         """
         if self._path_id is None:
-            return None
+            has_link = self.cable_id is not None or getattr(self, 'wireless_link_id', None) is not None
+            if self.pk and has_link:
+                self.refresh_from_db(fields=['_path'])
+
+            if self._path_id is None:
+                return None
 
         try:
             return self._path
@@ -523,7 +562,7 @@ class PowerPort(ModularComponentModel, CabledObjectModel, PathEndpoint, Tracking
 
         return PowerPort.objects.filter(q)
 
-    def get_power_draw(self):
+    def get_power_draw(self, _seen=None):
         """
         Return the allocated and maximum power draw (in VA) and child PowerOutlet count for this PowerPort.
         """
@@ -531,13 +570,34 @@ class PowerPort(ModularComponentModel, CabledObjectModel, PathEndpoint, Tracking
 
         # Calculate aggregate draw of all child power outlets if no numbers have been defined manually
         if self.allocated_draw is None and self.maximum_draw is None:
-            utilization = self.get_downstream_powerports().aggregate(
-                maximum_draw_total=Sum('maximum_draw'),
-                allocated_draw_total=Sum('allocated_draw'),
-            )
+
+            def _aggregate(powerports, seen):
+                # Recursively resolve the draw for each downstream PowerPort. Using the per-port value
+                # (rather than a SQL aggregate over allocated_draw/maximum_draw) allows the draw to
+                # propagate through intermediate auto-mode PowerPorts, e.g. PDU-internal fuse chains.
+                # `seen` tracks visited PowerPorts to prevent infinite recursion if the topology
+                # happens to form a cycle.
+                allocated_total = 0
+                maximum_total = 0
+                for powerport in powerports:
+                    if powerport.pk in seen:
+                        continue
+                    seen.add(powerport.pk)
+                    draw = powerport.get_power_draw(_seen=seen)
+                    allocated_total += draw['allocated']
+                    maximum_total += draw['maximum']
+                return allocated_total, maximum_total
+
+            # Seed each _aggregate() call with a fresh copy of the inherited visited set so the full
+            # and per-leg aggregations are independent. Otherwise, ports visited during the full
+            # aggregation would be skipped during the per-leg passes.
+            base_seen = set(_seen) if _seen else set()
+            base_seen.add(self.pk)
+
+            allocated, maximum = _aggregate(self.get_downstream_powerports(), set(base_seen))
             ret = {
-                'allocated': utilization['allocated_draw_total'] or 0,
-                'maximum': utilization['maximum_draw_total'] or 0,
+                'allocated': allocated,
+                'maximum': maximum,
                 'outlet_count': self.poweroutlets.count(),
                 'legs': [],
             }
@@ -546,14 +606,13 @@ class PowerPort(ModularComponentModel, CabledObjectModel, PathEndpoint, Tracking
             if len(self.link_peers) == 1 and isinstance(self.link_peers[0], PowerFeed) and \
                     self.link_peers[0].phase == PowerFeedPhaseChoices.PHASE_3PHASE:
                 for leg, leg_name in PowerOutletFeedLegChoices:
-                    utilization = self.get_downstream_powerports(leg=leg).aggregate(
-                        maximum_draw_total=Sum('maximum_draw'),
-                        allocated_draw_total=Sum('allocated_draw'),
+                    leg_allocated, leg_maximum = _aggregate(
+                        self.get_downstream_powerports(leg=leg), set(base_seen)
                     )
                     ret['legs'].append({
                         'name': leg_name,
-                        'allocated': utilization['allocated_draw_total'] or 0,
-                        'maximum': utilization['maximum_draw_total'] or 0,
+                        'allocated': leg_allocated,
+                        'maximum': leg_maximum,
                         'outlet_count': self.poweroutlets.filter(feed_leg=leg).count(),
                     })
 
@@ -839,8 +898,8 @@ class Interface(
         verbose_name=_('wireless channel')
     )
     rf_channel_frequency = models.DecimalField(
-        max_digits=7,
-        decimal_places=2,
+        max_digits=8,
+        decimal_places=3,
         blank=True,
         null=True,
         verbose_name=_('channel frequency (MHz)'),
@@ -1138,7 +1197,7 @@ class Interface(
 # Pass-through ports
 #
 
-class PortMapping(PortMappingBase):
+class PortMapping(ChangeLoggingMixin, PortMappingBase):
     """
     Maps a FrontPort & position to a RearPort & position.
     """
@@ -1157,6 +1216,10 @@ class PortMapping(PortMappingBase):
         on_delete=models.CASCADE,
         related_name='mappings',
     )
+
+    class Meta(PortMappingBase.Meta):
+        # Inherit the unique constraints from PortMappingBase.Meta.
+        pass
 
     def clean(self):
         super().clean()
@@ -1270,6 +1333,29 @@ class RearPort(ModularComponentModel, CabledObjectModel, TrackingModelMixin):
 # Bays
 #
 
+class ModuleBayManager(TreeManager):
+    """
+    Order ModuleBays by the natural-sort name of each tree's root, then by MPTT
+    left value within the tree. Combined with the root-insert bypass in
+    ModuleBay.save(), this lets us keep MPTTMeta.order_insertion_by for cheap
+    intra-tree sibling placement while skipping the global tree_id renumbering
+    it would otherwise perform on every root insert.
+    """
+    def get_queryset(self, *args, **kwargs):
+        # Use the raw manager to avoid recursing through this get_queryset() when
+        # building the annotation subquery.
+        root_name = self.model._objects_raw.filter(
+            tree_id=models.OuterRef('tree_id'),
+            level=0,
+        ).values('name')[:1]
+        return super().get_queryset(*args, **kwargs).annotate(
+            _root_name=models.Subquery(
+                root_name,
+                output_field=models.CharField(db_collation='natural_sort'),
+            )
+        ).order_by('_root_name', 'lft')
+
+
 class ModuleBay(ModularComponentModel, TrackingModelMixin, MPTTModel):
     """
     An empty space within a Device which can house a child device
@@ -1289,10 +1375,17 @@ class ModuleBay(ModularComponentModel, TrackingModelMixin, MPTTModel):
         blank=True,
         help_text=_('Identifier to reference when renaming installed components')
     )
+    enabled = models.BooleanField(
+        verbose_name=_('enabled'),
+        default=True,
+    )
 
-    objects = TreeManager()
+    objects = ModuleBayManager()
+    # Plain TreeManager used by ModuleBayManager to build the _root_name subquery
+    # without recursing through our annotated get_queryset().
+    _objects_raw = TreeManager()
 
-    clone_fields = ('device',)
+    clone_fields = ('device', 'enabled')
 
     class Meta(ModularComponentModel.Meta):
         # Empty tuple triggers Django migration detection for MPTT indexes
@@ -1308,6 +1401,9 @@ class ModuleBay(ModularComponentModel, TrackingModelMixin, MPTTModel):
         verbose_name_plural = _('module bays')
 
     class MPTTMeta:
+        # Used for placing siblings within a single tree at insert time. Costs
+        # are bounded to that tree's rows. Cross-tree (root) insertion is
+        # handled in save() to avoid the O(N) tree_id shift this would trigger.
         order_insertion_by = ('name',)
 
     def clean(self):
@@ -1329,7 +1425,45 @@ class ModuleBay(ModularComponentModel, TrackingModelMixin, MPTTModel):
             self.parent = self.module.module_bay
         else:
             self.parent = None
+        opts = self._mptt_meta
+        # For new root nodes, allocate the next tree_id and pre-set MPTT fields
+        # so super().save() skips MPTT's order_insertion_by-driven insertion
+        # path. That path would otherwise UPDATE every later tree_id on each
+        # root insert (NB-2800). Children still go through MPTT, which keeps
+        # siblings in name order via the same order_insertion_by setting.
+        if self._state.adding and self.parent_id is None and not self.lft and not self.rght:
+            using = kwargs.get('using') or router.db_for_write(ModuleBay, instance=self)
+            max_tree_id = ModuleBay._objects_raw.using(using).aggregate(
+                models.Max('tree_id')
+            )['tree_id__max'] or 0
+            self.tree_id = max_tree_id + 1
+            self.lft = 1
+            self.rght = 2
+            self.level = 0
+        elif (
+            not self._state.adding
+            and self.parent_id is None
+            and self._mptt_cached_fields.get(opts.parent_attr) is None
+        ):
+            # Existing root being updated. Spoof the cached order_insertion_by
+            # values so MPTT's same_order check passes and it skips its reorder
+            # path, which would UPDATE every later tree_id on each root rename.
+            # ModuleBayManager._root_name recovers display order at query time,
+            # so the tree_id reshuffling would be wasted work. Child renames
+            # and root<->child transitions intentionally fall through to MPTT.
+            for field_name in opts.order_insertion_by:
+                field_name = field_name.lstrip('-')
+                self._mptt_cached_fields[field_name] = opts.get_raw_field_value(
+                    self, field_name
+                )
         super().save(*args, **kwargs)
+
+    @property
+    def _occupied(self):
+        """
+        Indicates whether the module bay is occupied by a module.
+        """
+        return bool(not self.enabled or hasattr(self, 'installed_module'))
 
 
 class DeviceBay(ComponentModel, TrackingModelMixin):
@@ -1343,8 +1477,12 @@ class DeviceBay(ComponentModel, TrackingModelMixin):
         blank=True,
         null=True
     )
+    enabled = models.BooleanField(
+        verbose_name=_('enabled'),
+        default=True,
+    )
 
-    clone_fields = ('device',)
+    clone_fields = ('device', 'enabled')
 
     class Meta(ComponentModel.Meta):
         verbose_name = _('device bay')
@@ -1359,6 +1497,16 @@ class DeviceBay(ComponentModel, TrackingModelMixin):
                 device_type=self.device.device_type
             ))
 
+        # Prevent installing a device into a disabled bay
+        if self.installed_device and not self.enabled:
+            current_installed_device_id = (
+                DeviceBay.objects.filter(pk=self.pk).values_list('installed_device_id', flat=True).first()
+            )
+            if self.pk is None or current_installed_device_id != self.installed_device_id:
+                raise ValidationError({
+                    'installed_device': _("Cannot install a device in a disabled device bay.")
+                })
+
         # Cannot install a device into itself, obviously
         if self.installed_device and getattr(self, 'device', None) == self.installed_device:
             raise ValidationError(_("Cannot install a device into itself."))
@@ -1372,6 +1520,13 @@ class DeviceBay(ComponentModel, TrackingModelMixin):
                         "Cannot install the specified device; device is already installed in {bay}."
                     ).format(bay=current_bay)
                 })
+
+    @property
+    def _occupied(self):
+        """
+        Indicates whether the device bay is occupied by a child device.
+        """
+        return bool(not self.enabled or self.installed_device_id)
 
 
 #

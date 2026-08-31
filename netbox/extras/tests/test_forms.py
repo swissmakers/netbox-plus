@@ -1,15 +1,22 @@
+import tempfile
+from pathlib import Path
+
+from django.core.exceptions import NON_FIELD_ERRORS
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
-from core.models import ObjectType
+from core.choices import ManagedFileRootPathChoices
+from core.models import DataSource, ObjectType
 from dcim.forms import SiteForm
 from dcim.models import Site
 from extras.choices import CustomFieldTypeChoices
-from extras.forms import SavedFilterForm
+from extras.forms import SavedFilterForm, TableConfigBulkEditForm, TableConfigForm
 from extras.forms.model_forms import CustomFieldChoiceSetForm
-from extras.models import CustomField, CustomFieldChoiceSet
+from extras.forms.scripts import ScriptFileForm
+from extras.models import CustomField, CustomFieldChoiceSet, ScriptModule
 
 
-class CustomFieldModelFormTest(TestCase):
+class CustomFieldModelFormTestCase(TestCase):
 
     @classmethod
     def setUpTestData(cls):
@@ -91,7 +98,7 @@ class CustomFieldModelFormTest(TestCase):
             self.assertIsNone(instance.custom_field_data[field_type])
 
 
-class CustomFieldChoiceSetFormTest(TestCase):
+class CustomFieldChoiceSetFormTestCase(TestCase):
 
     def test_escaped_colons_preserved_on_edit(self):
         choice_set = CustomFieldChoiceSet.objects.create(
@@ -115,8 +122,34 @@ class CustomFieldChoiceSetFormTest(TestCase):
         # cleaned extra choices are correct, which does actually mean a list of tuples
         self.assertEqual(updated.extra_choices, [('foo:bar', 'label'), ('value', 'label:with:colons')])
 
+    def test_choice_colors_round_trip_on_edit(self):
+        choice_set = CustomFieldChoiceSet.objects.create(
+            name='Test Choice Set',
+            extra_choices=[['foo:bar', 'label'], ['choice2', 'Choice 2']],
+            choice_colors={'foo:bar': 'red', 'choice2': 'green'},
+        )
 
-class SavedFilterFormTest(TestCase):
+        form = CustomFieldChoiceSetForm(instance=choice_set)
+        initial_choices = form.initial['extra_choices']
+        initial_choice_colors = form.initial['choice_colors']
+
+        self.assertEqual(initial_choice_colors, 'choice2:green\nfoo\\:bar:red')
+
+        form = CustomFieldChoiceSetForm(
+            {
+                'name': choice_set.name,
+                'extra_choices': initial_choices,
+                'choice_colors': initial_choice_colors,
+            },
+            instance=choice_set,
+        )
+        self.assertTrue(form.is_valid())
+        updated = form.save()
+
+        self.assertEqual(updated.choice_colors, {'choice2': 'green', 'foo:bar': 'red'})
+
+
+class SavedFilterFormTestCase(TestCase):
 
     def test_basic_submit(self):
         """
@@ -135,3 +168,172 @@ class SavedFilterFormTest(TestCase):
         })
         self.assertTrue(form.is_valid())
         form.save()
+
+
+class ScriptFileFormTestCase(TestCase):
+    """
+    Scripts added via a Data Source must be validated the same way uploaded scripts are (see #22180).
+    """
+    BROKEN_SCRIPT = (
+        "from extras.scripts import Script\n"
+        "import imnotarealmoduleicreateerrors\n\n\n"
+        "class BrokenScript(Script):\n"
+        "    def run(self, data, commit):\n"
+        "        pass\n"
+    )
+    VALID_SCRIPT = (
+        "from extras.scripts import Script\n\n\n"
+        "class FirstScript(Script):\n"
+        "    def run(self, data, commit):\n"
+        "        pass\n\n\n"
+        "class SecondScript(Script):\n"
+        "    def run(self, data, commit):\n"
+        "        pass\n"
+    )
+
+    @staticmethod
+    def _write(scripts_dir, filename, content):
+        with open(scripts_dir / filename, 'w') as f:
+            f.write(content)
+
+    @staticmethod
+    def _new_module():
+        # Mirror ScriptModuleCreateView.alter_object(), which sets file_root before validation.
+        return ScriptModule(file_root=ManagedFileRootPathChoices.SCRIPTS)
+
+    def _sync_source(self, name, **files):
+        """
+        Create a local DataSource over a temp dir populated with the given {filename: content} files,
+        sync it, and return the DataSource.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        scripts_dir = Path(temp_dir.name) / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in files.items():
+            self._write(scripts_dir, filename, content)
+
+        data_source = DataSource(name=name, type="local", source_url=str(scripts_dir))
+        data_source.save()
+        data_source.sync()
+        return data_source
+
+    def test_broken_script_via_data_file_is_rejected(self):
+        """A script that fails to import via a data_file must be rejected, and no ScriptModule created."""
+        data_source = self._sync_source("Broken", **{'broken.py': self.BROKEN_SCRIPT})
+        data_file = data_source.datafiles.get(path__endswith='broken.py')
+
+        form = ScriptFileForm(data={'data_file': data_file.pk}, instance=self._new_module())
+
+        self.assertFalse(form.is_valid())
+        self.assertIn(NON_FIELD_ERRORS, form.errors)
+        self.assertEqual(ScriptModule.objects.count(), 0)
+
+    def test_valid_script_via_data_file_is_accepted(self):
+        """A valid script via a data_file passes validation and its Script classes are discovered on save."""
+        data_source = self._sync_source("Valid", **{'valid.py': self.VALID_SCRIPT})
+        data_file = data_source.datafiles.get(path__endswith='valid.py')
+
+        form = ScriptFileForm(data={'data_file': data_file.pk}, instance=self._new_module())
+        self.assertTrue(form.is_valid())
+        module = form.save()
+
+        self.assertEqual(ScriptModule.objects.count(), 1)
+        self.assertEqual(
+            {script.name for script in module.scripts.all()},
+            {'FirstScript', 'SecondScript'},
+        )
+
+    def test_corrected_script_recovers(self):
+        """After a broken script is rejected, syncing a corrected version succeeds without a uniqueness deadlock."""
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        scripts_dir = Path(temp_dir.name) / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+
+        data_source = DataSource(name="Recovery", type="local", source_url=str(scripts_dir))
+        data_source.save()
+
+        # First sync: broken script is rejected, nothing created
+        self._write(scripts_dir, 'myscript.py', self.BROKEN_SCRIPT)
+        data_source.sync()
+        data_file = data_source.datafiles.get(path__endswith='myscript.py')
+        form = ScriptFileForm(data={'data_file': data_file.pk}, instance=self._new_module())
+        self.assertFalse(form.is_valid())
+        self.assertEqual(ScriptModule.objects.count(), 0)
+
+        # Correct the script and re-sync: now it should be accepted
+        self._write(scripts_dir, 'myscript.py', self.VALID_SCRIPT)
+        data_source.sync()
+        data_file = data_source.datafiles.get(path__endswith='myscript.py')
+        form = ScriptFileForm(data={'data_file': data_file.pk}, instance=self._new_module())
+        self.assertTrue(form.is_valid())
+        module = form.save()
+        self.assertEqual(
+            {script.name for script in module.scripts.all()},
+            {'FirstScript', 'SecondScript'},
+        )
+
+    def test_broken_script_via_upload_is_rejected(self):
+        """Regression guard: the upload_file path still validates content."""
+        upload_file = SimpleUploadedFile(name='broken.py', content=self.BROKEN_SCRIPT.encode())
+        form = ScriptFileForm(files={'upload_file': upload_file}, instance=self._new_module())
+
+        self.assertFalse(form.is_valid())
+        self.assertIn(NON_FIELD_ERRORS, form.errors)
+
+    def test_valid_script_via_upload_is_accepted(self):
+        """Regression guard: a valid uploaded script still validates."""
+        upload_file = SimpleUploadedFile(name='valid.py', content=self.VALID_SCRIPT.encode())
+        form = ScriptFileForm(files={'upload_file': upload_file}, instance=self._new_module())
+
+        self.assertTrue(form.is_valid())
+
+
+class TableConfigFormTestCase(TestCase):
+
+    def test_form_without_table_context(self):
+        """The form must be constructible without an object type."""
+        form = TableConfigForm()
+        self.assertEqual(list(form.fields['available_columns'].widget.choices), [])
+        self.assertEqual(list(form.fields['columns'].widget.choices), [])
+
+    def test_form_with_invalid_object_type(self):
+        """An unknown object type must yield empty column choices."""
+        last_pk = ObjectType.objects.order_by('pk').last().pk
+        form = TableConfigForm(initial={'object_type': last_pk + 1})
+        self.assertEqual(list(form.fields['available_columns'].widget.choices), [])
+        self.assertEqual(list(form.fields['columns'].widget.choices), [])
+
+    def test_form_with_unknown_table(self):
+        """An unresolvable table name must yield empty column choices."""
+        object_type = ObjectType.objects.get_for_model(Site)
+        form = TableConfigForm(initial={'object_type': object_type.pk, 'table': 'NoSuchTable'})
+        self.assertEqual(list(form.fields['columns'].widget.choices), [])
+
+    def test_form_with_table_context(self):
+        """Column choices must be populated from the resolved table."""
+        object_type = ObjectType.objects.get_for_model(Site)
+        form = TableConfigForm(initial={
+            'object_type': object_type.pk,
+            'table': 'SiteTable',
+            'columns': ['name', 'status'],
+        })
+        self.assertEqual(
+            [name for name, _ in form.fields['columns'].widget.choices],
+            ['name', 'status']
+        )
+        self.assertIn('region', dict(form.fields['available_columns'].widget.choices))
+
+    def test_form_includes_changelog_message(self):
+        """The model form must expose the changelog_message meta field."""
+        object_type = ObjectType.objects.get_for_model(Site)
+        form = TableConfigForm(initial={'object_type': object_type.pk, 'table': 'SiteTable'})
+        self.assertIn('changelog_message', form.fields)
+        self.assertIn('changelog_message', form.meta_fields)
+
+    def test_bulk_edit_form_includes_changelog_message(self):
+        """The bulk edit form must expose the changelog_message meta field."""
+        form = TableConfigBulkEditForm()
+        self.assertIn('changelog_message', form.fields)
+        self.assertIn('changelog_message', form.meta_fields)

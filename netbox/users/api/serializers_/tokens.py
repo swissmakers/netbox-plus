@@ -5,6 +5,7 @@ from rest_framework.exceptions import AuthenticationFailed, PermissionDenied
 from netbox.api.fields import IPNetworkSerializer
 from netbox.api.serializers import ValidatedModelSerializer
 from users.models import Token
+from users.utils import user_may_grant_token
 
 from .users import *
 
@@ -50,12 +51,32 @@ class TokenSerializer(ValidatedModelSerializer):
     def validate(self, data):
 
         # If the Token is being created on behalf of another user, enforce the grant_token permission.
+        # Use user_may_grant_token() rather than has_perm(obj=None): the latter short-circuits to True
+        # when the permission is present in cache without evaluating ObjectPermission constraints.
         request = self.context.get('request')
         token_user = data.get('user')
-        if token_user and token_user != request.user and not request.user.has_perm('users.grant_token'):
+        if token_user and token_user != request.user and not user_may_grant_token(request.user, token_user):
             raise PermissionDenied("This user does not have permission to create tokens for other users.")
 
         return super().validate(data)
+
+    def create(self, validated_data):
+        instance = super().create(validated_data)
+        # The plaintext token is only available in memory after save(); v2 tokens persist only an
+        # HMAC digest, so it can't be recovered later. Stash it on the request so to_representation()
+        # can return it even after the viewset re-fetches the instance from the database.
+        if request := self.context.get('request'):
+            if not hasattr(request, '_token_plaintexts'):
+                request._token_plaintexts = {}
+            request._token_plaintexts[instance.pk] = instance.token
+        return instance
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get('token') and (request := self.context.get('request')):
+            if plaintext := getattr(request, '_token_plaintexts', {}).get(instance.pk):
+                data['token'] = plaintext
+        return data
 
 
 class TokenProvisionSerializer(TokenSerializer):

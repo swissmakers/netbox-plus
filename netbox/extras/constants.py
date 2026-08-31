@@ -1,8 +1,18 @@
+from jinja2 import ChainableUndefined, DebugUndefined, StrictUndefined, Undefined
+
 from core.events import *
 from extras.choices import LogLevelChoices
 
 # Custom fields
 CUSTOMFIELD_EMPTY_VALUES = (None, '', [])
+
+# Maximum number of objects to update per query when provisioning, removing, or renaming custom
+# field data. Bounding the number of rows touched by each statement prevents very large tables from
+# exceeding the database statement timeout (JSONB updates rewrite each affected row). This value
+# sits at the throughput "knee": benchmarking jsonb_set() across a 1M-row table showed throughput
+# plateaus by ~5K rows/statement (raising it further yields no meaningful speedup), while keeping
+# each statement orders of magnitude below a typical statement timeout.
+CUSTOMFIELD_DATA_BATCH_SIZE = 5000
 
 # ImageAttachment
 IMAGE_ATTACHMENT_IMAGE_FORMATS = {
@@ -18,6 +28,11 @@ IMAGE_ATTACHMENT_IMAGE_FORMATS = {
 # Template Export
 DEFAULT_MIME_TYPE = 'text/plain; charset=utf-8'
 
+# Scripts
+# Prefix applied to dynamically-loaded script/report module names so that a script whose filename
+# matches a core app or package (e.g. "circuits.py") cannot shadow it in sys.modules.
+SCRIPT_MODULE_NAME_PREFIX = '_netbox_script_module_'
+
 # Webhooks
 HTTP_CONTENT_TYPE_JSON = 'application/json'
 
@@ -32,11 +47,47 @@ WEBHOOK_EVENT_TYPES = {
     JOB_ERRORED: 'job_ended',
 }
 
-# Jinja environment parameters which support path imports
-JINJA_ENV_PARAMS_WITH_PATH_IMPORT = (
-    'undefined',
-    'finalize',
-)
+# Allowed Jinja2 environment parameters and their permitted values.
+# Only keys listed here may appear in a template's environment_params.
+#   None  = any JSON-serializable value accepted (scalars, booleans, etc.)
+#   dict  = only dict keys accepted; dict values are the resolved Python objects
+#
+# Note: 'finalize' is intentionally absent. It is deprecated and handled as a
+# legacy carve-out in RenderTemplateMixin (blocked from new use, but existing
+# stored values continue to resolve via import_string at render time).
+JINJA_ENV_PARAMS_ALLOWED = {
+    # Boolean / scalar params (accept any JSON-serializable value)
+    'auto_reload': None,
+    'autoescape': None,
+    'cache_size': None,
+    'enable_async': None,
+    'keep_trailing_newline': None,
+    'lstrip_blocks': None,
+    'optimized': None,
+    'trim_blocks': None,
+    # String params (template syntax delimiters)
+    'block_start_string': None,
+    'block_end_string': None,
+    'comment_start_string': None,
+    'comment_end_string': None,
+    'line_comment_prefix': None,
+    'line_statement_prefix': None,
+    'newline_sequence': None,
+    'variable_start_string': None,
+    'variable_end_string': None,
+    # Mapped params (value must be a key in the dict; resolved to the dict value)
+    'undefined': {
+        'jinja2.ChainableUndefined': ChainableUndefined,
+        'jinja2.DebugUndefined': DebugUndefined,
+        'jinja2.StrictUndefined': StrictUndefined,
+        'jinja2.Undefined': Undefined,
+    },
+    # Excluded (dangerous — accept callables or trigger imports):
+    #   'bytecode_cache' — accepts arbitrary object
+    #   'extensions'     — Jinja2 internally calls import_string() on string entries
+    #   'finalize'       — deprecated; legacy carve-out in RenderTemplateMixin
+    #   'loader'         — accepts arbitrary object
+}
 
 # Dashboard
 DEFAULT_DASHBOARD = [

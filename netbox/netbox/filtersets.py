@@ -2,6 +2,7 @@ import json
 from copy import deepcopy
 
 import django_filters
+from django.contrib.auth.models import AnonymousUser
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.db.models import Q
@@ -20,6 +21,7 @@ from utilities.constants import (
     FILTER_CHAR_BASED_LOOKUP_MAP,
     FILTER_NEGATION_LOOKUP_MAP,
     FILTER_NUMERIC_BASED_LOOKUP_MAP,
+    FILTER_TAG_LOOKUP_MAP,
     FILTER_TREENODE_NEGATION_LOOKUP_MAP,
 )
 from utilities.forms.fields import MACAddressField
@@ -108,9 +110,22 @@ class BaseFilterSet(django_filters.FilterSet):
         # Apply any referenced SavedFilters
         if data and ('filter' in data or 'filter_id' in data):
             data = data.copy()  # Get a mutable copy
-            saved_filters = SavedFilter.objects.filter(
+
+            # Coerce filter_id values to integers, ignoring any which are not valid (see #22568)
+            filter_ids = []
+            for f_id in data.pop('filter_id', []):
+                try:
+                    filter_ids.append(int(f_id))
+                except (ValueError, TypeError):
+                    pass
+
+            # Only apply SavedFilters the requesting user is permitted to see (#22790). Fall back to
+            # anonymous visibility (shared filters only) when no request is available.
+            request = kwargs.get('request')
+            user = request.user if request else AnonymousUser()
+            saved_filters = SavedFilter.objects.restrict_to_shared(user).filter(
                 Q(slug__in=data.pop('filter', [])) |
-                Q(pk__in=data.pop('filter_id', []))
+                Q(pk__in=filter_ids)
             )
             for sf in saved_filters:
                 for key, value in sf.parameters.items():
@@ -144,10 +159,13 @@ class BaseFilterSet(django_filters.FilterSet):
             # TreeNodeMultipleChoiceFilter only support negation but must maintain the `in` lookup expression
             return FILTER_TREENODE_NEGATION_LOOKUP_MAP
 
+        if isinstance(existing_filter, (TagFilter, TagIDFilter)):
+            # Tags additionally support an "any of" (OR) mode, unlike other model choice filters
+            return FILTER_TAG_LOOKUP_MAP
+
         if isinstance(existing_filter, (
             django_filters.ModelChoiceFilter,
             django_filters.ModelMultipleChoiceFilter,
-            TagFilter
         )):
             # These filter types support only negation
             return FILTER_NEGATION_LOOKUP_MAP
@@ -227,6 +245,10 @@ class BaseFilterSet(django_filters.FilterSet):
                 # This is a negation filter which requires a queryset.exclude() clause
                 # Of course setting the negation of the existing filter's exclude attribute handles both cases
                 new_filter.exclude = not existing_filter.exclude
+
+            if lookup_name == 'any' and isinstance(new_filter, (TagFilter, TagIDFilter)):
+                # "Any of" is an OR match, whereas TagFilter/TagIDFilter default to AND (conjoined=True)
+                new_filter.conjoined = False
 
             new_filters[new_filter_name] = new_filter
 

@@ -30,6 +30,11 @@ FILTER_NEGATION_LOOKUP_MAP = dict(
     n='exact'
 )
 
+FILTER_TAG_LOOKUP_MAP = dict(
+    n='exact',
+    any='exact',
+)
+
 FILTER_TREENODE_NEGATION_LOOKUP_MAP = dict(
     n='in'
 )
@@ -104,6 +109,9 @@ HTML_ALLOWED_ATTRIBUTES = {
     "td": {"align"},
     "th": {"align"},
 }
+
+# Allowed URL schemes for image sources (img[src]); applied in addition to ALLOWED_URL_SCHEMES
+IMAGE_URL_SCHEMES = {'http', 'https'}
 
 HTTP_PROXY_SUPPORTED_SOCK_SCHEMAS = ['socks4', 'socks4a', 'socks4h', 'socks5', 'socks5a', 'socks5h']
 HTTP_PROXY_SOCK_RDNS_SCHEMAS = ['socks4h', 'socks4a', 'socks5h', 'socks5a']

@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+from django import forms
 from django.test import TestCase
 
 from dcim.choices import (
@@ -11,6 +14,7 @@ from dcim.choices import (
 from dcim.forms import *
 from dcim.models import *
 from ipam.models import ASN, RIR, VLAN
+from utilities.exceptions import AbortRequest
 from utilities.forms.rendering import M2MAddRemoveFields
 from utilities.testing import create_test_device
 from virtualization.models import Cluster, ClusterGroup, ClusterType
@@ -176,6 +180,133 @@ class DeviceTestCase(TestCase):
         self.assertIn('position', form.errors)
 
 
+class ModuleTypeFormTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        cls.profile = ModuleTypeProfile.objects.create(
+            name='Module Type Profile 1',
+            schema={
+                'properties': {
+                    'media': {
+                        'title': 'Media',
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                            'enum': ['copper', 'sfp', 'qsfp28'],
+                        },
+                    },
+                },
+            },
+        )
+
+    def test_enum_array_attribute_uses_multiselect_field(self):
+        form = ModuleTypeForm(data={
+            'manufacturer': self.manufacturer.pk,
+            'model': 'Module Type 1',
+            'profile': self.profile.pk,
+            'attr_media': ['copper', 'qsfp28'],
+        })
+
+        self.assertIsInstance(form.fields['attr_media'], forms.MultipleChoiceField)
+        self.assertEqual(
+            list(form.fields['attr_media'].choices),
+            [
+                ('copper', 'copper'),
+                ('sfp', 'sfp'),
+                ('qsfp28', 'qsfp28'),
+            ],
+        )
+        with patch('utilities.forms.fields.dynamic.get_action_url', return_value='/'):
+            self.assertTrue(form.is_valid(), form.errors)
+
+            module_type = form.save()
+            self.assertEqual(module_type.attribute_data, {'media': ['copper', 'qsfp28']})
+
+
+class VCPositionTokenFormTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        Site.objects.create(name='Site VC 1', slug='site-vc-1')
+        manufacturer = Manufacturer.objects.create(name='Manufacturer VC 1', slug='manufacturer-vc-1')
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer, model='Device Type VC 1', slug='device-type-vc-1'
+        )
+        DeviceRole.objects.create(name='Device Role VC 1', slug='device-role-vc-1', color='ff0000')
+        InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='ge-{vc_position:0}/0/0',
+            type='1000base-t',
+        )
+        VirtualChassis.objects.create(name='VC 1')
+
+    def test_device_creation_in_vc_resolves_vc_position(self):
+        form = DeviceForm(data={
+            'name': 'Device VC Form 1',
+            'role': DeviceRole.objects.first().pk,
+            'tenant': None,
+            'manufacturer': Manufacturer.objects.first().pk,
+            'device_type': DeviceType.objects.first().pk,
+            'site': Site.objects.first().pk,
+            'rack': None,
+            'face': None,
+            'position': None,
+            'platform': None,
+            'status': DeviceStatusChoices.STATUS_ACTIVE,
+            'virtual_chassis': VirtualChassis.objects.first().pk,
+            'vc_position': 2,
+        })
+        self.assertTrue(form.is_valid())
+        device = form.save()
+        self.assertTrue(device.interfaces.filter(name='ge-2/0/0').exists())
+
+    def test_device_creation_not_in_vc_uses_fallback(self):
+        form = DeviceForm(data={
+            'name': 'Device VC Form 2',
+            'role': DeviceRole.objects.first().pk,
+            'tenant': None,
+            'manufacturer': Manufacturer.objects.first().pk,
+            'device_type': DeviceType.objects.first().pk,
+            'site': Site.objects.first().pk,
+            'rack': None,
+            'face': None,
+            'position': None,
+            'platform': None,
+            'status': DeviceStatusChoices.STATUS_ACTIVE,
+        })
+        self.assertTrue(form.is_valid())
+        device = form.save()
+        self.assertTrue(device.interfaces.filter(name='ge-0/0/0').exists())
+
+    def test_device_creation_duplicate_name_conflict(self):
+        # With conflict
+        device_type = DeviceType.objects.first()
+        # to generate conflicts create an interface that will exist
+        InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='ge-0/0/0',
+            type='1000base-t',
+        )
+        form = DeviceForm(data={
+            'name': 'Device VC Form 3',
+            'role': DeviceRole.objects.first().pk,
+            'tenant': None,
+            'manufacturer': Manufacturer.objects.first().pk,
+            'device_type': device_type.pk,
+            'site': Site.objects.first().pk,
+            'rack': None,
+            'face': None,
+            'position': None,
+            'platform': None,
+            'status': DeviceStatusChoices.STATUS_ACTIVE,
+        })
+        self.assertTrue(form.is_valid())
+        with self.assertRaises(AbortRequest):
+            form.save()
+
+
 class FrontPortTestCase(TestCase):
 
     @classmethod
@@ -188,6 +319,13 @@ class FrontPortTestCase(TestCase):
             RearPort(name='RearPort4', device=cls.device, type=PortTypeChoices.TYPE_8P8C),
         )
         RearPort.objects.bulk_create(cls.rear_ports)
+        cls.rear_port_templates = (
+            RearPortTemplate(name='RearPort1', device_type=cls.device.device_type, type=PortTypeChoices.TYPE_8P8C),
+            RearPortTemplate(name='RearPort2', device_type=cls.device.device_type, type=PortTypeChoices.TYPE_8P8C),
+            RearPortTemplate(name='RearPort3', device_type=cls.device.device_type, type=PortTypeChoices.TYPE_8P8C),
+            RearPortTemplate(name='RearPort4', device_type=cls.device.device_type, type=PortTypeChoices.TYPE_8P8C),
+        )
+        RearPortTemplate.objects.bulk_create(cls.rear_port_templates)
 
     def test_front_port_label_count_valid(self):
         """
@@ -216,6 +354,124 @@ class FrontPortTestCase(TestCase):
             'type': PortTypeChoices.TYPE_8P8C,
             'positions': 1,
             'rear_ports': [f'{rear_port.pk}:1' for rear_port in self.rear_ports],
+        }
+        form = FrontPortCreateForm(bad_front_port_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn('label', form.errors)
+
+    def test_front_port_position_count_valid(self):
+        """
+        Test that generating front ports with multiple positions each passes form validation.
+        """
+        front_port_data = {
+            'device': self.device.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 2,
+            'rear_ports': [f'{rear_port.pk}:1' for rear_port in self.rear_ports],
+        }
+        form = FrontPortCreateForm(front_port_data)
+
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_front_port_position_count_mismatch(self):
+        """
+        Check that the mismatch error reports the total number of front port positions, not the port count.
+        """
+        bad_front_port_data = {
+            'device': self.device.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 2,
+            'rear_ports': [f'{rear_port.pk}:1' for rear_port in self.rear_ports[:2]],
+        }
+        form = FrontPortCreateForm(bad_front_port_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            'The total number of front port positions (4) must match the selected number of rear port '
+            'positions (2).',
+            form.errors['rear_ports']
+        )
+
+    def test_front_port_template_position_count_mismatch(self):
+        """
+        Check that the front port template form reports the same corrected position total.
+        """
+        bad_front_port_template_data = {
+            'device_type': self.device.device_type.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 2,
+            'rear_ports': [f'{rear_port_template.pk}:1' for rear_port_template in self.rear_port_templates[:2]],
+        }
+        form = FrontPortTemplateCreateForm(bad_front_port_template_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn(
+            'The total number of front port positions (4) must match the selected number of rear port '
+            'positions (2).',
+            form.errors['rear_ports']
+        )
+
+    def test_front_port_missing_rear_ports(self):
+        """
+        Check that omitting the rear port selection reports a field error rather than raising an exception.
+        """
+        bad_front_port_data = {
+            'device': self.device.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 1,
+        }
+        form = FrontPortCreateForm(bad_front_port_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn('rear_ports', form.errors)
+
+    def test_front_port_invalid_positions(self):
+        """
+        Check that a non-numeric position count reports a field error rather than raising an exception.
+        """
+        bad_front_port_data = {
+            'device': self.device.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 'two',
+            'rear_ports': [f'{rear_port.pk}:1' for rear_port in self.rear_ports[:2]],
+        }
+        form = FrontPortCreateForm(bad_front_port_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn('positions', form.errors)
+
+    def test_front_port_template_missing_rear_ports(self):
+        """
+        Check that the front port template form also reports a field error rather than raising an exception.
+        """
+        bad_front_port_template_data = {
+            'device_type': self.device.device_type.pk,
+            'name': 'FrontPort[1-2]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 1,
+        }
+        form = FrontPortTemplateCreateForm(bad_front_port_template_data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn('rear_ports', form.errors)
+
+    def test_front_port_invalid_label_range(self):
+        """
+        Check that an inverted label range reports a field error rather than raising an exception.
+        """
+        bad_front_port_data = {
+            'device': self.device.pk,
+            'name': 'FrontPort[1-2]',
+            'label': 'Port[2-1]',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'positions': 1,
+            'rear_ports': [f'{rear_port.pk}:1' for rear_port in self.rear_ports[:2]],
         }
         form = FrontPortCreateForm(bad_front_port_data)
 
@@ -418,6 +674,15 @@ class InterfaceTestCase(TestCase):
         self.assertNotIn('untagged_vlan', form.cleaned_data.keys())
         self.assertNotIn('tagged_vlans', form.cleaned_data.keys())
         self.assertNotIn('qinq_svlan', form.cleaned_data.keys())
+
+
+class CableTestCase(TestCase):
+
+    def test_invalid_side_designation_raises_value_error(self):
+        """_clean_side rejects a side other than 'a' or 'b' with ValueError."""
+        form = CableImportForm.__new__(CableImportForm)
+        with self.assertRaisesMessage(ValueError, "Invalid side designation: c"):
+            form._clean_side('c')
 
 
 class SiteFormTestCase(TestCase):

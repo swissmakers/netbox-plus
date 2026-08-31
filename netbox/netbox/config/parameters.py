@@ -28,7 +28,7 @@ PARAMS = (
         description=_("Additional content to display on the login page"),
         field_kwargs={
             'widget': forms.Textarea(
-                attrs={'class': 'vLargeTextField'}
+                attrs={'class': 'font-monospace'}
             ),
         },
     ),
@@ -39,7 +39,7 @@ PARAMS = (
         description=_('Additional content to display when in maintenance mode'),
         field_kwargs={
             'widget': forms.Textarea(
-                attrs={'class': 'vLargeTextField'}
+                attrs={'class': 'font-monospace'}
             ),
         },
     ),
@@ -50,7 +50,7 @@ PARAMS = (
         description=_("Additional content to display at the top of every page"),
         field_kwargs={
             'widget': forms.Textarea(
-                attrs={'class': 'vLargeTextField'}
+                attrs={'class': 'font-monospace'}
             ),
         },
     ),
@@ -61,7 +61,7 @@ PARAMS = (
         description=_("Additional content to display at the bottom of every page"),
         field_kwargs={
             'widget': forms.Textarea(
-                attrs={'class': 'vLargeTextField'}
+                attrs={'class': 'font-monospace'}
             ),
         },
     ),
@@ -179,6 +179,25 @@ PARAMS = (
         field=forms.JSONField
     ),
 
+    # Change log
+    ConfigParam(
+        name='CHANGELOG_RETENTION',
+        label=_('Changelog retention'),
+        default=90,
+        description=_("Days to retain changelog history (set to zero for unlimited)"),
+        field=forms.IntegerField,
+    ),
+    ConfigParam(
+        name='CHANGELOG_RETAIN_CREATE_LAST_UPDATE',
+        label=_('Retain create & last update changelog records'),
+        default=False,
+        description=_(
+            "Retain each object's create record and most recent update record when pruning expired changelog entries "
+            "(excluding objects with a delete record)."
+        ),
+        field=forms.BooleanField,
+    ),
+
     # Miscellaneous
     ConfigParam(
         name='MAINTENANCE_MODE',
@@ -204,13 +223,6 @@ PARAMS = (
         field=forms.BooleanField
     ),
     ConfigParam(
-        name='CHANGELOG_RETENTION',
-        label=_('Changelog retention'),
-        default=90,
-        description=_("Days to retain changelog history (set to zero for unlimited)"),
-        field=forms.IntegerField
-    ),
-    ConfigParam(
         name='JOB_RETENTION',
         label=_('Job result retention'),
         default=90,
@@ -221,7 +233,11 @@ PARAMS = (
         name='MAPS_URL',
         label=_('Maps URL'),
         default='https://maps.google.com/?q=',
-        description=_("Base URL for mapping geographic locations")
+        description=_(
+            "URL for mapping geographic locations. For GPS coordinates, include {lat} and/or {lon} placeholders, "
+            "or omit them to append coordinates as a comma-separated pair. "
+            "Note: when {lat} or {lon} placeholders are present, address-based map links will be disabled."
+        )
     ),
 
     # Enterprise authentication (NetBox Plus): LDAP / OpenID Connect via dynamic config.

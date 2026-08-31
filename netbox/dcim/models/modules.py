@@ -1,3 +1,5 @@
+from collections.abc import Iterable, Mapping
+
 import jsonschema
 import yaml
 from django.core.exceptions import ValidationError
@@ -9,7 +11,7 @@ from mptt.models import MPTTModel
 
 from dcim.choices import *
 from dcim.utils import create_port_mappings, update_interface_bridges
-from extras.models import ConfigContextModel, CustomField
+from extras.models import CustomField
 from netbox.models import PrimaryModel
 from netbox.models.features import ImageAttachmentsMixin
 from netbox.models.mixins import WeightMixin
@@ -58,8 +60,8 @@ class ModuleType(ImageAttachmentsMixin, PrimaryModel, WeightMixin):
     """
     A ModuleType represents a hardware element that can be installed within a device and which houses additional
     components; for example, a line card within a chassis-based switch such as the Cisco Catalyst 6500. Like a
-    DeviceType, each ModuleType can have console, power, interface, and pass-through port templates assigned to it. It
-    cannot, however house device bays or module bays.
+    DeviceType, each ModuleType can have console, power, interface, pass-through port, and module bay templates assigned
+    to it. It cannot, however, house device bays.
     """
     profile = models.ForeignKey(
         to='dcim.ModuleTypeProfile',
@@ -100,6 +102,40 @@ class ModuleType(ImageAttachmentsMixin, PrimaryModel, WeightMixin):
         to_field='module_type'
     )
 
+    # Counter fields
+    console_port_template_count = CounterCacheField(
+        to_model='dcim.ConsolePortTemplate',
+        to_field='module_type'
+    )
+    console_server_port_template_count = CounterCacheField(
+        to_model='dcim.ConsoleServerPortTemplate',
+        to_field='module_type'
+    )
+    power_port_template_count = CounterCacheField(
+        to_model='dcim.PowerPortTemplate',
+        to_field='module_type'
+    )
+    power_outlet_template_count = CounterCacheField(
+        to_model='dcim.PowerOutletTemplate',
+        to_field='module_type'
+    )
+    interface_template_count = CounterCacheField(
+        to_model='dcim.InterfaceTemplate',
+        to_field='module_type'
+    )
+    front_port_template_count = CounterCacheField(
+        to_model='dcim.FrontPortTemplate',
+        to_field='module_type'
+    )
+    rear_port_template_count = CounterCacheField(
+        to_model='dcim.RearPortTemplate',
+        to_field='module_type'
+    )
+    module_bay_template_count = CounterCacheField(
+        to_model='dcim.ModuleBayTemplate',
+        to_field='module_type'
+    )
+
     clone_fields = ('profile', 'manufacturer', 'weight', 'weight_unit', 'airflow')
     prerequisite_models = (
         'dcim.Manufacturer',
@@ -112,6 +148,9 @@ class ModuleType(ImageAttachmentsMixin, PrimaryModel, WeightMixin):
                 fields=('manufacturer', 'model'),
                 name='%(app_label)s_%(class)s_unique_manufacturer_model'
             ),
+        )
+        indexes = (
+            models.Index(fields=('profile', 'manufacturer', 'model')),  # Default ordering
         )
         verbose_name = _('module type')
         verbose_name_plural = _('module types')
@@ -133,7 +172,10 @@ class ModuleType(ImageAttachmentsMixin, PrimaryModel, WeightMixin):
         attrs = {}
         for name, options in self.profile.schema.get('properties', {}).items():
             key = options.get('title', title(name))
-            attrs[key] = self.attribute_data.get(name)
+            value = self.attribute_data.get(name)
+            if isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping)):
+                value = ', '.join(str(v) for v in value)
+            attrs[key] = value
         return dict(sorted(attrs.items()))
 
     def clean(self):
@@ -203,7 +245,7 @@ class ModuleType(ImageAttachmentsMixin, PrimaryModel, WeightMixin):
         return yaml.dump(dict(data), sort_keys=False)
 
 
-class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
+class Module(TrackingModelMixin, PrimaryModel):
     """
     A Module represents a field-installable component within a Device which may itself hold multiple device components
     (for example, a line card within a chassis switch). Modules are instantiated from ModuleTypes.
@@ -266,6 +308,14 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
                 )
             )
 
+        # Prevent module from being installed in a disabled bay
+        if hasattr(self, 'module_bay') and self.module_bay and not self.module_bay.enabled:
+            current_module_bay_id = Module.objects.filter(pk=self.pk).values_list('module_bay_id', flat=True).first()
+            if self.pk is None or current_module_bay_id != self.module_bay_id:
+                raise ValidationError({
+                    'module_bay': _("Cannot install a module in a disabled module bay.")
+                })
+
         # Check for recursion
         module = self
         module_bays = []
@@ -281,8 +331,21 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
+        old_module_bay_id = None
+
+        if not is_new:
+            old_module_bay_id = Module.objects.using(self._state.db).filter(pk=self.pk).values_list(
+                'module_bay_id', flat=True
+            ).first()
 
         super().save(*args, **kwargs)
+
+        using = self._state.db
+
+        if old_module_bay_id is not None and old_module_bay_id != self.module_bay_id:
+            for child_bay in self.modulebays.db_manager(using).select_related('module__module_bay'):
+                child_bay.snapshot()
+                child_bay.save(using=using)
 
         adopt_components = getattr(self, '_adopt_components', False)
         disable_replication = getattr(self, '_disable_replication', False)
@@ -309,7 +372,9 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
             # Prefetch installed components
             installed_components = {
                 component.name: component
-                for component in getattr(self.device, component_attribute).filter(module__isnull=True)
+                for component in getattr(self.device, component_attribute).db_manager(using).filter(
+                    module__isnull=True
+                )
             }
 
             # Get the template for the module type.
@@ -343,7 +408,7 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
 
             # we handle create and update separately - this is for create
             if not issubclass(component_model, MPTTModel):
-                component_model.objects.bulk_create(create_instances)
+                component_model.objects.using(using).bulk_create(create_instances)
                 # Emit the post_save signal for each newly created object
                 for component in create_instances:
                     post_save.send(
@@ -351,18 +416,18 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
                         instance=component,
                         created=True,
                         raw=False,
-                        using='default',
+                        using=using,
                         update_fields=None
                     )
             else:
                 # MPTT models must be saved individually to maintain tree structure
                 for instance in create_instances:
-                    instance.save()
+                    instance.save(using=using)
 
             update_fields = ['module']
 
             # we handle create and update separately - this is for update
-            component_model.objects.bulk_update(update_instances, update_fields)
+            component_model.objects.using(using).bulk_update(update_instances, update_fields)
             # Emit the post_save signal for each updated object
             for component in update_instances:
                 post_save.send(
@@ -370,13 +435,14 @@ class Module(TrackingModelMixin, PrimaryModel, ConfigContextModel):
                     instance=component,
                     created=False,
                     raw=False,
-                    using='default',
+                    using=using,
                     update_fields=update_fields
                 )
 
             # Rebuild MPTT tree if needed (bulk_update bypasses model save)
             if issubclass(component_model, MPTTModel) and update_instances:
-                component_model.objects.rebuild()
+                # db_manager() is used in place of using(), as rebuild() is a manager method
+                component_model.objects.db_manager(using).rebuild()
 
         # Replicate any front/rear port mappings from the ModuleType
         create_port_mappings(self.device, self.module_type, self)

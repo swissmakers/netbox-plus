@@ -19,7 +19,8 @@ __all__ = (
 class CustomFieldChoiceSetSerializer(OwnerMixin, ChangeLogMessageSerializer, ValidatedModelSerializer):
     base_choices = ChoiceField(
         choices=CustomFieldChoiceSetBaseChoices,
-        required=False
+        required=False,
+        allow_null=True,
     )
     extra_choices = serializers.ListField(
         child=serializers.ListField(
@@ -27,13 +28,17 @@ class CustomFieldChoiceSetSerializer(OwnerMixin, ChangeLogMessageSerializer, Val
             max_length=2
         )
     )
+    choice_colors = serializers.DictField(
+        child=serializers.ChoiceField(choices=CustomFieldChoiceColorChoices),
+        required=False,
+    )
     choices_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = CustomFieldChoiceSet
         fields = [
             'id', 'url', 'display_url', 'display', 'name', 'description', 'base_choices', 'extra_choices',
-            'order_alphabetically', 'choices_count', 'owner', 'created', 'last_updated',
+            'choice_colors', 'order_alphabetically', 'choices_count', 'owner', 'created', 'last_updated',
         ]
         brief_fields = ('id', 'url', 'display', 'name', 'description', 'choices_count')
 
@@ -65,8 +70,8 @@ class CustomFieldSerializer(OwnerMixin, ChangeLogMessageSerializer, ValidatedMod
             'id', 'url', 'display_url', 'display', 'object_types', 'type', 'related_object_type', 'data_type',
             'name', 'label', 'group_name', 'description', 'required', 'unique', 'search_weight', 'filter_logic',
             'ui_visible', 'ui_editable', 'is_cloneable', 'default', 'related_object_filter', 'weight',
-            'validation_minimum', 'validation_maximum', 'validation_regex', 'choice_set', 'owner', 'comments',
-            'created', 'last_updated',
+            'validation_minimum', 'validation_maximum', 'validation_regex', 'validation_schema', 'choice_set',
+            'owner', 'comments', 'created', 'last_updated',
         ]
         brief_fields = ('id', 'url', 'display', 'name', 'description')
 

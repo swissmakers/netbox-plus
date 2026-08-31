@@ -1,4 +1,7 @@
-from collections import defaultdict
+import os
+import re
+import sys
+import traceback
 
 import jsonschema
 from django.conf import settings
@@ -6,9 +9,9 @@ from django.core.validators import ValidationError
 from django.db import models
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
+from jinja2.exceptions import TemplateError
 from jsonschema.exceptions import ValidationError as JSONValidationError
 
-from core.models import ObjectType
 from extras.models.mixins import RenderTemplateMixin
 from extras.querysets import ConfigContextQuerySet
 from netbox.models import ChangeLoggedModel, PrimaryModel
@@ -176,6 +179,9 @@ class ConfigContext(SyncedDataMixin, CloningMixin, CustomLinksMixin, OwnerMixin,
 
     class Meta:
         ordering = ['weight', 'name']
+        indexes = (
+            models.Index(fields=('weight', 'name')),  # Default ordering
+        )
         verbose_name = _('config context')
         verbose_name_plural = _('config contexts')
 
@@ -284,9 +290,19 @@ class ConfigTemplate(
         max_length=200,
         blank=True
     )
+    debug = models.BooleanField(
+        verbose_name=_('debug'),
+        default=False,
+        help_text=_(
+            'Enable verbose error output when rendering this template. Not recommended for production use.'
+        )
+    )
 
     class Meta:
         ordering = ('name',)
+        indexes = (
+            models.Index(fields=('name',)),  # Default ordering
+        )
         verbose_name = _('config template')
         verbose_name_plural = _('config templates')
 
@@ -303,16 +319,45 @@ class ConfigTemplate(
         self.template_code = self.data_file.data_as_string
     sync_data.alters_data = True
 
-    def get_context(self, context=None, queryset=None):
-        _context = defaultdict(dict)
+    def get_environment_params(self):
+        """
+        Config templates render plain text (network configs, scripts), not HTML. Force
+        autoescape off so environment_params cannot enable it and create a latent XSS sink
+        if output is ever rendered in an HTML context.
+        """
+        params = super().get_environment_params()
+        params['autoescape'] = False
+        return params
 
-        # Populate all public models for reference within the template
-        for object_type in ObjectType.objects.public():
-            if model := object_type.model_class():
-                _context[object_type.app_label][model.__name__] = model
-
-        # Apply the provided context data, if any
-        if context is not None:
-            _context.update(context)
-
-        return _context
+    def format_render_error(self, exc):
+        """
+        Return a formatted error string for a rendering exception. When debug is enabled, the full
+        traceback for the provided exception is returned. Otherwise, a concise, user-facing message
+        is returned.
+        """
+        if self.debug:
+            # Strip deployment-specific path prefixes from File "..." lines to avoid disclosing
+            # the server's filesystem layout. install_root covers all NetBox source files plus
+            # any venv co-located inside the repo. When the venv lives outside the repo
+            # (the typical production pattern, e.g. ~/.venv/netbox/), sys.prefix differs from
+            # sys.base_prefix and the venv root is stripped separately so that the deployment
+            # user's home directory is not exposed. Stdlib paths not under either prefix are
+            # left as-is — they reveal only standard OS locations, not deployment structure.
+            install_root = os.path.dirname(settings.BASE_DIR) + os.sep
+            prefixes_to_strip = [install_root]
+            if sys.prefix != sys.base_prefix:
+                venv_root = sys.prefix + os.sep
+                if venv_root != install_root:
+                    prefixes_to_strip.append(venv_root)
+            tb = ''.join(traceback.format_exception(exc))
+            for prefix in prefixes_to_strip:
+                tb = re.sub(r'(File ")' + re.escape(prefix), r'\1', tb)
+            return tb
+        if isinstance(exc, TemplateError):
+            parts = [f"{type(exc).__name__}: {exc}"]
+            if getattr(exc, 'name', None):
+                parts.append(_("Template: {name}").format(name=exc.name))
+            if getattr(exc, 'lineno', None):
+                parts.append(_("Line: {lineno}").format(lineno=exc.lineno))
+            return "\n".join(parts)
+        return f"{type(exc).__name__}: {exc}"

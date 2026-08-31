@@ -1,6 +1,10 @@
 # See PEP 518 for the spec of this file
 # https://www.python.org/dev/peps/pep-0518/
 
+[build-system]
+requires = ["hatchling>=1.27", "packaging"]
+build-backend = "hatchling.build"
+
 [project]
 name = "netbox plus"
 version = "4.5.8"
@@ -21,22 +25,163 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 
+[project.optional-dependencies]
+ldap = ["django-auth-ldap"]
+saml2 = ["python3-saml"]
+remote-auth = ["django-auth-ldap", "python3-saml"]
+sentry = ["sentry-sdk"]
+swift = ["django-storage-swift"]
+s3 = ["boto3"]
+git = ["dulwich"]
+# NetBox Labs plugins (proprietary, opt-in). Minor-bounded to the tested series.
+branching = ["netboxlabs-netbox-branching>=1.1.0,<1.2.0"]
+custom-objects = ["netboxlabs-netbox-custom-objects>=0.5.0,<0.6.0"]
+# Convenience aggregate of the recommended NetBox Labs plugins (NOT a catch-all of every extra).
+# The component pins are duplicated literally, as remote-auth duplicates ldap and saml2;
+# scripts/verify_wheel_metadata.py verifies in CI that this aggregate equals the union of the
+# branching and custom-objects extras, guarding the duplication against drift.
+recommended-plugins = [
+    "netboxlabs-netbox-branching>=1.1.0,<1.2.0",
+    "netboxlabs-netbox-custom-objects>=0.5.0,<0.6.0",
+]
+dev = [
+    "build",
+    "coverage",
+    "packaging",
+    "pre-commit",
+    "ruff==0.15.20",
+    "tblib",
+    "twine",
+    "uv",
+]
+
+[project.scripts]
+netbox = "netbox.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/swissmakers/netbox-plus"
 Documentation = "https://netboxlabs.com/docs/netbox/"
 Source = "https://github.com/swissmakers/netbox-plus"
 Issues = "https://github.com/swissmakers/netbox-plus/issues"
 
-[tool.black]
-line-length = 120
-target_version = ['py312', 'py313', 'py314']
-skip-string-normalization = true
+[tool.coverage.run]
+source = ["netbox/"]
+concurrency = ["multiprocessing"]
+parallel = true
+sigterm = true
 
-[tool.isort]
-profile = "black"
+[tool.coverage.report]
+skip_covered = true
+fail_under = 91
+omit = [
+    "*/migrations/*",
+    "*/tests/*",
+    # Non-application code (no testable logic / not part of the app)
+    "netbox/scripts/*",  # SCRIPTS_ROOT: user/generated scripts
+    "*/netbox/configuration*.py",  # settings/config files (template, testing, local)
+    "*/netbox/wsgi.py",  # WSGI entrypoint
+    "*/netbox/__main__.py",  # `python -m netbox` entry point
+    "*/generate_secret_key.py",  # standalone CLI helper
+    "*/utilities/debug.py",  # debug-toolbar hook, active only when DEBUG=True
+    "*/extras/management/commands/housekeeping.py",  # deprecated; will not be tested
+]
 
-[tool.pylint]
-max-line-length = 120
+[tool.hatch.metadata.hooks.custom]
+# Implemented in scripts/packaging/hatch_metadata.py; computes a PEP 440 version from
+# netbox/release.yaml (version + optional designation) and runtime deps from requirements.txt.
+path = "scripts/packaging/hatch_metadata.py"
+
+[tool.hatch.build.targets.wheel]
+# Pinned artifact format. Change only when NetBox needs a newer format and the publishing path supports it.
+core-metadata-version = "2.4"
+sources = ["netbox"]
+packages = [
+    "netbox/account",
+    "netbox/circuits",
+    "netbox/core",
+    "netbox/dcim",
+    "netbox/extras",
+    "netbox/ipam",
+    "netbox/netbox",
+    "netbox/tenancy",
+    "netbox/users",
+    "netbox/utilities",
+    "netbox/virtualization",
+    "netbox/vpn",
+    "netbox/wireless",
+]
+
+# Never ship a live or local configuration file: configuration.py holds SECRET_KEY
+# and database credentials, ldap_config.py holds LDAP bind credentials, and developers
+# often keep ad-hoc configuration*.py copies in this directory. Exclude both sets, then
+# re-include only the two tracked templates. (verify_wheel_contents.py enforces this in CI.)
+exclude = [
+    "netbox/netbox/configuration*.py",
+    "netbox/netbox/ldap_config*.py",
+]
+
+# Bundle runtime data inside the installed netbox package at netbox/_data/.
+# Destinations carry an extra leading "netbox/" because the wheel `sources`
+# setting above strips one "netbox/" prefix from every path (including these
+# force-include targets); after stripping they resolve to netbox/_data/...
+[tool.hatch.build.targets.wheel.force-include]
+"netbox/project-static/dist" = "netbox/netbox/_data/project-static/dist"
+# The pre-rendered documentation site ships in the wheel; render it with `zensical build`
+# before `python -m build` (the release workflow's build job does; see
+# docs/development/building-the-package.md for local builds).
+"netbox/project-static/docs" = "netbox/netbox/_data/docs"
+"netbox/project-static/img" = "netbox/netbox/_data/project-static/img"
+"netbox/project-static/js" = "netbox/netbox/_data/project-static/js"
+"netbox/release.yaml" = "netbox/netbox/_data/release.yaml"
+"netbox/templates" = "netbox/netbox/_data/templates"
+"netbox/translations" = "netbox/netbox/_data/translations"
+# Deployment examples, bundled verbatim for `netbox setup` (no adaptation).
+"contrib/apache.conf" = "netbox/netbox/_data/contrib/apache.conf"
+"contrib/gunicorn.py" = "netbox/netbox/_data/contrib/gunicorn.py"
+"contrib/netbox-rq.service" = "netbox/netbox/_data/contrib/netbox-rq.service"
+"contrib/netbox.env" = "netbox/netbox/_data/contrib/netbox.env"
+"contrib/netbox.service" = "netbox/netbox/_data/contrib/netbox.service"
+"contrib/nginx.conf" = "netbox/netbox/_data/contrib/nginx.conf"
+"contrib/uwsgi.ini" = "netbox/netbox/_data/contrib/uwsgi.ini"
+# Force the two tracked config templates in over the configuration*.py exclude above.
+"netbox/netbox/configuration_example.py" = "netbox/netbox/configuration_example.py"
+"netbox/netbox/configuration_testing.py" = "netbox/netbox/configuration_testing.py"
+
+[tool.hatch.build.targets.sdist]
+# Keep the sdist and wheel on the same Core Metadata contract.
+core-metadata-version = "2.4"
+include = [
+    "/.github/workflows/release.yml",
+    "/CHANGELOG.md",
+    "/LICENSE.txt",
+    "/README.md",
+    "/base_requirements.txt",
+    "/contrib",
+    "/docs",
+    "/mkdocs.yml",
+    "/netbox",
+    "/pyproject.toml",
+    "/requirements.txt",
+    "/scripts",
+    "/upgrade.sh",
+]
+# Keep live/local configuration*.py and ldap_config*.py out of the sdist (same rule as the
+# wheel, keeping only the two tracked templates), and drop the local netbox/configuration.py
+# symlink that otherwise breaks `python -m build --sdist` with an AbsoluteLinkError.
+exclude = [
+    "netbox/netbox/configuration*.py",
+    "netbox/netbox/ldap_config*.py",
+    "netbox/configuration.py",
+    "netbox/ldap_config.py",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+# Force the two tracked config templates in over the configuration*.py exclude above.
+"netbox/netbox/configuration_example.py" = "netbox/netbox/configuration_example.py"
+"netbox/netbox/configuration_testing.py" = "netbox/netbox/configuration_testing.py"
+# The rendered site is gitignored, so the plain /netbox include skips it; force it in so a
+# wheel rebuilt from the sdist (verify-sdist job, `pip install <sdist>`) ships the docs.
+"netbox/project-static/docs" = "netbox/project-static/docs"
 
 [tool.pyright]
 include = ["netbox"]
@@ -46,3 +191,90 @@ exclude = [
 ]
 reportMissingImports = true
 reportMissingTypeStubs = false
+
+[tool.ruff]
+exclude = [
+    ".eggs",
+    ".git",
+    ".pyenv",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "build",
+    "dist",
+    "netbox/project-static/**",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+# Enforce line length and indent-width
+line-length = 120
+indent-width = 4
+
+# Ignores anything in .gitignore
+respect-gitignore = true
+
+# Always generate Python 3.12-compatible code
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pin the effective default rule set used with `preview = true` to match Ruff 0.15.1.
+# Ruff 0.15.2 changed the preview defaults, see https://github.com/astral-sh/ruff/releases/tag/0.15.2
+# Keeping this explicit makes ruff deterministic.
+select = ["E4", "E7", "E9", "F"]
+extend-select = [
+    "E1", # pycodestyle errors: indentation-related (e.g., unexpected/missing indent)
+    "E2", # pycodestyle errors: whitespace-related (e.g., missing whitespace, extra spaces)
+    "E3", # pycodestyle errors: blank lines / spacing around definitions
+    "E501", # pycodestyle: line too long (enforced with `line-length` above)
+    "W", # pycodestyle warnings (various style warnings, often whitespace/newlines)
+    "I", # import sorting (isort-equivalent)
+    "RET", # return semantics (flake8-return family: consistent/explicit returns; remove redundant else/assign before return)
+    "UP", # pyupgrade: modernize syntax for your target Python (e.g., f-strings, built-in generics, newer stdlib idioms)
+    "RUF022", # ruff: enforce sorted `__all__` lists
+]
+# If you add a rule to `ignore`, please also update the "Linter Exceptions" section in
+# docs/development/style-guide.md.
+ignore = [
+    "F403", # pyflakes: `from ... import *` used; unable to detect undefined names
+    "F405", # pyflakes: name may be undefined or defined from star imports
+    "RET504", # return: unnecessary assignment before `return` (e.g., `x = expr; return x` -> `return expr`)
+    "UP032", # pyupgrade: prefer f-strings over `str.format(...)`
+]
+preview = true
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "account",
+    "circuits",
+    "core",
+    "dcim",
+    "extras",
+    "ipam",
+    "netbox",
+    "tenancy",
+    "users",
+    "utilities",
+    "virtualization",
+    "vpn",
+    "wireless",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"template_code.py" = ["E501"]
+"netbox/netbox/graphql/filter_lookups.py" = ["UP046"] # Strawberry typing: keep `Generic[T]` for now
+"netbox/netbox/graphql/scalars.py" = ["UP007"] # Strawberry scalar typing: `Union[...]` required
+
+[tool.ruff.format]
+# Use single quotes for strings.
+quote-style = "single"
+
+# Indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Enforce UNIX line ending
+line-ending = "lf"

@@ -19,7 +19,7 @@ from ipam import filtersets
 from ipam.models import *
 from ipam.utils import get_next_available_prefix
 from netbox.api.viewsets import NetBoxModelViewSet
-from netbox.api.viewsets.mixins import ObjectValidationMixin
+from netbox.api.viewsets.mixins import ObjectValidationMixin, discard_events_on_rollback
 from netbox.config import get_config
 from netbox.constants import ADVISORY_LOCK_KEYS
 from utilities.api import get_serializer_for_model
@@ -295,8 +295,9 @@ class AvailableObjectsView(ObjectValidationMixin, APIView):
                 return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
             # Create the new IP address(es)
+            using = router.db_for_write(self.queryset.model)
             try:
-                with transaction.atomic(using=router.db_for_write(self.queryset.model)):
+                with transaction.atomic(using=using), discard_events_on_rollback(self, using=using):
                     created = serializer.save()
                     self._validate_objects(created)
             except ObjectDoesNotExist:
@@ -392,7 +393,7 @@ class AvailablePrefixesView(AvailableObjectsView):
     @extend_schema(
         methods=["post"],
         responses={201: serializers.PrefixSerializer(many=True)},
-        request=serializers.PrefixSerializer(many=True),
+        request=serializers.PrefixLengthSerializer(many=True),
     )
     def post(self, request, pk):
         return super().post(request, pk)
@@ -407,7 +408,7 @@ class AvailableIPAddressesView(AvailableObjectsView):
     def get_available_objects(self, parent, limit=None):
         # Calculate available IPs within the parent
         ip_list = []
-        for index, ip in enumerate(parent.get_available_ips(), start=1):
+        for index, ip in enumerate(parent.iter_available_ips(), start=1):
             ip_list.append(ip)
             if index == limit:
                 break
@@ -488,7 +489,7 @@ class AvailableVLANsView(AvailableObjectsView):
     @extend_schema(
         methods=["post"],
         responses={201: serializers.VLANSerializer(many=True)},
-        request=serializers.VLANSerializer(many=True),
+        request=serializers.CreateAvailableVLANSerializer(many=True),
     )
     def post(self, request, pk):
         return super().post(request, pk)

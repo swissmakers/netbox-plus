@@ -97,7 +97,7 @@ NetBox uses [`pre-commit`](https://pre-commit.com/) to automatically validate co
 * Run the `ruff` Python linter
 * Run Django's internal system check
 * Check for missing database migrations
-* Validate any changes to the documentation with `mkdocs`
+* Validate any changes to the documentation with `zensical`
 * Validate Typescript & Sass styling with `yarn`
 * Ensure that any modified static front end assets have been recompiled
 
@@ -185,6 +185,18 @@ This is handy for instances where just a few tests are failing and you want to r
 
 !!! info
     NetBox uses [django-rich](https://github.com/adamchainz/django-rich) to enhance Django's default `test` management command.
+
+### SQL Query Count Baselines
+
+The shared list-test mixins assert the number of SQL queries each list endpoint performs against a baseline checked in alongside the tests. This guards against the accidental introduction of new queries (e.g. N+1 patterns) when a queryset, serializer, or table changes. Baselines are stored per app at `netbox/<app>/tests/query_counts.json`, keyed by `<model_name>:<test_name>`.
+
+If a list test fails with a message like `Query count for dcim/site:list_objects changed: expected 16, got 18`, first investigate whether the change is expected. If the new count is correct (e.g. you intentionally added a `prefetch_related`, or removed one), regenerate the baseline:
+
+```no-highlight
+UPDATE_QUERY_COUNTS=1 python manage.py test --keepdb
+```
+
+`UPDATE_QUERY_COUNTS` mode requires serial execution; do not combine it with `--parallel`. You can target a single test, app, or the full suite — only the keys exercised by the run are updated. Review the resulting diff in the JSON files as part of the PR; a reviewer should be able to see and reason about every query-count change.
 
 ## Submitting Pull Requests
 

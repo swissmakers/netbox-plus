@@ -2,6 +2,8 @@ from typing import TYPE_CHECKING, Annotated
 
 import strawberry
 import strawberry_django
+from strawberry.scalars import JSON
+from strawberry.types import Info
 
 from core.graphql.mixins import SyncedDataMixin
 from extras import models
@@ -45,6 +47,17 @@ __all__ = (
     'TagType',
     'WebhookType',
 )
+
+
+class SharedObjectMixin:
+    """
+    Restrict the queryset to shared objects, or those owned by the current user, unless the user is a superuser.
+    This mirrors the visibility enforced in the UI (extras.utils.SharedObjectViewMixin) and the REST API.
+    """
+    @classmethod
+    def get_queryset(cls, queryset, info: Info, **kwargs):
+        queryset = super().get_queryset(queryset, info, **kwargs)
+        return queryset.restrict_to_shared(info.context.request.user)
 
 
 @strawberry_django.type(
@@ -106,7 +119,7 @@ class CustomFieldType(OwnerMixin, ObjectType):
 
 @strawberry_django.type(
     models.CustomFieldChoiceSet,
-    exclude=['extra_choices'],
+    exclude=['extra_choices', 'choice_colors'],
     filters=CustomFieldChoiceSetFilter,
     pagination=True
 )
@@ -114,6 +127,7 @@ class CustomFieldChoiceSetType(OwnerMixin, ObjectType):
 
     choices_for: list[Annotated["CustomFieldType", strawberry.lazy('extras.graphql.types')]]
     extra_choices: list[list[str]] | None
+    choice_colors: JSON
 
 
 @strawberry_django.type(
@@ -159,7 +173,7 @@ class JournalEntryType(CustomFieldsMixin, TagsMixin, ObjectType):
 
 @strawberry_django.type(
     models.Notification,
-    # filters=NotificationFilter
+    filters=NotificationFilter,
     pagination=True
 )
 class NotificationType(ObjectType):
@@ -182,13 +196,13 @@ class NotificationGroupType(ObjectType):
     filters=SavedFilterFilter,
     pagination=True
 )
-class SavedFilterType(OwnerMixin, ObjectType):
+class SavedFilterType(SharedObjectMixin, OwnerMixin, ObjectType):
     user: Annotated["UserType", strawberry.lazy('users.graphql.types')] | None
 
 
 @strawberry_django.type(
     models.Subscription,
-    # filters=NotificationFilter
+    filters=SubscriptionFilter,
     pagination=True
 )
 class SubscriptionType(ObjectType):
@@ -201,7 +215,8 @@ class SubscriptionType(ObjectType):
     filters=TableConfigFilter,
     pagination=True
 )
-class TableConfigType(ObjectType):
+class TableConfigType(SharedObjectMixin, ObjectType):
+    object_type: Annotated["ContentTypeType", strawberry.lazy('netbox.graphql.types')] | None
     user: Annotated["UserType", strawberry.lazy('users.graphql.types')] | None
 
 

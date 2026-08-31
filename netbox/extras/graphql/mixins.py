@@ -4,6 +4,9 @@ import strawberry
 import strawberry_django
 from strawberry.types import Info
 
+from extras.models import CustomField, ImageAttachment, JournalEntry
+from utilities.querysets import RestrictedPrefetch
+
 __all__ = (
     'ConfigContextMixin',
     'ContactsMixin',
@@ -42,31 +45,50 @@ class ConfigContextMixin:
 @strawberry.type
 class CustomFieldsMixin:
 
-    @strawberry_django.field
+    @strawberry_django.field(only=['custom_field_data'])
     def custom_fields(self) -> strawberry.scalars.JSON:
-        return self.custom_field_data
+        # Emit a key for every custom field assigned to the model, as the REST API does, rather than
+        # returning the stored data verbatim. A key is materialized only once a value is assigned
+        # (see CustomField.populate_initial_data()), so an object which predates a field carries no
+        # key for it; without this, such a field would be absent from the response instead of null.
+        # CustomFieldManager.get_for_model() is served from the per-request cache, so this costs one
+        # query per model rather than one per object.
+        return {
+            cf.name: self.custom_field_data.get(cf.name)
+            for cf in CustomField.objects.get_for_model(self)
+        }
 
 
 @strawberry.type
 class ImageAttachmentsMixin:
 
-    @strawberry_django.field
-    def image_attachments(self, info: Info) -> list[Annotated['ImageAttachmentType', strawberry.lazy('.types')]]:
-        return self.images.restrict(info.context.request.user, 'view')
+    @strawberry_django.field(
+        prefetch_related=lambda info: RestrictedPrefetch(
+            'images', info.context.request.user, 'view', queryset=ImageAttachment.objects.all()
+        ),
+    )
+    def image_attachments(self) -> list[Annotated['ImageAttachmentType', strawberry.lazy('.types')]]:
+        return self.images.all()
 
 
 @strawberry.type
 class JournalEntriesMixin:
 
-    @strawberry_django.field
-    def journal_entries(self, info: Info) -> list[Annotated['JournalEntryType', strawberry.lazy('.types')]]:
+    @strawberry_django.field(
+        prefetch_related=lambda info: RestrictedPrefetch(
+            'journal_entries', info.context.request.user, 'view', queryset=JournalEntry.objects.all()
+        ),
+    )
+    def journal_entries(self) -> list[Annotated['JournalEntryType', strawberry.lazy('.types')]]:
         return self.journal_entries.all()
 
 
 @strawberry.type
 class TagsMixin:
 
-    tags: list[Annotated['TagType', strawberry.lazy('.types')]]
+    tags: list[Annotated['TagType', strawberry.lazy('.types')]] = strawberry_django.field(
+        prefetch_related=['tags'],
+    )
 
 
 @strawberry.type

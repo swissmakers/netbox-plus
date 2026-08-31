@@ -1,19 +1,33 @@
-from django.test import Client, TestCase, override_settings, tag
+from django.test import Client, RequestFactory, TestCase, override_settings, tag
 from django.urls import reverse
 from drf_spectacular.drainage import GENERATOR_STATS
 from rest_framework import status
+from rest_framework.serializers import Serializer
 
 from core.models import ObjectType
+from dcim.api.serializers import SiteSerializer
 from dcim.models import Region, Site
 from extras.choices import CustomFieldTypeChoices
 from extras.models import CustomField
+from ipam.api.serializers import VLANSerializer
 from ipam.models import VLAN
+from netbox.api.fields import SerializedPKRelatedField
+from netbox.api.serializers import BaseModelSerializer
 from netbox.config import get_config
-from utilities.api import get_view_name
+from netbox.plugins import register_serializer_resolver
+from netbox.registry import registry
+from users.models import ObjectPermission
+from utilities.api import (
+    get_prefetches_for_serializer,
+    get_serializer_for_model,
+    get_view_name,
+    is_api_request,
+    is_graphql_request,
+)
 from utilities.testing import APITestCase, disable_warnings
 
 
-class WritableNestedSerializerTest(APITestCase):
+class WritableNestedSerializerTestCase(APITestCase):
     """
     Test the operation of WritableNestedSerializer using VLANSerializer as our test subject.
     """
@@ -64,7 +78,7 @@ class WritableNestedSerializerTest(APITestCase):
             },
         }
         url = reverse('ipam-api:vlan-list')
-        self.add_permissions('ipam.add_vlan')
+        self.add_permissions('ipam.add_vlan', 'dcim.view_site')
 
         response = self.client.post(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_201_CREATED)
@@ -81,7 +95,7 @@ class WritableNestedSerializerTest(APITestCase):
             },
         }
         url = reverse('ipam-api:vlan-list')
-        self.add_permissions('ipam.add_vlan')
+        self.add_permissions('ipam.add_vlan', 'dcim.view_site')
 
         with disable_warnings('django.request'):
             response = self.client.post(url, data, format='json', **self.header)
@@ -100,13 +114,107 @@ class WritableNestedSerializerTest(APITestCase):
             },
         }
         url = reverse('ipam-api:vlan-list')
-        self.add_permissions('ipam.add_vlan')
+        self.add_permissions('ipam.add_vlan', 'dcim.view_site')
 
         with disable_warnings('django.request'):
             response = self.client.post(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(VLAN.objects.count(), 0)
         self.assertTrue(response.data['site'][0].startswith("Multiple objects match"))
+
+    def test_related_by_pk_without_view_permission(self):
+        """
+        Referencing a related object by its numeric ID must be permitted even if the user has not been granted
+        permission to view the object.
+        """
+        data = {
+            'vid': 100,
+            'name': 'Test VLAN 100',
+            'site': self.site1.pk,
+        }
+        url = reverse('ipam-api:vlan-list')
+        self.add_permissions('ipam.add_vlan')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['site']['id'], self.site1.pk)
+        vlan = VLAN.objects.get(pk=response.data['id'])
+        self.assertEqual(vlan.site, self.site1)
+
+    def test_related_by_id_attribute_without_view_permission(self):
+        """
+        Referencing a related object by a dictionary containing only its numeric ID is equivalent to referencing it
+        by ID directly, and must be permitted even without view permission.
+        """
+        data = {
+            'vid': 100,
+            'name': 'Test VLAN 100',
+            'site': {
+                'id': self.site1.pk
+            },
+        }
+        url = reverse('ipam-api:vlan-list')
+        self.add_permissions('ipam.add_vlan')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['site']['id'], self.site1.pk)
+        vlan = VLAN.objects.get(pk=response.data['id'])
+        self.assertEqual(vlan.site, self.site1)
+
+    def test_related_by_attributes_without_view_permission(self):
+        """
+        Referencing a related object by a dictionary of attributes must enforce the user's view permissions,
+        preventing enumeration of objects the user is not permitted to see.
+        """
+        data = {
+            'vid': 100,
+            'name': 'Test VLAN 100',
+            'site': {
+                'name': 'Site 1'
+            },
+        }
+        url = reverse('ipam-api:vlan-list')
+        self.add_permissions('ipam.add_vlan')
+
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(VLAN.objects.count(), 0)
+        self.assertTrue(response.data['site'][0].startswith("Related object not found"))
+
+    def test_related_by_attributes_constrained_view_permission(self):
+        """
+        When a user's view permission is constrained, only objects matching the constraint may be referenced by
+        attributes.
+        """
+        data = {
+            'vid': 100,
+            'name': 'Test VLAN 100',
+            'site': {
+                'name': 'Site 2'
+            },
+        }
+        url = reverse('ipam-api:vlan-list')
+        # Grant view permission only for Site 1
+        self.add_permissions('ipam.add_vlan')
+        obj_perm = ObjectPermission(name='Constrained view', constraints={'name': 'Site 1'}, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Site))
+
+        # Referencing Site 2 by attributes must fail, as the user cannot view it
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(VLAN.objects.count(), 0)
+        self.assertTrue(response.data['site'][0].startswith("Related object not found"))
+
+        # Referencing Site 1 by attributes must succeed
+        data['site'] = {'name': 'Site 1'}
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['site']['id'], self.site1.pk)
 
     def test_related_by_invalid(self):
         data = {
@@ -186,6 +294,116 @@ class APIPaginationTestCase(APITestCase):
         self.assertIsNone(response.data['next'])
         self.assertIsNone(response.data['previous'])
         self.assertEqual(len(response.data['results']), 100)
+
+    def test_cursor_pagination(self):
+        """Basic cursor pagination returns results ordered by PK with correct next link."""
+        first_pk = Site.objects.order_by('pk').values_list('pk', flat=True).first()
+        response = self.client.get(f'{self.url}?start={first_pk}&limit=10', format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertIsNone(response.data['count'])
+        self.assertIsNone(response.data['previous'])
+        self.assertEqual(len(response.data['results']), 10)
+
+        # Results should be ordered by PK
+        pks = [r['id'] for r in response.data['results']]
+        self.assertEqual(pks, sorted(pks))
+
+        # Next link should use start parameter
+        last_pk = pks[-1]
+        self.assertIn(f'start={last_pk + 1}', response.data['next'])
+        self.assertIn('limit=10', response.data['next'])
+
+    def test_cursor_pagination_last_page(self):
+        """Cursor pagination returns null next link when fewer results than limit."""
+        last_pk = Site.objects.order_by('pk').values_list('pk', flat=True).last()
+        response = self.client.get(f'{self.url}?start={last_pk}&limit=10', format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertIsNone(response.data['next'])
+        self.assertIsNone(response.data['previous'])
+
+    def test_cursor_pagination_no_results(self):
+        """Cursor pagination beyond all PKs returns empty results."""
+        max_pk = Site.objects.order_by('pk').values_list('pk', flat=True).last()
+        response = self.client.get(f'{self.url}?start={max_pk + 1000}&limit=10', format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 0)
+        self.assertIsNone(response.data['next'])
+
+    def test_cursor_and_offset_conflict(self):
+        """Specifying both start and offset returns a 400 error."""
+        with disable_warnings('django.request'):
+            response = self.client.get(f'{self.url}?start=1&offset=10', format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_cursor_and_ordering_conflict(self):
+        """Specifying both start and ordering returns a 400 error."""
+        with disable_warnings('django.request'):
+            response = self.client.get(f'{self.url}?start=1&ordering=name', format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_cursor_negative_start(self):
+        """Negative start value returns a 400 error."""
+        with disable_warnings('django.request'):
+            response = self.client.get(f'{self.url}?start=-1', format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_cursor_with_filters(self):
+        """Cursor pagination works alongside other query filters."""
+        response = self.client.get(f'{self.url}?start=0&limit=10&name=Site 1', format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertIsNone(response.data['count'])
+        results = response.data['results']
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['name'], 'Site 1')
+
+    def test_offset_multi_page_traversal(self):
+        """Traverse all 100 objects using offset pagination and verify complete, non-overlapping coverage."""
+        collected_pks = []
+        url = f'{self.url}?limit=10'
+
+        while url:
+            response = self.client.get(url, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            self.assertEqual(response.data['count'], 100)
+            collected_pks.extend(r['id'] for r in response.data['results'])
+            url = response.data['next']
+
+        # Should have collected exactly 100 unique objects
+        self.assertEqual(len(set(collected_pks)), 100)
+
+    def test_cursor_multi_page_traversal(self):
+        """Traverse all 100 objects using cursor pagination and verify complete, non-overlapping coverage."""
+        collected_pks = []
+        first_pk = Site.objects.order_by('pk').values_list('pk', flat=True).first()
+        url = f'{self.url}?start={first_pk}&limit=10'
+
+        while url:
+            response = self.client.get(url, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            self.assertIsNone(response.data['count'])
+            self.assertIsNone(response.data['previous'])
+
+            page_pks = [r['id'] for r in response.data['results']]
+
+            # Each page should be ordered by PK
+            self.assertEqual(page_pks, sorted(page_pks))
+
+            # No overlap with previously collected PKs
+            self.assertFalse(set(page_pks) & set(collected_pks))
+
+            collected_pks.extend(page_pks)
+            url = response.data['next']
+
+        # Should have collected exactly 100 unique objects
+        self.assertEqual(len(set(collected_pks)), 100)
+
+        # Full result set should be in PK order
+        self.assertEqual(collected_pks, sorted(collected_pks))
 
 
 class APIOrderingTestCase(APITestCase):
@@ -284,3 +502,441 @@ class GetViewNameTestCase(TestCase):
 
         name = get_view_name(view)
         self.assertEqual(name, 'Mock List')
+
+
+class GetPrefetchesForSerializerTestCase(TestCase):
+
+    def test_nested_serializer_honors_explicit_fields(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'name', 'parent')
+                brief_fields = ('id', 'name')
+
+        class SiteSerializer(BaseModelSerializer):
+            region = RegionSerializer(nested=True, fields=('id', 'parent'))
+
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(SiteSerializer),
+            ['region', 'region__parent'],
+        )
+
+    def test_nested_serializer_honors_explicit_omit(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'name', 'parent')
+                brief_fields = ('id', 'name')
+
+        class SiteSerializer(BaseModelSerializer):
+            region = RegionSerializer(nested=True, omit=('name',))
+
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(SiteSerializer),
+            ['region', 'region__parent'],
+        )
+
+    def test_many_nested_serializer_honors_explicit_fields(self):
+        class SiteSerializer(BaseModelSerializer):
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region')
+                brief_fields = ('id', 'name')
+
+        class RegionSerializer(BaseModelSerializer):
+            sites = SiteSerializer(nested=True, many=True, fields=('id', 'region'))
+
+            class Meta:
+                model = Region
+                fields = ('id', 'name', 'sites')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['sites', 'sites__region'],
+        )
+
+    def test_nested_serializer_uses_source_for_prefetch_path(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'name', 'parent')
+                brief_fields = ('id', 'name')
+
+        class SiteSerializer(BaseModelSerializer):
+            region_detail = RegionSerializer(source='region', nested=True, fields=('id', 'parent'))
+
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region_detail')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(SiteSerializer),
+            ['region', 'region__parent'],
+        )
+
+    def test_serialized_pk_related_field(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'name', 'parent', 'sites')
+                brief_fields = ('id', 'parent')
+
+        class SiteSerializer(BaseModelSerializer):
+            region = SerializedPKRelatedField(
+                queryset=Region.objects.all(),
+                serializer=RegionSerializer,
+                nested=True,
+            )
+
+            class Meta:
+                model = Site
+                fields = ('id', 'region')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(SiteSerializer),
+            ['region', 'region__parent'],
+        )
+
+    def test_many_serialized_pk_related_field(self):
+        class SiteSerializer(BaseModelSerializer):
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region', 'group')
+                brief_fields = ('id', 'region')
+
+        class RegionSerializer(BaseModelSerializer):
+            sites = SerializedPKRelatedField(
+                queryset=Site.objects.all(),
+                serializer=SiteSerializer,
+                nested=True,
+                many=True,
+            )
+
+            class Meta:
+                model = Region
+                fields = ('id', 'sites')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['sites', 'sites__region'],
+        )
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer, fields=('id',)),
+            [],
+        )
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer, omit=('sites',)),
+            [],
+        )
+
+    def test_many_serialized_pk_related_field_not_nested(self):
+        class SiteSerializer(BaseModelSerializer):
+            class Meta:
+                model = Site
+                fields = ('id', 'name', 'region', 'group')
+                brief_fields = ('id', 'region')
+
+        class RegionSerializer(BaseModelSerializer):
+            sites = SerializedPKRelatedField(
+                queryset=Site.objects.all(),
+                serializer=SiteSerializer,
+                nested=False,
+                many=True,
+            )
+
+            class Meta:
+                model = Region
+                fields = ('id', 'sites')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['sites', 'sites__region', 'sites__group'],
+        )
+
+    def test_self_referential_serialized_pk_related_field(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'parent', 'children')
+
+        # The field can only name its own serializer once the class exists.
+        RegionSerializer._declared_fields['children'] = SerializedPKRelatedField(
+            queryset=Region.objects.all(),
+            serializer=RegionSerializer,
+            many=True,
+        )
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['parent', 'children'],
+        )
+
+    def test_self_referential_serialized_pk_related_field_with_brief_fields(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'sites', 'children')
+                brief_fields = ('id', 'sites')
+
+        RegionSerializer._declared_fields['children'] = SerializedPKRelatedField(
+            queryset=Region.objects.all(),
+            serializer=RegionSerializer,
+            nested=True,
+            many=True,
+        )
+
+        # Re-entering the serializer at brief depth is not a cycle, so brief_fields must expand.
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['sites', 'children', 'children__sites'],
+        )
+
+    def test_mutually_referential_serialized_pk_related_fields(self):
+        class RegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'sites')
+
+        class SiteSerializer(BaseModelSerializer):
+            region = SerializedPKRelatedField(
+                queryset=Region.objects.all(),
+                serializer=RegionSerializer,
+            )
+
+            class Meta:
+                model = Site
+                fields = ('id', 'region')
+
+        RegionSerializer._declared_fields['sites'] = SerializedPKRelatedField(
+            queryset=Site.objects.all(),
+            serializer=SiteSerializer,
+            many=True,
+        )
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['sites', 'sites__region'],
+        )
+
+    def test_serializer_class_reused_on_sibling_fields(self):
+        class TargetRegionSerializer(BaseModelSerializer):
+            class Meta:
+                model = Region
+                fields = ('id', 'sites')
+
+        class RegionSerializer(BaseModelSerializer):
+            parent = SerializedPKRelatedField(
+                queryset=Region.objects.all(),
+                serializer=TargetRegionSerializer,
+            )
+            children = SerializedPKRelatedField(
+                queryset=Region.objects.all(),
+                serializer=TargetRegionSerializer,
+                many=True,
+            )
+
+            class Meta:
+                model = Region
+                fields = ('id', 'parent', 'children')
+
+        self.assertListEqual(
+            get_prefetches_for_serializer(RegionSerializer),
+            ['parent', 'parent__sites', 'children', 'children__sites'],
+        )
+
+
+class _ResolvedSerializerA(Serializer):
+    pass
+
+
+class _ResolvedSerializerB(Serializer):
+    pass
+
+
+class SerializerResolverRegistryTestCase(TestCase):
+    """
+    Verify that a registered serializer resolver is consulted before the
+    default import-path lookup in get_serializer_for_model(), scoped to
+    the app for which it was registered.
+    """
+
+    def setUp(self):
+        # Snapshot and clear the resolver mapping so each test starts from a
+        # known state and can't leak resolvers into the rest of the suite.
+        self._saved_resolvers = dict(registry['serializer_resolvers'])
+        registry['serializer_resolvers'].clear()
+
+    def tearDown(self):
+        registry['serializer_resolvers'].clear()
+        registry['serializer_resolvers'].update(self._saved_resolvers)
+
+    def test_default_lookup_when_no_resolvers_registered(self):
+        self.assertIs(get_serializer_for_model(Site), SiteSerializer)
+
+    def test_registered_resolver_overrides_default(self):
+        register_serializer_resolver('dcim', lambda model, prefix='': _ResolvedSerializerA)
+
+        self.assertIs(get_serializer_for_model(Site), _ResolvedSerializerA)
+
+    def test_resolver_returning_none_falls_through_to_default(self):
+        register_serializer_resolver('dcim', lambda model, prefix='': None)
+
+        self.assertIs(get_serializer_for_model(Site), SiteSerializer)
+
+    def test_resolver_scoped_to_registered_app(self):
+        # A resolver registered for dcim must not affect lookups for other apps (e.g. ipam).
+        register_serializer_resolver('dcim', lambda model, prefix='': _ResolvedSerializerA)
+
+        self.assertIs(get_serializer_for_model(Site), _ResolvedSerializerA)
+        self.assertIs(get_serializer_for_model(VLAN), VLANSerializer)
+
+    def test_per_app_resolvers_are_independent(self):
+        register_serializer_resolver('dcim', lambda model, prefix='': _ResolvedSerializerA)
+        register_serializer_resolver('ipam', lambda model, prefix='': _ResolvedSerializerB)
+
+        self.assertIs(get_serializer_for_model(Site), _ResolvedSerializerA)
+        self.assertIs(get_serializer_for_model(VLAN), _ResolvedSerializerB)
+
+    def test_resolver_receives_prefix(self):
+        seen = {}
+
+        def resolver(model, prefix=''):
+            seen['prefix'] = prefix
+            return _ResolvedSerializerA
+
+        register_serializer_resolver('dcim', resolver)
+        get_serializer_for_model(Site, prefix='Nested')
+
+        self.assertEqual(seen['prefix'], 'Nested')
+
+    def test_register_rejects_non_callable(self):
+        with self.assertRaises(TypeError):
+            register_serializer_resolver('dcim', 'not a callable')
+
+    def test_register_rejects_duplicate_app_registration(self):
+        register_serializer_resolver('dcim', lambda model, prefix='': _ResolvedSerializerA)
+        with self.assertRaises(ValueError):
+            register_serializer_resolver('dcim', lambda model, prefix='': _ResolvedSerializerB)
+
+    def test_raising_resolver_falls_through_to_default(self):
+        def broken_resolver(model, prefix=''):
+            raise RuntimeError("intentional failure")
+
+        register_serializer_resolver('dcim', broken_resolver)
+
+        with self.assertLogs('netbox.utilities.api', level='ERROR'):
+            self.assertIs(get_serializer_for_model(Site), SiteSerializer)
+
+    def test_resolver_returning_non_serializer_falls_through_to_default(self):
+        register_serializer_resolver('dcim', lambda model, prefix='': object())
+
+        with self.assertLogs('netbox.utilities.api', level='WARNING'):
+            self.assertIs(get_serializer_for_model(Site), SiteSerializer)
+
+
+class APITrailingSlashTestCase(APITestCase):
+    """
+    Verify behavior for REST API requests sent to a URL without a trailing slash.
+
+    GET requests should continue to be redirected to the trailing-slash URL (Django's default
+    APPEND_SLASH behavior). Write methods (POST/PUT/PATCH/DELETE) should instead receive a 404
+    so that the request body is not silently dropped by a redirect.
+    """
+    model = Site
+    user_permissions = ('dcim.view_site', 'dcim.add_site', 'dcim.change_site', 'dcim.delete_site')
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.site = Site.objects.create(name='Site 1', slug='site-1')
+
+    def _strip_slash(self, url):
+        return url.rstrip('/')
+
+    def test_get_redirects(self):
+        url = self._strip_slash(reverse('dcim-api:site-list'))
+        response = self.client.get(url, **self.header)
+        self.assertIn(response.status_code, (301, 302))
+        self.assertTrue(response['Location'].endswith('/'))
+
+    def test_post_returns_404(self):
+        url = self._strip_slash(reverse('dcim-api:site-list'))
+        data = {'name': 'Site 2', 'slug': 'site-2'}
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+    def test_patch_returns_404(self):
+        url = self._strip_slash(self._get_detail_url(self.site))
+        with disable_warnings('django.request'):
+            response = self.client.patch(url, {'name': 'Renamed'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+    def test_put_returns_404(self):
+        url = self._strip_slash(self._get_detail_url(self.site))
+        data = {'name': 'Renamed', 'slug': 'renamed'}
+        with disable_warnings('django.request'):
+            response = self.client.put(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+    def test_delete_returns_404(self):
+        url = self._strip_slash(self._get_detail_url(self.site))
+        with disable_warnings('django.request'):
+            response = self.client.delete(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(Site.objects.filter(pk=self.site.pk).exists())
+
+
+class IsApiRequestTestCase(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_returns_true_for_api_path(self):
+        request = self.factory.get(reverse('api-root'))
+        self.assertTrue(is_api_request(request))
+
+    def test_returns_false_for_non_api_path(self):
+        request = self.factory.get('/dcim/interfaces/')
+        self.assertFalse(is_api_request(request))
+
+    def test_returns_false_for_path_merely_containing_api(self):
+        """
+        A path that contains 'api' as a substring, but does not start with the
+        API root, must not be classified as an API request.
+        """
+        request = self.factory.get('/dcim/api-widget/')
+        self.assertFalse(is_api_request(request))
+
+
+class IsGraphqlRequestTestCase(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_returns_true_for_graphql_json_request(self):
+        request = self.factory.post(
+            reverse('graphql'),
+            data='{"query": "{ __typename }"}',
+            content_type='application/json',
+        )
+        self.assertTrue(is_graphql_request(request))
+
+    def test_returns_false_for_graphql_non_json_request(self):
+        """
+        The GraphiQL browser UI hits the same path with a non-JSON content
+        type; it must not be classified as a GraphQL API request.
+        """
+        request = self.factory.get(reverse('graphql'))
+        self.assertFalse(is_graphql_request(request))
+
+    def test_returns_false_for_non_graphql_path(self):
+        request = self.factory.get(reverse('api-root'))
+        self.assertFalse(is_graphql_request(request))

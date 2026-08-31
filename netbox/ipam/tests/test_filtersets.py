@@ -4,8 +4,20 @@ from django.test import TestCase
 from netaddr import IPNetwork
 
 from circuits.models import Provider
-from dcim.choices import InterfaceTypeChoices
-from dcim.models import Device, DeviceRole, DeviceType, Interface, Location, Manufacturer, Rack, Region, Site, SiteGroup
+from dcim.choices import InterfaceModeChoices, InterfaceTypeChoices
+from dcim.models import (
+    Device,
+    DeviceRole,
+    DeviceType,
+    Interface,
+    Location,
+    Manufacturer,
+    Rack,
+    RackGroup,
+    Region,
+    Site,
+    SiteGroup,
+)
 from ipam.choices import *
 from ipam.filtersets import *
 from ipam.models import *
@@ -114,6 +126,13 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         ]
         RIR.objects.bulk_create(rirs)
 
+        roles = [
+            Role(name='Role 1', slug='role-1'),
+            Role(name='Role 2', slug='role-2'),
+            Role(name='Role 3', slug='role-3'),
+        ]
+        Role.objects.bulk_create(roles)
+
         tenants = [
             Tenant(name='Tenant 1', slug='tenant-1'),
             Tenant(name='Tenant 2', slug='tenant-2'),
@@ -124,12 +143,12 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         Tenant.objects.bulk_create(tenants)
 
         asns = (
-            ASN(asn=65001, rir=rirs[0], tenant=tenants[0], description='foobar1'),
-            ASN(asn=65002, rir=rirs[1], tenant=tenants[1], description='foobar2'),
-            ASN(asn=65003, rir=rirs[2], tenant=tenants[2], description='foobar3'),
-            ASN(asn=4200000000, rir=rirs[0], tenant=tenants[0]),
-            ASN(asn=4200000001, rir=rirs[1], tenant=tenants[1]),
-            ASN(asn=4200000002, rir=rirs[2], tenant=tenants[2]),
+            ASN(asn=65001, rir=rirs[0], role=roles[0], tenant=tenants[0], description='foobar1'),
+            ASN(asn=65002, rir=rirs[1], role=roles[1], tenant=tenants[1], description='foobar2'),
+            ASN(asn=65003, rir=rirs[2], role=roles[2], tenant=tenants[2], description='foobar3'),
+            ASN(asn=4200000000, rir=rirs[0], role=roles[0], tenant=tenants[0]),
+            ASN(asn=4200000001, rir=rirs[1], role=roles[1], tenant=tenants[1]),
+            ASN(asn=4200000002, rir=rirs[2], role=roles[2], tenant=tenants[2]),
         )
         ASN.objects.bulk_create(asns)
 
@@ -184,6 +203,13 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'rir_id': [rirs[0].pk, rirs[1].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
         params = {'rir': [rirs[0].slug, rirs[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+
+    def test_role(self):
+        roles = Role.objects.all()[:2]
+        params = {'role_id': [roles[0].pk, roles[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+        params = {'role': [roles[0].slug, roles[1].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
     def test_site_group(self):
@@ -1096,6 +1122,25 @@ class IPRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'mark_populated': 'false'}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
 
+    def test_single_address_range(self):
+        # A range with start_address == end_address must be discoverable by the
+        # start, end, and contains filters.
+        iprange = IPRange(
+            start_address=IPNetwork('10.0.5.1/24'),
+            end_address=IPNetwork('10.0.5.1/24'),
+        )
+        iprange.clean()
+        iprange.save()
+
+        params = {'start_address': ['10.0.5.1']}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
+        params = {'end_address': ['10.0.5.1']}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
+        params = {'contains': '10.0.5.1/24'}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
 
 class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
     queryset = IPAddress.objects.all()
@@ -1274,6 +1319,10 @@ class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
         )
         IPAddress.objects.bulk_create(ipaddresses)
 
+        IPAddress.objects.filter(pk__in=[ipaddresses[1].pk, ipaddresses[2].pk]).update(
+            nat_inside=ipaddresses[0]
+        )
+
         services = (
             Service(
                 parent=devices[0],
@@ -1441,6 +1490,11 @@ class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_service(self):
         services = Service.objects.all()[:2]
         params = {'service_id': [services[0].pk, services[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_nat_inside(self):
+        inside = IPAddress.objects.filter(nat_outside__isnull=False).distinct().first()
+        params = {'nat_inside_id': [inside.pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
@@ -1700,7 +1754,9 @@ class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
                 slug='vlan-group-8'
             ),
         )
-        VLANGroup.objects.bulk_create(vlan_groups)
+        # Ensure the total_vlan_ids field is populated
+        for vlan_group in vlan_groups:
+            vlan_group.save()
 
     def test_q(self):
         params = {'q': 'foobar1'}
@@ -1728,33 +1784,111 @@ class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'contains_vid': 4095}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
 
-    def test_region(self):
-        params = {'region': Region.objects.first().pk}
+    def test_total_vlan_ids(self):
+        params = {'total_vlan_ids': [110]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)
+        params = {'total_vlan_ids': [4094]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_region(self):
+        regions = (
+            Region.objects.get(slug='region-1'),
+            Region.objects.create(name='Region 2', slug='region-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=regions[1])
+
+        params = {'region': [regions[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'region': [regions[0].pk, regions[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_site_group(self):
-        params = {'site_group': SiteGroup.objects.first().pk}
+        site_groups = (
+            SiteGroup.objects.get(slug='site-group-1'),
+            SiteGroup.objects.create(name='Site Group 2', slug='site-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=site_groups[1])
+
+        params = {'site_group': [site_groups[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'site_group': [site_groups[0].pk, site_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_site(self):
-        params = {'site': Site.objects.first().pk}
+        sites = (
+            Site.objects.get(slug='site-1'),
+            Site.objects.create(name='Site 2', slug='site-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=sites[1])
+
+        params = {'site': [sites[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'site': [sites[0].pk, sites[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_location(self):
-        params = {'location': Location.objects.first().pk}
+        site = Site.objects.get(slug='site-1')
+        locations = (
+            Location.objects.get(slug='location-1'),
+            Location.objects.create(name='Location 2', slug='location-2', site=site),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=locations[1])
+
+        params = {'location': [locations[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'location': [locations[0].pk, locations[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_rack_group(self):
+        rack_groups = (
+            RackGroup.objects.create(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup.objects.create(name='Rack Group 2', slug='rack-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=rack_groups[0])
+        VLANGroup.objects.create(name='VLAN Group 10', slug='vlan-group-10', scope=rack_groups[1])
+
+        params = {'rack_group': [rack_groups[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'rack_group': [rack_groups[0].pk, rack_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_rack(self):
-        params = {'rack': Rack.objects.first().pk}
+        site = Site.objects.get(slug='site-1')
+        racks = (
+            Rack.objects.get(name='Rack 1'),
+            Rack.objects.create(name='Rack 2', site=site),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=racks[1])
+
+        params = {'rack': [racks[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'rack': [racks[0].pk, racks[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_cluster_group(self):
-        params = {'cluster_group': ClusterGroup.objects.first().pk}
+        cluster_groups = (
+            ClusterGroup.objects.get(slug='cluster-group-1'),
+            ClusterGroup.objects.create(name='Cluster Group 2', slug='cluster-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=cluster_groups[1])
+
+        params = {'cluster_group': [cluster_groups[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'cluster_group': [cluster_groups[0].pk, cluster_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_cluster(self):
-        params = {'cluster': Cluster.objects.first().pk}
+        cluster_type = ClusterType.objects.get(slug='cluster-type-1')
+        clusters = (
+            Cluster.objects.get(name='Cluster 1'),
+            Cluster.objects.create(name='Cluster 2', type=cluster_type),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=clusters[1])
+
+        params = {'cluster': [clusters[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'cluster': [clusters[0].pk, clusters[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_tenant(self):
         tenants = Tenant.objects.all()[:2]
@@ -2138,6 +2272,26 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'available_on_device': device_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)  # 5 scoped + 1 global group + 1 global
 
+    def test_available_on_device_cluster_scopes(self):
+        device = Device.objects.get(name='Device 1')
+        device.cluster = Cluster.objects.get(name='Cluster 1')
+        device.save(update_fields=('cluster',))
+
+        params = {'available_on_device': device.pk}
+        vlans = self.filterset(params, self.queryset).qs
+
+        # VLANs from groups scoped to the assigned cluster or its cluster group
+        self.assertIn(VLAN.objects.get(name='Cluster 1'), vlans)
+        self.assertIn(VLAN.objects.get(name='Cluster Group 1'), vlans)
+        # VLANs from groups scoped to unrelated clusters or cluster groups
+        self.assertNotIn(VLAN.objects.get(name='Cluster 2'), vlans)
+        self.assertNotIn(VLAN.objects.get(name='Cluster Group 2'), vlans)
+        # Site, location, rack and global availability is unchanged
+        self.assertEqual(
+            set(vlans.values_list('vid', flat=True)),
+            {1, 4, 7, 10, 13, 16, 19, 500, 1000}
+        )
+
     def test_available_on_virtualmachine(self):
         vm_id = VirtualMachine.objects.first().pk
         params = {'available_on_virtualmachine': vm_id}
@@ -2151,15 +2305,59 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'available_at_site': site_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 5)  # 4 scoped + 1 global group + 1 global
 
+    def test_available_at_site_group(self):
+        site_group = SiteGroup.objects.get(name='Site Group 1')
+        params = {'available_at_site_group': site_group.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)  # 1 scoped + 1 global group + 1 global
+
     def test_interface(self):
         interface_id = Interface.objects.first().pk
         params = {'interface_id': interface_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
+        # An interface untagged on one VLAN and tagged on a different VLAN should return both (UNION across paths)
+        vlans = self.queryset.all()[:2]
+        interface = Interface.objects.create(
+            device=Device.objects.first(),
+            name='Interface X',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+            mode=InterfaceModeChoices.MODE_TAGGED,
+            untagged_vlan=vlans[0],
+        )
+        interface.tagged_vlans.add(vlans[1])
+        params = {'interface_id': interface.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # A VLAN that is both untagged and tagged on the same interface should be returned only once (deduplication)
+        interface.tagged_vlans.add(vlans[0])
+        params = {'interface_id': interface.pk}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual(len(qs), len(set(qs.values_list('pk', flat=True))))
+
     def test_vminterface(self):
         vminterface_id = VMInterface.objects.first().pk
         params = {'vminterface_id': vminterface_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+        # A VM interface untagged on one VLAN and tagged on a different VLAN should return both (UNION across paths)
+        vlans = self.queryset.all()[:2]
+        vminterface = VMInterface.objects.create(
+            virtual_machine=VirtualMachine.objects.first(),
+            name='VM Interface X',
+            mode=InterfaceModeChoices.MODE_TAGGED,
+            untagged_vlan=vlans[0],
+        )
+        vminterface.tagged_vlans.add(vlans[1])
+        params = {'vminterface_id': vminterface.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # A VLAN that is both untagged and tagged on the same interface should be returned only once (deduplication)
+        vminterface.tagged_vlans.add(vlans[0])
+        params = {'vminterface_id': vminterface.pk}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual(len(qs), len(set(qs.values_list('pk', flat=True))))
 
     def test_qinq_role(self):
         params = {'qinq_role': [VLANQinQRoleChoices.ROLE_SERVICE, VLANQinQRoleChoices.ROLE_CUSTOMER]}

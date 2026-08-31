@@ -5,10 +5,14 @@ from django.conf import settings
 from django.contrib import auth, messages
 from django.contrib.auth.middleware import RemoteUserMiddleware as RemoteUserMiddleware_
 from django.core.exceptions import ImproperlyConfigured
+from django.core.signals import got_request_exception
 from django.db import ProgrammingError, connection
 from django.db.utils import InternalError
 from django.http import Http404, HttpResponseRedirect
+from django.middleware.common import CommonMiddleware as DjangoCommonMiddleware
+from django.utils.translation import gettext_lazy as _
 from django_prometheus import middleware
+from social_django.middleware import SocialAuthExceptionMiddleware as SocialAuthExceptionMiddleware_
 
 from netbox.config import clear_config, get_config
 from netbox.metrics import Metrics
@@ -18,12 +22,14 @@ from utilities.error_handlers import handle_rest_api_exception
 from utilities.request import apply_request_processors
 
 __all__ = (
+    'CommonMiddleware',
     'CoreMiddleware',
     'EnterpriseAuthMiddleware',
     'MaintenanceModeMiddleware',
     'PrometheusAfterMiddleware',
     'PrometheusBeforeMiddleware',
     'RemoteUserMiddleware',
+    'SocialAuthExceptionMiddleware',
 )
 
 
@@ -149,8 +155,11 @@ class CoreMiddleware:
         if settings.DEBUG:
             return None
 
-        # Cleanly handle exceptions that occur from REST API requests
-        if is_api_request(request):
+        # Cleanly handle exceptions that occur from REST or GraphQL API requests
+        if is_api_request(request) or is_graphql_request(request):
+            # Fire Django's got_request_exception signal so error-tracking
+            # integrations (e.g. Sentry) capture the exception.
+            got_request_exception.send(sender=self.__class__, request=request)
             return handle_rest_api_exception(request)
 
         # Ignore Http404s (defer to Django's built-in 404 handling)
@@ -168,6 +177,9 @@ class CoreMiddleware:
 
         # Return a custom error message, or fall back to Django's default 500 error handling
         if custom_template:
+            # Fire Django's got_request_exception signal so error-tracking
+            # integrations (e.g. Sentry) capture the exception.
+            got_request_exception.send(sender=self.__class__, request=request)
             return handler_500(request, template_name=custom_template)
         return None
 
@@ -321,9 +333,19 @@ class MaintenanceModeMiddleware:
             error_message = 'NetBox is currently operating in maintenance mode and is unable to perform write ' \
                             'operations. Please try again later.'
 
-            if is_api_request(request):
+            if is_api_request(request) or is_graphql_request(request):
                 return handle_rest_api_exception(request, error=error_message)
 
             messages.error(request, error_message)
             return HttpResponseRedirect(request.path_info)
         return None
+
+
+class SocialAuthExceptionMiddleware(SocialAuthExceptionMiddleware_):
+    """
+    Subclass of python-social-auth's exception middleware which surfaces a generic, user-friendly
+    message rather than exposing the raw social_core exception text to (typically unauthenticated)
+    users when an SSO/SAML login fails.
+    """
+    def get_message(self, request, exception):
+        return _("Single sign-on failed. Please try again or contact your administrator.")

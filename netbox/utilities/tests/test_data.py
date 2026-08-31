@@ -3,7 +3,10 @@ from django.test import TestCase
 
 from utilities.data import (
     check_ranges_overlap,
+    deep_compare_dict,
     get_config_value_ci,
+    get_inclusive_integer_range_bounds,
+    normalize_integer_range,
     ranges_to_string,
     ranges_to_string_list,
     string_to_ranges,
@@ -53,6 +56,54 @@ class RangeFunctionsTestCase(TestCase):
             ])
         )
 
+    def test_check_ranges_overlap_does_not_mutate_input(self):
+        """Verify check_ranges_overlap does not reorder the caller's list."""
+        ranges = [
+            NumericRange(10, 20, bounds='[)'),
+            NumericRange(1, 5, bounds='[)'),
+        ]
+        expected = [
+            NumericRange(10, 20, bounds='[)'),
+            NumericRange(1, 5, bounds='[)'),
+        ]
+        check_ranges_overlap(ranges)
+        self.assertEqual(ranges, expected)
+
+    def test_check_ranges_overlap_with_non_canonical_bounds(self):
+        # Both ranges share raw .lower=1 but different inclusive lowers (2 vs. 1).
+        # The pre-fix sort key (raw .lower) would order them as written and report
+        # a false overlap; sorting by inclusive lower catches this.
+        self.assertFalse(check_ranges_overlap([
+            NumericRange(1, 10, bounds='(]'),  # 2-10
+            NumericRange(1, 1, bounds='[]'),   # 1
+        ]))
+
+        self.assertTrue(check_ranges_overlap([
+            NumericRange(1, 10, bounds='(]'),  # 2-10
+            NumericRange(2, 2, bounds='[]'),   # 2
+        ]))
+
+    def test_get_inclusive_integer_range_bounds(self):
+        self.assertEqual(get_inclusive_integer_range_bounds(NumericRange(10, 20, bounds='[)')), (10, 19))
+        self.assertEqual(get_inclusive_integer_range_bounds(NumericRange(10, 20, bounds='[]')), (10, 20))
+        self.assertEqual(get_inclusive_integer_range_bounds(NumericRange(10, 20, bounds='(]')), (11, 20))
+        self.assertEqual(get_inclusive_integer_range_bounds(NumericRange(10, 20, bounds='()')), (11, 19))
+        self.assertEqual(get_inclusive_integer_range_bounds(NumericRange(10, 10, bounds='[]')), (10, 10))
+
+    def test_normalize_integer_range(self):
+        self.assertEqual(
+            normalize_integer_range(NumericRange(10, 20, bounds='[)')),
+            NumericRange(10, 20, bounds='[)')
+        )
+        self.assertEqual(
+            normalize_integer_range(NumericRange(10, 20, bounds='[]')),
+            NumericRange(10, 21, bounds='[)')
+        )
+        self.assertEqual(
+            normalize_integer_range(NumericRange(10, 10, bounds='[]')),
+            NumericRange(10, 11, bounds='[)')
+        )
+
     def test_ranges_to_string_list(self):
         self.assertEqual(
             ranges_to_string_list([
@@ -98,6 +149,64 @@ class RangeFunctionsTestCase(TestCase):
             string_to_ranges('2-10, a-b'),
             None  # Fails to convert
         )
+
+
+class DeepCompareDictTestCase(TestCase):
+
+    def test_no_changes(self):
+        source = {'a': 1, 'b': 'foo', 'c': {'x': 1, 'y': 2}}
+        added, removed = deep_compare_dict(source, source)
+        self.assertEqual(added, {})
+        self.assertEqual(removed, {})
+
+    def test_scalar_change(self):
+        source = {'a': 1, 'b': 'foo'}
+        dest = {'a': 2, 'b': 'foo'}
+        added, removed = deep_compare_dict(source, dest)
+        self.assertEqual(added, {'a': 2})
+        self.assertEqual(removed, {'a': 1})
+
+    def test_key_added(self):
+        source = {'a': 1}
+        dest = {'a': 1, 'b': 'new'}
+        added, removed = deep_compare_dict(source, dest)
+        self.assertEqual(added, {'b': 'new'})
+        self.assertEqual(removed, {'b': None})
+
+    def test_key_removed(self):
+        source = {'a': 1, 'b': 'old'}
+        dest = {'a': 1}
+        added, removed = deep_compare_dict(source, dest)
+        self.assertEqual(added, {'b': None})
+        self.assertEqual(removed, {'b': 'old'})
+
+    def test_nested_dict_partial_change(self):
+        """Only changed sub-keys of a nested dict are included."""
+        source = {'custom_fields': {'cf1': 'old', 'cf2': 'unchanged'}}
+        dest = {'custom_fields': {'cf1': 'new', 'cf2': 'unchanged'}}
+        added, removed = deep_compare_dict(source, dest)
+        self.assertEqual(added, {'custom_fields': {'cf1': 'new'}})
+        self.assertEqual(removed, {'custom_fields': {'cf1': 'old'}})
+
+    def test_nested_dict_no_change(self):
+        source = {'name': 'test', 'custom_fields': {'cf1': 'same'}}
+        added, removed = deep_compare_dict(source, source)
+        self.assertEqual(added, {})
+        self.assertEqual(removed, {})
+
+    def test_mixed_flat_and_nested(self):
+        source = {'name': 'old', 'custom_fields': {'cf1': 'old', 'cf2': 'same'}}
+        dest = {'name': 'new', 'custom_fields': {'cf1': 'new', 'cf2': 'same'}}
+        added, removed = deep_compare_dict(source, dest)
+        self.assertEqual(added, {'name': 'new', 'custom_fields': {'cf1': 'new'}})
+        self.assertEqual(removed, {'name': 'old', 'custom_fields': {'cf1': 'old'}})
+
+    def test_exclude(self):
+        source = {'a': 1, 'last_updated': '2024-01-01'}
+        dest = {'a': 2, 'last_updated': '2024-06-01'}
+        added, removed = deep_compare_dict(source, dest, exclude=['last_updated'])
+        self.assertEqual(added, {'a': 2})
+        self.assertEqual(removed, {'a': 1})
 
 
 class GetConfigValueCITestCase(TestCase):

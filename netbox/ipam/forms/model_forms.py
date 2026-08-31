@@ -5,7 +5,7 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 
 from dcim.forms.mixins import ScopedForm
-from dcim.models import Device, Interface, Site
+from dcim.models import Device, Interface, Site, SiteGroup
 from ipam.choices import *
 from ipam.constants import *
 from ipam.formfields import IPNetworkFormField
@@ -37,6 +37,7 @@ __all__ = (
     'IPAddressBulkAddForm',
     'IPAddressForm',
     'IPRangeForm',
+    'PrefixBulkAddForm',
     'PrefixForm',
     'RIRForm',
     'RoleForm',
@@ -44,6 +45,7 @@ __all__ = (
     'ServiceCreateForm',
     'ServiceForm',
     'ServiceTemplateForm',
+    'VLANBulkAddForm',
     'VLANForm',
     'VLANGroupForm',
     'VLANTranslationPolicyForm',
@@ -152,6 +154,12 @@ class ASNForm(TenancyForm, PrimaryModelForm):
         label=_('RIR'),
         quick_add=True
     )
+    role = DynamicModelChoiceField(
+        queryset=Role.objects.all(),
+        label=_('Role'),
+        required=False,
+        quick_add=True
+    )
     sites = DynamicModelMultipleChoiceField(
         queryset=Site.objects.all(),
         label=_('Sites'),
@@ -159,14 +167,14 @@ class ASNForm(TenancyForm, PrimaryModelForm):
     )
 
     fieldsets = (
-        FieldSet('asn', 'rir', 'sites', 'description', 'tags', name=_('ASN')),
+        FieldSet('asn', 'rir', 'role', 'sites', 'description', 'tags', name=_('ASN')),
         FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
     )
 
     class Meta:
         model = ASN
         fields = [
-            'asn', 'rir', 'sites', 'tenant_group', 'tenant', 'description', 'owner', 'comments', 'tags'
+            'asn', 'rir', 'role', 'sites', 'tenant_group', 'tenant', 'description', 'owner', 'comments', 'tags'
         ]
         widgets = {
             'date_added': DatePicker(),
@@ -237,10 +245,35 @@ class PrefixForm(TenancyForm, ScopedForm, PrimaryModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # #18605: only filter VLAN select list if scope field is a Site
+        # #18605: only filter VLAN select list if scope field is a Site or Site Group
         if scope_field := self.fields.get('scope', None):
-            if scope_field.queryset.model is not Site:
+            if scope_field.queryset.model is Site:
+                pass  # already filtered by available_at_site
+            elif scope_field.queryset.model is SiteGroup:
+                self.fields['vlan'].widget.dynamic_params.clear()
                 self.fields['vlan'].widget.attrs.pop('data-dynamic-params', None)
+                self.fields['vlan'].widget.add_query_params({
+                    'available_at_site_group': '$scope',
+                })
+            else:
+                self.fields['vlan'].widget.attrs.pop('data-dynamic-params', None)
+
+
+class PrefixBulkAddForm(PrefixForm):
+    """
+    Subclass of PrefixForm for bulk creation. The prefix field is inherited
+    but excluded from fieldsets — it is populated programmatically by BulkCreateView
+    from the expanded pattern.
+    """
+
+    fieldsets = (
+        FieldSet(
+            'status', 'vrf', 'role', 'is_pool', 'mark_utilized', 'description', 'tags', name=_('Prefix')
+        ),
+        FieldSet('scope_type', 'scope', name=_('Scope')),
+        FieldSet('vlan', name=_('VLAN Assignment')),
+        FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
+    )
 
 
 class IPRangeForm(TenancyForm, PrimaryModelForm):
@@ -459,17 +492,23 @@ class IPAddressForm(TenancyForm, PrimaryModelForm):
         return ipaddress
 
 
-class IPAddressBulkAddForm(TenancyForm, NetBoxModelForm):
+class IPAddressBulkAddForm(TenancyForm, PrimaryModelForm):
     vrf = DynamicModelChoiceField(
         queryset=VRF.objects.all(),
         required=False,
         label=_('VRF')
     )
 
+    fieldsets = (
+        FieldSet('status', 'role', 'vrf', 'dns_name', 'description', 'tags', name=_('IP Address')),
+        FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
+    )
+
     class Meta:
         model = IPAddress
         fields = [
-            'address', 'vrf', 'status', 'role', 'dns_name', 'description', 'tenant_group', 'tenant', 'tags',
+            'address', 'vrf', 'status', 'role', 'dns_name', 'tenant_group', 'tenant', 'description', 'owner',
+            'comments', 'tags',
         ]
 
 
@@ -697,6 +736,26 @@ class VLANForm(TenancyForm, PrimaryModelForm):
         ]
 
 
+class VLANBulkAddForm(VLANForm):
+    """
+    Subclass of VLANForm for bulk creation.
+
+    The VID field is inherited but excluded from the visible fieldsets, as it is
+    populated programmatically by BulkCreateView from the expanded pattern.
+    """
+    fieldsets = (
+        FieldSet('group', 'site', 'name', 'status', 'role', 'description', 'tags', name=_('VLAN')),
+        FieldSet('qinq_role', 'qinq_svlan', name=_('Q-in-Q/802.1ad')),
+        FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['name'].help_text = _(
+            'Use {vid} as a placeholder for the VLAN ID. Example: VLAN-{vid}.'
+        )
+
+
 class VLANTranslationPolicyForm(PrimaryModelForm):
 
     fieldsets = (
@@ -851,7 +910,7 @@ class ServiceCreateForm(ServiceForm):
 
     class Meta(ServiceForm.Meta):
         fields = [
-            'service_template', 'name', 'protocol', 'ports', 'ipaddresses', 'description',
+            'service_template', 'name', 'protocol', 'ports', 'ipaddresses', 'description', 'owner',
             'comments', 'tags', 'parent_object_type',
         ]
 

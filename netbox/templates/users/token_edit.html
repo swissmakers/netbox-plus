@@ -5,5 +5,34 @@
   {% if not request.user.is_superuser %}
     {% include 'inc/alerts/warning.html' with title="Creating API Tokens" message="Non-superusers should generally create and modify API tokens under their user profile." %}
   {% endif %}
+  {% include 'users/inc/v1_token_warning.html' %}
   {{ block.super }}
 {% endblock %}
+
+{% block javascript %}
+{{ block.super }}
+<script>
+  (function () {
+    const versionField = document.getElementById('id_version');
+    const v1Warning = document.getElementById('v1-deprecation-warning');
+    if (versionField && v1Warning) {
+      function updateV1Warning() {
+        v1Warning.style.display = versionField.value === '1' ? '' : 'none';
+      }
+      versionField.addEventListener('change', updateV1Warning);
+      updateV1Warning();
+    }
+  })();
+</script>
+{% endblock javascript %}
+
+{% block buttons %}
+  {# Omit the "Create & Add Another" button: that flow would redirect away from the detail page before the #}
+  {# one-time plaintext can be displayed, leaving the new token unrecoverable. #}
+  <a href="{{ return_url }}" class="btn btn-outline-secondary">{% trans "Cancel" %}</a>
+  {% if object.pk %}
+    <button type="submit" name="_update" class="btn btn-primary">{% trans "Save" %}</button>
+  {% else %}
+    <button type="submit" name="_create" class="btn btn-primary">{% trans "Create" %}</button>
+  {% endif %}
+{% endblock buttons %}

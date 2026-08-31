@@ -2,6 +2,10 @@ from django.utils.translation import gettext_lazy as _
 
 from netbox.ui import attrs, panels
 
+#
+# Cluster
+#
+
 
 class ClusterPanel(panels.ObjectAttributesPanel):
     name = attrs.TextAttr('name')
@@ -10,14 +14,37 @@ class ClusterPanel(panels.ObjectAttributesPanel):
     description = attrs.TextAttr('description')
     group = attrs.RelatedObjectAttr('group', linkify=True)
     tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
-    scope = attrs.GenericForeignKeyAttr('scope', linkify=True)
+    scope = attrs.GenericForeignKeyAttr('scope', linkify=True, nested=True, max_depth=3)
+
+
+#
+# Virtual machine types
+#
+
+
+class VirtualMachineTypePanel(panels.ObjectAttributesPanel):
+    name = attrs.TextAttr('name')
+    default_platform = attrs.NestedObjectAttr('default_platform', linkify=True, max_depth=3)
+    default_vcpus = attrs.TextAttr('default_vcpus', label=_('Default vCPUs'))
+    default_memory = attrs.TemplatedAttr(
+        'default_memory',
+        template_name='virtualization/virtualmachinetype/attrs/default_memory.html',
+        label=_('Default memory')
+    )
+    description = attrs.TextAttr('description')
+
+
+#
+# Virtual machines
+#
 
 
 class VirtualMachinePanel(panels.ObjectAttributesPanel):
     name = attrs.TextAttr('name')
+    virtual_machine_type = attrs.RelatedObjectAttr('virtual_machine_type', linkify=True, label=_('Type'))
     status = attrs.ChoiceAttr('status')
     start_on_boot = attrs.ChoiceAttr('start_on_boot')
-    role = attrs.RelatedObjectAttr('role', linkify=True, colored=True)
+    role = attrs.NestedObjectAttr('role', linkify=True, max_depth=3, colored=True)
     platform = attrs.NestedObjectAttr('platform', linkify=True, max_depth=3)
     description = attrs.TextAttr('description')
     serial = attrs.TextAttr('serial', label=_('Serial number'), style='font-monospace', copy_button=True)
@@ -35,8 +62,8 @@ class VirtualMachinePanel(panels.ObjectAttributesPanel):
     )
 
 
-class VirtualMachineClusterPanel(panels.ObjectAttributesPanel):
-    title = _('Cluster')
+class VirtualMachinePlacementPanel(panels.ObjectAttributesPanel):
+    title = _('Placement')
 
     site = attrs.RelatedObjectAttr('site', linkify=True, grouped_by='group')
     cluster = attrs.RelatedObjectAttr('cluster', linkify=True)
@@ -44,11 +71,21 @@ class VirtualMachineClusterPanel(panels.ObjectAttributesPanel):
     device = attrs.RelatedObjectAttr('device', linkify=True)
 
 
+#
+# Virtual disks
+#
+
+
 class VirtualDiskPanel(panels.ObjectAttributesPanel):
     virtual_machine = attrs.RelatedObjectAttr('virtual_machine', linkify=True, label=_('Virtual Machine'))
     name = attrs.TextAttr('name')
     size = attrs.TemplatedAttr('size', template_name='virtualization/virtualdisk/attrs/size.html')
     description = attrs.TextAttr('description')
+
+
+#
+# VM interfaces
+#
 
 
 class VMInterfacePanel(panels.ObjectAttributesPanel):

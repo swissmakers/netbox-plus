@@ -4,6 +4,17 @@ from . import models
 
 
 @register_search
+class CableBundleIndex(SearchIndex):
+    model = models.CableBundle
+    fields = (
+        ('name', 100),
+        ('description', 500),
+        ('comments', 5000),
+    )
+    display_attrs = ('description',)
+
+
+@register_search
 class CableIndex(SearchIndex):
     model = models.Cable
     fields = (
@@ -73,6 +84,7 @@ class DeviceRoleIndex(SearchIndex):
         ('name', 100),
         ('slug', 110),
         ('description', 500),
+        ('comments', 5000),
     )
     display_attrs = ('description',)
 
@@ -106,6 +118,7 @@ class MACAddressIndex(SearchIndex):
     fields = (
         ('mac_address', 100),
         ('description', 500),
+        ('comments', 5000),
     )
     display_attrs = ('assigned_object', 'description')
 
@@ -228,6 +241,7 @@ class PlatformIndex(SearchIndex):
         ('name', 100),
         ('slug', 110),
         ('description', 500),
+        ('comments', 5000),
     )
     display_attrs = ('manufacturer', 'description')
 
@@ -313,6 +327,18 @@ class RackReservationIndex(SearchIndex):
         ('comments', 5000),
     )
     display_attrs = ('rack', 'tenant', 'user', 'description')
+
+
+@register_search
+class RackGroupIndex(SearchIndex):
+    model = models.RackGroup
+    fields = (
+        ('name', 100),
+        ('slug', 110),
+        ('description', 500),
+        ('comments', 5000),
+    )
+    display_attrs = ('description',)
 
 
 @register_search

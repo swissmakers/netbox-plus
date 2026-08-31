@@ -32,8 +32,8 @@ Context:
 
     {# Link to model documentation #}
     {% if settings.DOCS_ROOT and object.docs_url %}
-      <a href="{{ object.docs_url }}" target="_blank" class="btn btn-outline-secondary" title="{% trans "View model documentation" %}">
-        <i class="mdi mdi-help-circle"></i> {% trans "Help" %}
+      <a href="{{ object.docs_url }}" target="_blank" class="btn btn-outline-secondary" title="{% trans "View model documentation" %}" aria-label="{% trans "View model documentation" %}">
+        <i class="mdi mdi-help-circle" aria-hidden="true"></i> {% trans "Help" %}
       </a>
     {% endif %}
 
@@ -51,40 +51,43 @@ Context:
 {% endblock tabs %}
 
 {% block content %}
-  <div class="tab-pane show active" id="edit-form" role="tabpanel" aria-labelledby="object-list-tab">
+  <div class="tab-pane show active" id="edit-form" role="tabpanel" aria-labelledby="edit-form-tab">
 
     {# Warn about missing prerequisite objects #}
     {% if prerequisite_model %}
       {% include 'inc/missing_prerequisites.html' %}
     {% endif %}
 
-    <form action="" method="post" enctype="multipart/form-data" class="object-edit mt-5">
+    <form action="" method="post" enctype="multipart/form-data" class="object-edit object-edit--with-sticky-actions mt-5">
       {% csrf_token %}
 
+      {% block pre_form_fields %}{% endblock pre_form_fields %}
       <div id="form_fields" hx-disinherit="hx-select hx-swap">
         {% block form %}
           {% include 'htmx/form.html' %}
         {% endblock form %}
       </div>
 
-      <div class="btn-float-group-right">
-        {% block buttons %}
-          <a href="{{ return_url }}" class="btn btn-outline-secondary btn-float">{% trans "Cancel" %}</a>
-          {% if object.pk %}
-            <button type="submit" name="_update" class="btn btn-primary">
-              {% trans "Save" %}
-            </button>
-          {% else %}
-            <div class="btn-group" role="group" aria-label="{% trans "Actions" %}">
-              <button type="submit" name="_create" class="btn btn-primary">
-                {% trans "Create" %}
+      <div class="sticky-actions sticky-actions-footer d-print-none" data-sticky-position="full" data-sticky-when="always">
+        <div class="btn-list">
+          {% block buttons %}
+            <a href="{{ return_url }}" class="btn btn-outline-secondary">{% trans "Cancel" %}</a>
+            {% if object.pk %}
+              <button type="submit" name="_update" class="btn btn-primary">
+                {% trans "Save" %}
               </button>
-              <button type="submit" name="_addanother" class="btn btn-outline-primary btn-float">
-                {% trans "Create & Add Another" %}
-              </button>
-            </div>
-          {% endif %}
-        {% endblock buttons %}
+            {% else %}
+              <div class="btn-group" role="group" aria-label="{% trans "Actions" %}">
+                <button type="submit" name="_create" class="btn btn-primary">
+                  {% trans "Create" %}
+                </button>
+                <button type="submit" name="_addanother" class="btn btn-outline-primary">
+                  {% trans "Create & Add Another" %}
+                </button>
+              </div>
+            {% endif %}
+          {% endblock buttons %}
+        </div>
       </div>
     </form>
   </div>

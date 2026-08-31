@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
 
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
@@ -534,6 +536,37 @@ class LocationTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
 
+class RackGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = RackGroup.objects.all()
+    filterset = RackGroupFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+
+        rack_groups = (
+            RackGroup(name='Rack Group 1', slug='rack-group-1', description='foobar1'),
+            RackGroup(name='Rack Group 2', slug='rack-group-2', description='foobar2'),
+            RackGroup(name='Rack Group 3', slug='rack-group-3'),
+        )
+        RackGroup.objects.bulk_create(rack_groups)
+
+    def test_q(self):
+        params = {'q': 'foobar1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_name(self):
+        params = {'name': ['Rack Group 1', 'Rack Group 2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_slug(self):
+        params = {'slug': ['rack-group-1', 'rack-group-2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_description(self):
+        params = {'description': ['foobar1', 'foobar2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+
 class RackRoleTestCase(TestCase, ChangeLoggedFilterSetTests):
     queryset = RackRole.objects.all()
     filterset = RackRoleFilterSet
@@ -738,18 +771,18 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
         for region in regions:
             region.save()
 
-        groups = (
+        site_groups = (
             SiteGroup(name='Site Group 1', slug='site-group-1'),
             SiteGroup(name='Site Group 2', slug='site-group-2'),
             SiteGroup(name='Site Group 3', slug='site-group-3'),
         )
-        for group in groups:
-            group.save()
+        for site_group in site_groups:
+            site_group.save()
 
         sites = (
-            Site(name='Site 1', slug='site-1', region=regions[0], group=groups[0]),
-            Site(name='Site 2', slug='site-2', region=regions[1], group=groups[1]),
-            Site(name='Site 3', slug='site-3', region=regions[2], group=groups[2]),
+            Site(name='Site 1', slug='site-1', region=regions[0], group=site_groups[0]),
+            Site(name='Site 2', slug='site-2', region=regions[1], group=site_groups[1]),
+            Site(name='Site 3', slug='site-3', region=regions[2], group=site_groups[2]),
         )
         Site.objects.bulk_create(sites)
 
@@ -810,6 +843,13 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
         )
         RackType.objects.bulk_create(rack_types)
 
+        rack_groups = (
+            RackGroup(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup(name='Rack Group 2', slug='rack-group-2'),
+            RackGroup(name='Rack Group 3', slug='rack-group-3'),
+        )
+        RackGroup.objects.bulk_create(rack_groups)
+
         rack_roles = (
             RackRole(name='Rack Role 1', slug='rack-role-1'),
             RackRole(name='Rack Role 2', slug='rack-role-2'),
@@ -838,6 +878,7 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
                 facility_id='rack-1',
                 site=sites[0],
                 location=locations[0],
+                group=rack_groups[0],
                 tenant=tenants[0],
                 status=RackStatusChoices.STATUS_ACTIVE,
                 role=rack_roles[0],
@@ -862,6 +903,7 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
                 facility_id='rack-2',
                 site=sites[1],
                 location=locations[1],
+                group=rack_groups[1],
                 tenant=tenants[1],
                 status=RackStatusChoices.STATUS_PLANNED,
                 role=rack_roles[1],
@@ -886,6 +928,7 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
                 facility_id='rack-3',
                 site=sites[2],
                 location=locations[2],
+                group=rack_groups[2],
                 tenant=tenants[2],
                 status=RackStatusChoices.STATUS_RESERVED,
                 role=rack_roles[2],
@@ -1017,6 +1060,13 @@ class RackTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'location': [locations[0].slug, locations[1].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_rack_group(self):
+        rack_groups = RackGroup.objects.all()[:2]
+        params = {'group_id': [rack_groups[0].pk, rack_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'group': [rack_groups[0].slug, rack_groups[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
     def test_status(self):
         params = {'status': [RackStatusChoices.STATUS_ACTIVE, RackStatusChoices.STATUS_PLANNED]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
@@ -1095,18 +1145,18 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
         for region in regions:
             region.save()
 
-        groups = (
+        site_groups = (
             SiteGroup(name='Site Group 1', slug='site-group-1'),
             SiteGroup(name='Site Group 2', slug='site-group-2'),
             SiteGroup(name='Site Group 3', slug='site-group-3'),
         )
-        for group in groups:
-            group.save()
+        for site_group in site_groups:
+            site_group.save()
 
         sites = (
-            Site(name='Site 1', slug='site-1', region=regions[0], group=groups[0]),
-            Site(name='Site 2', slug='site-2', region=regions[1], group=groups[1]),
-            Site(name='Site 3', slug='site-3', region=regions[2], group=groups[2]),
+            Site(name='Site 1', slug='site-1', region=regions[0], group=site_groups[0]),
+            Site(name='Site 2', slug='site-2', region=regions[1], group=site_groups[1]),
+            Site(name='Site 3', slug='site-3', region=regions[2], group=site_groups[2]),
         )
         Site.objects.bulk_create(sites)
 
@@ -1118,10 +1168,17 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
         for location in locations:
             location.save()
 
+        rack_groups = (
+            RackGroup(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup(name='Rack Group 2', slug='rack-group-2'),
+            RackGroup(name='Rack Group 3', slug='rack-group-3'),
+        )
+        RackGroup.objects.bulk_create(rack_groups)
+
         racks = (
-            Rack(name='Rack 1', site=sites[0], location=locations[0]),
-            Rack(name='Rack 2', site=sites[1], location=locations[1]),
-            Rack(name='Rack 3', site=sites[2], location=locations[2]),
+            Rack(name='Rack 1', site=sites[0], location=locations[0], group=rack_groups[0]),
+            Rack(name='Rack 2', site=sites[1], location=locations[1], group=rack_groups[1]),
+            Rack(name='Rack 3', site=sites[2], location=locations[2], group=rack_groups[2]),
         )
         Rack.objects.bulk_create(racks)
 
@@ -1150,7 +1207,7 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
         reservations = (
             RackReservation(
                 rack=racks[0],
-                units=[1, 2, 3],
+                units=[1, 2],
                 status=RackReservationStatusChoices.STATUS_ACTIVE,
                 user=users[0],
                 tenant=tenants[0],
@@ -1158,7 +1215,7 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
             ),
             RackReservation(
                 rack=racks[1],
-                units=[4, 5, 6],
+                units=[1, 2, 3],
                 status=RackReservationStatusChoices.STATUS_PENDING,
                 user=users[1],
                 tenant=tenants[1],
@@ -1166,7 +1223,7 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
             ),
             RackReservation(
                 rack=racks[2],
-                units=[7, 8, 9],
+                units=[1, 2, 3, 4],
                 status=RackReservationStatusChoices.STATUS_STALE,
                 user=users[2],
                 tenant=tenants[2],
@@ -1207,6 +1264,13 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'location': [locations[0].slug, locations[1].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_rack_group(self):
+        rack_groups = RackGroup.objects.all()[:2]
+        params = {'group_id': [rack_groups[0].pk, rack_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'group': [rack_groups[0].slug, rack_groups[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
     def test_status(self):
         params = {'status': [RackReservationStatusChoices.STATUS_ACTIVE, RackReservationStatusChoices.STATUS_PENDING]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
@@ -1228,6 +1292,14 @@ class RackReservationTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_description(self):
         params = {'description': ['foobar1', 'foobar2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_unit_count(self):
+        params = {'unit_count_min': 3}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'unit_count_max': 3}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'unit_count_min': 3, 'unit_count_max': 3}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
     def test_tenant_group(self):
         tenant_groups = TenantGroup.objects.all()[:2]
@@ -1635,6 +1707,10 @@ class ModuleTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
             PortTemplateMapping(module_type=module_types[0], front_port=front_ports[0], rear_port=rear_ports[0]),
             PortTemplateMapping(module_type=module_types[1], front_port=front_ports[1], rear_port=rear_ports[1]),
         ])
+        ModuleBayTemplate.objects.bulk_create((
+            ModuleBayTemplate(module_type=module_types[0], name='Module Bay 1'),
+            ModuleBayTemplate(module_type=module_types[1], name='Module Bay 2'),
+        ))
 
     def test_q(self):
         params = {'q': 'foobar1'}
@@ -1693,6 +1769,12 @@ class ModuleTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'pass_through_ports': 'true'}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
         params = {'pass_through_ports': 'false'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_module_bays(self):
+        params = {'module_bays': 'true'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'module_bays': 'false'}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
     def test_weight(self):
@@ -2185,13 +2267,21 @@ class ModuleBayTemplateTestCase(TestCase, DeviceComponentTemplateFilterSetTests,
         ModuleBayTemplate.objects.bulk_create(
             (
                 ModuleBayTemplate(
-                    device_type=device_types[0], name='Module Bay 1', description='foobar1'
+                    device_type=device_types[0], name='Module Bay 1', enabled=True, description='foobar1'
                 ),
                 ModuleBayTemplate(
-                    device_type=device_types[1], name='Module Bay 2', description='foobar2', module_type=module_types[0]
+                    device_type=device_types[1],
+                    name='Module Bay 2',
+                    enabled=False,
+                    description='foobar2',
+                    module_type=module_types[0],
                 ),
                 ModuleBayTemplate(
-                    device_type=device_types[2], name='Module Bay 3', description='foobar3', module_type=module_types[1]
+                    device_type=device_types[2],
+                    name='Module Bay 3',
+                    enabled=True,
+                    description='foobar3',
+                    module_type=module_types[1],
                 ),
             )
         )
@@ -2199,6 +2289,12 @@ class ModuleBayTemplateTestCase(TestCase, DeviceComponentTemplateFilterSetTests,
     def test_name(self):
         params = {'name': ['Module Bay 1', 'Module Bay 2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_enabled(self):
+        params = {'enabled': True}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'enabled': False}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
     def test_module_type(self):
         module_types = ModuleType.objects.all()[:2]
@@ -2222,15 +2318,29 @@ class DeviceBayTemplateTestCase(TestCase, DeviceComponentTemplateFilterSetTests,
         )
         DeviceType.objects.bulk_create(device_types)
 
-        DeviceBayTemplate.objects.bulk_create((
-            DeviceBayTemplate(device_type=device_types[0], name='Device Bay 1', description='foobar1'),
-            DeviceBayTemplate(device_type=device_types[1], name='Device Bay 2', description='foobar2'),
-            DeviceBayTemplate(device_type=device_types[2], name='Device Bay 3', description='foobar3'),
-        ))
+        DeviceBayTemplate.objects.bulk_create(
+            (
+                DeviceBayTemplate(
+                    device_type=device_types[0], name='Device Bay 1', enabled=True, description='foobar1'
+                ),
+                DeviceBayTemplate(
+                    device_type=device_types[1], name='Device Bay 2', enabled=False, description='foobar2'
+                ),
+                DeviceBayTemplate(
+                    device_type=device_types[2], name='Device Bay 3', enabled=True, description='foobar3'
+                ),
+            )
+        )
 
     def test_name(self):
         params = {'name': ['Device Bay 1', 'Device Bay 2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_enabled(self):
+        params = {'enabled': True}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'enabled': False}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
 
 class InventoryItemTemplateTestCase(TestCase, DeviceComponentTemplateFilterSetTests, ChangeLoggedFilterSetTests):
@@ -3085,6 +3195,11 @@ class ModuleTestCase(TestCase, ChangeLoggedFilterSetTests):
             Manufacturer(name='Manufacturer 3', slug='manufacturer-3'),
         )
         Manufacturer.objects.bulk_create(manufacturers)
+        module_type_profiles = (
+            ModuleTypeProfile(name='Test CPU'),
+            ModuleTypeProfile(name='Test Hard disk'),
+        )
+        ModuleTypeProfile.objects.bulk_create(module_type_profiles)
 
         device_types = (
             DeviceType(manufacturer=manufacturers[0], model='Device Type 1', slug='device-type-1'),
@@ -3148,8 +3263,8 @@ class ModuleTestCase(TestCase, ChangeLoggedFilterSetTests):
         Device.objects.bulk_create(devices)
 
         module_types = (
-            ModuleType(manufacturer=manufacturers[0], model='Module Type 1'),
-            ModuleType(manufacturer=manufacturers[1], model='Module Type 2'),
+            ModuleType(manufacturer=manufacturers[0], model='Module Type 1', profile=module_type_profiles[0]),
+            ModuleType(manufacturer=manufacturers[1], model='Module Type 2', profile=module_type_profiles[1]),
             ModuleType(manufacturer=manufacturers[2], model='Module Type 3'),
         )
         ModuleType.objects.bulk_create(module_types)
@@ -3264,6 +3379,19 @@ class ModuleTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
         params = {'module_type': [module_types[0].model, module_types[1].model]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
+
+    def test_profile(self):
+        profiles = ModuleTypeProfile.objects.filter(name__startswith='Test').order_by('name')
+        params = {'profile_id': [profiles[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'profile': [profiles[0].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'profile_id': [profiles[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'profile': [profiles[1].name]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'profile_id': [settings.FILTERS_NULL_CHOICE_VALUE]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
     def test_description(self):
         params = {'description': ['foobar1', 'foobar2']}
@@ -4514,6 +4642,11 @@ class InterfaceTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
         )
         Device.objects.bulk_create(devices)
 
+        # Expose base devices for regression tests which need custom cabling
+        # topologies.
+        cls.connection_filter_device = devices[0]
+        cls.connection_filter_peer_device = devices[1]
+
         virtual_chassis.master = devices[0]
         virtual_chassis.save()
 
@@ -4946,6 +5079,117 @@ class InterfaceTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
         params = {'connected': False}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_connected_excludes_incomplete_pass_through_path(self):
+        """
+        Validate that connected=true requires a complete cable path, not merely
+        an active cable path.
+
+        The incomplete path below models:
+
+            interface -- front port -- rear port
+
+        with no onward cable from the rear port.
+        """
+        device = self.connection_filter_device
+        peer_device = self.connection_filter_peer_device
+
+        connected_interface = Interface.objects.create(
+            device=device,
+            name='Connected Filter Interface',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+        )
+        connected_peer_interface = Interface.objects.create(
+            device=peer_device,
+            name='Connected Filter Peer Interface',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+        )
+        incomplete_path_interface = Interface.objects.create(
+            device=device,
+            name='Connected Filter Incomplete Path Interface',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+        )
+
+        patch_panel = Device.objects.create(
+            name='Connected Filter Patch Panel',
+            site=device.site,
+            device_type=device.device_type,
+            role=device.role,
+        )
+        rear_port = RearPort.objects.create(
+            device=patch_panel,
+            name='Patch Rear Port',
+            type=PortTypeChoices.TYPE_8P8C,
+            positions=1,
+        )
+        front_port = FrontPort.objects.create(
+            device=patch_panel,
+            name='Patch Front Port',
+            type=PortTypeChoices.TYPE_8P8C,
+        )
+        PortMapping.objects.create(
+            device=patch_panel,
+            front_port=front_port,
+            front_port_position=1,
+            rear_port=rear_port,
+            rear_port_position=1,
+        )
+
+        Cable(
+            a_terminations=[connected_interface],
+            b_terminations=[connected_peer_interface],
+        ).save()
+        Cable(
+            a_terminations=[incomplete_path_interface],
+            b_terminations=[front_port],
+        ).save()
+
+        connected_interface.refresh_from_db()
+        connected_peer_interface.refresh_from_db()
+        incomplete_path_interface.refresh_from_db()
+
+        self.assertTrue(connected_interface._path.is_active)
+        self.assertTrue(connected_interface._path.is_complete)
+        self.assertTrue(connected_peer_interface._path.is_active)
+        self.assertTrue(connected_peer_interface._path.is_complete)
+
+        self.assertTrue(incomplete_path_interface._path.is_active)
+        self.assertFalse(incomplete_path_interface._path.is_complete)
+
+        queryset = self.queryset.filter(
+            pk__in=(
+                connected_interface.pk,
+                connected_peer_interface.pk,
+                incomplete_path_interface.pk,
+            )
+        )
+
+        params = {'cabled': 'true'}
+        self.assertSetEqual(
+            set(self.filterset(params, queryset).qs.values_list('pk', flat=True)),
+            {
+                connected_interface.pk,
+                connected_peer_interface.pk,
+                incomplete_path_interface.pk,
+            },
+        )
+
+        params = {'connected': 'true'}
+        self.assertSetEqual(
+            set(self.filterset(params, queryset).qs.values_list('pk', flat=True)),
+            {
+                connected_interface.pk,
+                connected_peer_interface.pk,
+            },
+        )
+
+        params = {'connected': 'false'}
+        self.assertSetEqual(
+            set(self.filterset(params, queryset).qs.values_list('pk', flat=True)),
+            {
+                incomplete_path_interface.pk,
+            },
+        )
 
     def test_kind(self):
         params = {'kind': 'physical'}
@@ -5716,11 +5960,11 @@ class ModuleBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
         Device.objects.bulk_create(devices)
 
         module_bays = (
-            ModuleBay(device=devices[0], name='Module Bay 1', label='A', description='First'),
-            ModuleBay(device=devices[1], name='Module Bay 2', label='B', description='Second'),
-            ModuleBay(device=devices[2], name='Module Bay 3', label='C', description='Third'),
-            ModuleBay(device=devices[2], name='Module Bay 4', label='D', description='Fourth'),
-            ModuleBay(device=devices[2], name='Module Bay 5', label='E', description='Fifth'),
+            ModuleBay(device=devices[0], name='Module Bay 1', label='A', enabled=True, description='First'),
+            ModuleBay(device=devices[1], name='Module Bay 2', label='B', enabled=False, description='Second'),
+            ModuleBay(device=devices[2], name='Module Bay 3', label='C', enabled=True, description='Third'),
+            ModuleBay(device=devices[2], name='Module Bay 4', label='D', enabled=False, description='Fourth'),
+            ModuleBay(device=devices[2], name='Module Bay 5', label='E', enabled=True, description='Fifth'),
         )
         for module_bay in module_bays:
             module_bay.save()
@@ -5742,6 +5986,12 @@ class ModuleBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
 
     def test_label(self):
         params = {'label': ['A', 'B']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_enabled(self):
+        params = {'enabled': True}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'enabled': False}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_description(self):
@@ -5903,6 +6153,7 @@ class DeviceBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
                 device=devices[0],
                 name='Device Bay 1',
                 label='A',
+                enabled=True,
                 description='First',
                 _site=devices[0].site,
                 _location=devices[0].location,
@@ -5912,6 +6163,7 @@ class DeviceBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
                 device=devices[1],
                 name='Device Bay 2',
                 label='B',
+                enabled=False,
                 description='Second',
                 _site=devices[1].site,
                 _location=devices[1].location,
@@ -5921,6 +6173,7 @@ class DeviceBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
                 device=devices[2],
                 name='Device Bay 3',
                 label='C',
+                enabled=True,
                 description='Third',
                 _site=devices[2].site,
                 _location=devices[2].location,
@@ -5936,6 +6189,12 @@ class DeviceBayTestCase(TestCase, DeviceComponentFilterSetTests, ChangeLoggedFil
     def test_label(self):
         params = {'label': ['A', 'B']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_enabled(self):
+        params = {'enabled': True}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'enabled': False}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
     def test_description(self):
         params = {'description': ['First', 'Second']}
@@ -6409,6 +6668,32 @@ class VirtualChassisTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
+class CableBundleTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = CableBundle.objects.all()
+    filterset = CableBundleFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        cable_bundles = (
+            CableBundle(name='Cable Bundle 1', description='foobar1'),
+            CableBundle(name='Cable Bundle 2', description='foobar2'),
+            CableBundle(name='Cable Bundle 3'),
+        )
+        CableBundle.objects.bulk_create(cable_bundles)
+
+    def test_q(self):
+        params = {'q': 'foobar1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_name(self):
+        params = {'name': ['Cable Bundle 1', 'Cable Bundle 2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_description(self):
+        params = {'description': ['foobar1', 'foobar2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+
 class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
     queryset = Cable.objects.all()
     filterset = CableFilterSet
@@ -6539,6 +6824,13 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
         circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
         circuit = Circuit.objects.create(cid='Circuit 1', provider=provider, type=circuit_type)
         circuit_termination = CircuitTermination.objects.create(circuit=circuit, term_side='A', termination=sites[0])
+        circuit2 = Circuit.objects.create(cid='Circuit 2', provider=provider, type=circuit_type)
+        circuit_termination_a = CircuitTermination.objects.create(
+            circuit=circuit2, term_side='A', termination=sites[0]
+        )
+        circuit_termination_z = CircuitTermination.objects.create(
+            circuit=circuit2, term_side='Z', termination=locations[0]
+        )
 
         # Cables
         cables = (
@@ -6645,6 +6937,11 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
                 a_terminations=[circuit_termination],
                 label='Cable 14'
             ),
+            Cable(
+                a_terminations=[circuit_termination_a],
+                b_terminations=[circuit_termination_z],
+                label='Cable 15'
+            ),
         )
         for cable in cables:
             cable.save()
@@ -6669,13 +6966,13 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'type': [CableTypeChoices.TYPE_CAT3, CableTypeChoices.TYPE_CAT5E]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
         params = {'type__empty': 'true'}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 8)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 9)
         params = {'type__empty': 'false'}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
 
     def test_status(self):
         params = {'status': [LinkStatusChoices.STATUS_CONNECTED]}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 11)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 12)
         params = {'status': [LinkStatusChoices.STATUS_PLANNED]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
@@ -6704,16 +7001,16 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_location(self):
         locations = Location.objects.all()[:2]
         params = {'location_id': [locations[0].pk, locations[1].pk]}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 11)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 12)
         params = {'location': [locations[0].name, locations[1].name]}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 11)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 12)
 
     def test_site(self):
         site = Site.objects.all()[:2]
         params = {'site_id': [site[0].pk, site[1].pk]}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 11)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 13)
         params = {'site': [site[0].slug, site[1].slug]}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 11)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 13)
 
     def test_tenant(self):
         tenant = Tenant.objects.all()[:2]
@@ -6741,7 +7038,7 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'unterminated': True}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 8)
         params = {'unterminated': False}
-        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)
 
     def test_consoleport(self):
         params = {'consoleport_id': [ConsolePort.objects.first().pk]}
@@ -6774,6 +7071,96 @@ class CableTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_circuittermination(self):
         params = {'circuittermination_id': [CircuitTermination.objects.first().pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+
+class CableTerminationTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = CableTermination.objects.all()
+    filterset = CableTerminationFilterSet
+    ignore_fields = ('connector', 'positions')
+    filter_name_map = {
+        'consoleport': 'consoleport_id',
+        'consoleserverport': 'consoleserverport_id',
+        'powerport': 'powerport_id',
+        'poweroutlet': 'poweroutlet_id',
+        'interface': 'interface_id',
+        'frontport': 'frontport_id',
+        'rearport': 'rearport_id',
+        'powerfeed': 'powerfeed_id',
+        'circuittermination': 'circuittermination_id',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        site = Site.objects.create(name='Site 1', slug='site-1')
+        device = create_test_device('Device 1', site=site)
+
+        cls.interfaces = [
+            Interface(device=device, name=f'eth{i}', type=InterfaceTypeChoices.TYPE_1GE_FIXED)
+            for i in range(4)
+        ]
+        Interface.objects.bulk_create(cls.interfaces)
+
+        cls.consoleport = ConsolePort.objects.create(device=device, name='Console Port 1')
+        cls.consoleserverport = ConsoleServerPort.objects.create(device=device, name='Console Server Port 1')
+        cls.powerport = PowerPort.objects.create(device=device, name='Power Port 1')
+        cls.poweroutlet = PowerOutlet.objects.create(device=device, name='Power Outlet 1')
+        cls.rearport = RearPort.objects.create(device=device, name='Rear Port 1', type=PortTypeChoices.TYPE_8P8C)
+        cls.frontport = FrontPort.objects.create(device=device, name='Front Port 1', type=PortTypeChoices.TYPE_8P8C)
+        PortMapping.objects.create(device=device, front_port=cls.frontport, rear_port=cls.rearport)
+
+        power_panel = PowerPanel.objects.create(name='Power Panel 1', site=site)
+        cls.powerfeed = PowerFeed.objects.create(name='Power Feed 1', power_panel=power_panel)
+
+        provider = Provider.objects.create(name='Provider 1', slug='provider-1')
+        circuit_type = CircuitType.objects.create(name='Circuit Type 1', slug='circuit-type-1')
+        circuit = Circuit.objects.create(cid='Circuit 1', provider=provider, type=circuit_type)
+        cls.circuittermination = CircuitTermination.objects.create(
+            circuit=circuit, term_side='A', termination=site,
+        )
+
+        # Two bipartite interface cables (4 CableTerminations) plus one single-end cable per
+        # non-Interface component (8 CableTerminations).
+        cables = [
+            Cable(a_terminations=[cls.interfaces[0]], b_terminations=[cls.interfaces[1]], label='Cable 1'),
+            Cable(a_terminations=[cls.interfaces[2]], b_terminations=[cls.interfaces[3]], label='Cable 2'),
+        ]
+        for component in (
+            cls.consoleport, cls.consoleserverport, cls.powerport, cls.poweroutlet,
+            cls.rearport, cls.frontport, cls.powerfeed, cls.circuittermination,
+        ):
+            cables.append(Cable(a_terminations=[component], label=f'Cable for {component._meta.model_name}'))
+        for cable in cables:
+            cable.save()
+
+    def test_cable(self):
+        """Filter CableTerminations by cable ID."""
+        cables = Cable.objects.all()[:2]
+        params = {'cable_id': [cables[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'cable_id': [cables[0].pk, cables[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+
+    def test_termination_object_filters(self):
+        """Each <component>_id filter resolves to only matching terminations."""
+        cases = (
+            ('consoleport_id', ConsolePort, self.consoleport),
+            ('consoleserverport_id', ConsoleServerPort, self.consoleserverport),
+            ('powerport_id', PowerPort, self.powerport),
+            ('poweroutlet_id', PowerOutlet, self.poweroutlet),
+            ('interface_id', Interface, self.interfaces[0]),
+            ('frontport_id', FrontPort, self.frontport),
+            ('rearport_id', RearPort, self.rearport),
+            ('powerfeed_id', PowerFeed, self.powerfeed),
+            ('circuittermination_id', CircuitTermination, self.circuittermination),
+        )
+        for filter_name, model, obj in cases:
+            with self.subTest(filter_name=filter_name):
+                ct = ContentType.objects.get_for_model(model)
+                params = {filter_name: [obj.pk]}
+                results = self.filterset(params, self.queryset).qs
+                self.assertEqual(results.count(), 1)
+                self.assertEqual(results.first().termination_type, ct)
+                self.assertEqual(results.first().termination_id, obj.pk)
 
 
 class PowerPanelTestCase(TestCase, ChangeLoggedFilterSetTests):

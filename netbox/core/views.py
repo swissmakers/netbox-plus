@@ -3,17 +3,21 @@ import platform
 from copy import deepcopy
 
 from django import __version__ as django_version
+from django.apps import apps as django_apps_registry
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.mixins import UserPassesTestMixin
 from django.core.cache import cache
-from django.db import ProgrammingError, connection
+from django.db import DatabaseError, connection
 from django.http import Http404, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils.decorators import method_decorator
+from django.utils.http import content_disposition_header
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.cache import never_cache
 from django.views.generic import View
-from django_rq.queues import get_connection, get_queue_by_index, get_redis_connection
+from django_rq.queues import get_queue_by_index, get_redis_connection
 from django_rq.settings import get_queues_list, get_queues_map
 from django_rq.utils import get_statistics
 from rq.exceptions import NoSuchJobError
@@ -22,15 +26,22 @@ from rq.job import JobStatus as RQJobStatus
 from rq.worker import Worker
 from rq.worker_registration import clean_worker_registry
 
-from core.utils import delete_rq_job, enqueue_rq_job, get_rq_jobs_from_status, requeue_rq_job, stop_rq_job
+from core.utils import (
+    delete_rq_job,
+    enqueue_rq_job,
+    get_db_schema,
+    get_rq_jobs_from_status,
+    requeue_rq_job,
+    stop_rq_job,
+)
 from extras.ui.panels import CustomFieldsPanel, TagsPanel
 from netbox.config import PARAMS, get_config
 from netbox.object_actions import AddObject, BulkDelete, BulkExport, DeleteObject
+from netbox.plugins import PluginConfig
 from netbox.plugins.utils import get_installed_plugins
 from netbox.ui import layout
 from netbox.ui.panels import (
     CommentsPanel,
-    ContextTablePanel,
     JSONPanel,
     ObjectsTablePanel,
     PluginContentPanel,
@@ -48,6 +59,7 @@ from utilities.htmx import htmx_partial
 from utilities.querydict import normalize_querydict
 from utilities.json import ConfigJSONEncoder
 from utilities.query import count_related
+from utilities.rqworker import get_all_workers
 from utilities.views import (
     ContentTypePermissionRequiredMixin,
     GetRelatedModelsMixin,
@@ -96,6 +108,7 @@ class DataSourceView(GetRelatedModelsMixin, generic.ObjectView):
             ObjectsTablePanel(
                 model='core.DataFile',
                 filters={'source_id': lambda ctx: ctx['object'].pk},
+                exclude_columns=['source'],
             ),
         ],
     )
@@ -186,6 +199,7 @@ class DataFileListView(generic.ObjectListView):
 
 
 @register_model_view(DataFile)
+@method_decorator(never_cache, name='dispatch')
 class DataFileView(generic.ObjectView):
     queryset = DataFile.objects.all()
     actions = (DeleteObject,)
@@ -194,6 +208,12 @@ class DataFileView(generic.ObjectView):
             layout.Column(
                 panels.DataFilePanel(),
                 panels.DataFileContentPanel(),
+                PluginContentPanel('left_page'),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
             ),
         ),
     )
@@ -254,17 +274,37 @@ class JobLogView(generic.ObjectView):
     layout = layout.Layout(
         layout.Row(
             layout.Column(
-                ContextTablePanel('table', title=_('Log Entries')),
+                TemplatePanel('core/job/log_entries.html', title=_('Log Entries')),
+                PluginContentPanel('left_page'),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
             ),
         ),
     )
 
-    def get_extra_context(self, request, instance):
+    def get_table(self, request, instance):
         table = JobLogEntryTable(instance.log_entries)
+        table.embedded = True
+        table.htmx_url = reverse('core:job_log', kwargs={'pk': instance.pk})
         table.configure(request)
+        return table
+
+    def get_extra_context(self, request, instance):
         return {
-            'table': table,
+            'table': self.get_table(request, instance),
         }
+
+    def get(self, request, **kwargs):
+        if htmx_partial(request):
+            instance = self.get_object(**kwargs)
+            return render(request, 'htmx/table.html', {
+                'object': instance,
+                'table': self.get_table(request, instance),
+            })
+        return super().get(request, **kwargs)
 
 
 @register_model_view(Job, 'delete')
@@ -351,17 +391,14 @@ class ObjectChangeView(generic.ObjectView):
             prechange_data = instance.prechange_data_clean
 
         if prechange_data and instance.postchange_data:
-            diff_added = shallow_compare_dict(
-                prechange_data or dict(),
-                instance.postchange_data_clean or dict(),
+            diff_added, diff_removed = deep_compare_dict(
+                prechange_data,
+                instance.postchange_data_clean,
                 exclude=['last_updated'],
             )
-            diff_removed = {
-                x: prechange_data.get(x) for x in diff_added
-            } if prechange_data else {}
         else:
-            diff_added = None
-            diff_removed = None
+            diff_added = {}
+            diff_removed = {}
 
         return {
             'diff_added': diff_added,
@@ -395,6 +432,12 @@ class ConfigRevisionView(generic.ObjectView):
             layout.Column(
                 TemplatePanel('core/panels/configrevision_data.html'),
                 TemplatePanel('core/panels/configrevision_comment.html'),
+                PluginContentPanel('left_page'),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
             ),
         ),
     )
@@ -688,14 +731,13 @@ class WorkerView(BaseRQView):
 # System
 #
 
+
 class SystemView(UserPassesTestMixin, View):
 
     def test_func(self):
         return self.request.user.is_superuser
 
-    def get(self, request):
-
-        # System status
+    def _get_stats(self):
         psql_version = db_name = db_size = None
         try:
             with connection.cursor() as cursor:
@@ -704,37 +746,37 @@ class SystemView(UserPassesTestMixin, View):
                 psql_version = psql_version.split('(')[0].strip()
                 cursor.execute("SELECT current_database()")
                 db_name = cursor.fetchone()[0]
-                cursor.execute(f"SELECT pg_size_pretty(pg_database_size('{db_name}'))")
+                cursor.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
                 db_size = cursor.fetchone()[0]
-        except (ProgrammingError, IndexError):
+        except (DatabaseError, IndexError):
             pass
-        stats = {
+        return {
             'netbox_release': settings.RELEASE,
             'django_version': django_version,
             'python_version': platform.python_version(),
             'postgresql_version': psql_version,
             'database_name': db_name,
             'database_size': db_size,
-            'rq_worker_count': Worker.count(get_connection('default')),
+            'rq_worker_count': len(get_all_workers()),
         }
 
-        # Django apps
-        django_apps = get_installed_apps()
-
-        # Configuration
-        config = get_config()
-
-        # Plugins
-        plugins = get_installed_plugins()
-
-        # Object counts
+    def _get_object_counts(self):
         objects = {}
         for ot in ObjectType.objects.public().order_by('app_label', 'model'):
             if model := ot.model_class():
                 objects[ot] = model.objects.count()
+        return objects
+
+    def get(self, request):
+        stats = self._get_stats()
+        django_apps = get_installed_apps()
+        config = get_config()
+        plugins = get_installed_plugins()
+        objects = self._get_object_counts()
 
         # Raw data export
         if 'export' in request.GET:
+            db_schema = get_db_schema()
             stats['netbox_release'] = stats['netbox_release'].asdict()
             params = [param.name for param in PARAMS]
             data = {
@@ -747,9 +789,15 @@ class SystemView(UserPassesTestMixin, View):
                 'objects': {
                     f'{ot.app_label}.{ot.model}': count for ot, count in objects.items()
                 },
+                'db_schema': {
+                    table['name']: {
+                        'columns': table['columns'],
+                        'indexes': table['indexes'],
+                    } for table in db_schema
+                },
             }
             response = HttpResponse(json.dumps(data, cls=ConfigJSONEncoder, indent=4), content_type='text/json')
-            response['Content-Disposition'] = 'attachment; filename="netbox.json"'
+            response['Content-Disposition'] = content_disposition_header(as_attachment=True, filename='netbox.json')
             return response
 
         # Serialize any JSON-based classes
@@ -763,6 +811,61 @@ class SystemView(UserPassesTestMixin, View):
             'config': config,
             'plugins': plugins,
             'objects': objects,
+        })
+
+
+class SystemDBSchemaView(UserPassesTestMixin, View):
+
+    def test_func(self):
+        return self.request.user.is_superuser
+
+    @staticmethod
+    def _get_db_schema_groups(db_schema):
+        plugin_app_labels = {
+            app_config.label
+            for app_config in django_apps_registry.get_app_configs()
+            if isinstance(app_config, PluginConfig)
+        }
+        # Sort longest-first so "netbox_branching" matches before "netbox"
+        sorted_plugin_labels = sorted(plugin_app_labels, key=len, reverse=True)
+        groups = {}
+        for table in db_schema:
+            matched_plugin = next(
+                (label for label in sorted_plugin_labels if table['name'].startswith(label + '_')),
+                None,
+            )
+            if matched_plugin:
+                prefix = matched_plugin
+            elif '_' in table['name']:
+                prefix = table['name'].split('_')[0]
+            else:
+                prefix = 'other'
+            groups.setdefault(prefix, []).append(table)
+        return sorted(
+            [
+                {
+                    'name': name,
+                    'tables': tables,
+                    'index_count': sum(len(t['indexes']) for t in tables),
+                    'is_plugin': name in plugin_app_labels,
+                }
+                for name, tables in groups.items()
+            ],
+            key=lambda g: (g['is_plugin'], g['name']),
+        )
+
+    def get(self, request):
+        db_schema = get_db_schema()
+        db_schema_groups = self._get_db_schema_groups(db_schema)
+        db_schema_stats = {
+            'total_tables': len(db_schema),
+            'total_columns': sum(len(t['columns']) for t in db_schema),
+            'total_indexes': sum(len(t['indexes']) for t in db_schema),
+        }
+        return render(request, 'core/htmx/system_db_schema.html', {
+            'db_schema': db_schema,
+            'db_schema_groups': db_schema_groups,
+            'db_schema_stats': db_schema_stats,
         })
 
 

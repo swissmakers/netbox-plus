@@ -26,6 +26,7 @@ from netbox.config import ConfigItem
 from netbox.models import NestedGroupModel, OrganizationalModel, PrimaryModel
 from netbox.models.features import ContactsMixin, ImageAttachmentsMixin
 from netbox.models.mixins import WeightMixin
+from utilities.exceptions import AbortRequest
 from utilities.fields import ColorField, CounterCacheField
 from utilities.prefetch import get_prefetchable_fields
 from utilities.tracking import TrackingModelMixin
@@ -745,6 +746,9 @@ class Device(
 
     class Meta:
         ordering = ('name', 'pk')  # Name may be null
+        indexes = (
+            models.Index(fields=('name', 'id')),  # Default ordering
+        )
         constraints = (
             models.UniqueConstraint(
                 Lower('name'), 'site', 'tenant',
@@ -767,6 +771,9 @@ class Device(
         )
         verbose_name = _('device')
         verbose_name_plural = _('devices')
+        permissions = [
+            ('render_config', 'Render configuration'),
+        ]
 
     def __str__(self):
         if self.label and self.asset_tag:
@@ -939,7 +946,7 @@ class Device(
         if self.cluster and self.cluster._location is not None and self.cluster._location != self.location:
             raise ValidationError({
                 'cluster': _("The assigned cluster belongs to a different location ({location})").format(
-                    site=self.cluster._location
+                    location=self.cluster._location
                 )
             })
 
@@ -957,6 +964,20 @@ class Device(
                 ).format(virtual_chassis=self.vc_master_for)
             })
 
+    def _check_duplicate_component_names(self, components):
+        """
+        Check for duplicate component names after resolving {vc_position} placeholders.
+        Raises AbortRequest if duplicates are found.
+        """
+        names = [c.name for c in components]
+        duplicates = {n for n in names if names.count(n) > 1}
+        if duplicates:
+            raise AbortRequest(
+                _("Component name conflict after resolving {{vc_position}}: {names}").format(
+                    names=', '.join(duplicates)
+                )
+            )
+
     def _instantiate_components(self, queryset, bulk_create=True):
         """
         Instantiate components for the device from the specified component templates.
@@ -966,11 +987,16 @@ class Device(
                          (default). Otherwise, save() will be called on each instance individually.
         """
         model = queryset.model.component_model
+        using = self._state.db
 
         if bulk_create:
             components = [obj.instantiate(device=self) for obj in queryset]
             if not components:
                 return
+
+            # Check for duplicate names after resolution {vc_position}
+            self._check_duplicate_component_names(components)
+
             # Set default values for any applicable custom fields
             if cf_defaults := CustomField.objects.get_defaults_for_model(model):
                 for component in components:
@@ -980,7 +1006,7 @@ class Device(
                 component._site = self.site
                 component._location = self.location
                 component._rack = self.rack
-            components = model.objects.bulk_create(components)
+            components = model.objects.using(using).bulk_create(components)
             # Prefetch related objects to minimize queries needed during post_save
             prefetch_fields = get_prefetchable_fields(model)
             prefetch_related_objects(components, *prefetch_fields)
@@ -991,16 +1017,22 @@ class Device(
                     instance=component,
                     created=True,
                     raw=False,
-                    using='default',
+                    using=using,
                     update_fields=None
                 )
         else:
-            for obj in queryset:
-                component = obj.instantiate(device=self)
+            components = [obj.instantiate(device=self) for obj in queryset]
+            if not components:
+                return
+
+            # Check for duplicate names after resolution {vc_position}
+            self._check_duplicate_component_names(components)
+
+            for component in components:
                 # Set default values for any applicable custom fields
                 if cf_defaults := CustomField.objects.get_defaults_for_model(model):
                     component.custom_field_data = cf_defaults
-                component.save()
+                component.save(using=using)
 
     def save(self, *args, **kwargs):
         is_new = not bool(self.pk)
@@ -1168,6 +1200,9 @@ class VirtualChassis(PrimaryModel):
 
     class Meta:
         ordering = ['name']
+        indexes = (
+            models.Index(fields=('name',)),  # Default ordering
+        )
         verbose_name = _('virtual chassis')
         verbose_name_plural = _('virtual chassis')
 
@@ -1195,10 +1230,13 @@ class VirtualChassis(PrimaryModel):
             lag__device=F('device')
         )
         if interfaces:
-            raise ProtectedError(_(
-                "Unable to delete virtual chassis {self}. There are member interfaces which form a cross-chassis LAG "
-                "interfaces."
-            ).format(self=self, interfaces=InterfaceSpeedChoices))
+            raise ProtectedError(
+                _(
+                    "Unable to delete virtual chassis {virtual_chassis}. One or more member interfaces form a "
+                    "cross-chassis LAG."
+                ).format(virtual_chassis=self),
+                set(interfaces),
+            )
 
         # Clear vc_position and vc_priority on member devices BEFORE calling super().delete()
         # This must be done here because on_delete=SET_NULL executes before pre_delete signal
@@ -1274,6 +1312,9 @@ class VirtualDeviceContext(PrimaryModel):
                 name='%(app_label)s_%(class)s_device_name'
             ),
         )
+        indexes = (
+            models.Index(fields=('name',)),  # Default ordering
+        )
         verbose_name = _('virtual device context')
         verbose_name_plural = _('virtual device contexts')
 
@@ -1340,6 +1381,7 @@ class MACAddress(PrimaryModel):
     class Meta:
         ordering = ('mac_address', 'pk')
         indexes = (
+            models.Index(fields=('mac_address', 'id')),  # Default ordering
             models.Index(fields=('assigned_object_type', 'assigned_object_id')),
         )
         verbose_name = _('MAC address')

@@ -1,9 +1,24 @@
 // Navbar and light theme styling
 .navbar-vertical.navbar-expand-lg {
+  // Tabler forces `overflow-y: scroll` on the vertical navbar, which renders a
+  // permanent scrollbar in Chromium browsers even when scrolling isn't needed.
+  // Use `auto` so the scrollbar only appears when the menu overflows.
+  @include media-breakpoint-up(lg) {
+    overflow-y: auto;
+  }
+
+  // Render the <button> menu headings identically to the surrounding nav links
+  .navbar-collapse .nav-item.dropdown > button.nav-link {
+    width: 100%;
+    background-color: transparent;
+    border: 0;
+    text-align: left;
+  }
 
   // Adjust hover color & style for menu items
   .navbar-collapse {
-    .nav-link-icon, .nav-link-title {
+    .nav-link-icon,
+    .nav-link-title {
       color: $rich-black;
     }
     .text-secondary {
@@ -11,27 +26,27 @@
     }
 
     .dropdown-menu {
-
       // Adjust hover color & style for menu items
       .dropdown-item {
-        a {
+        > a {
           color: $rich-black;
         }
-        .btn-group {
+        .dropdown-item-buttons {
           visibility: hidden;
         }
 
         // Style menu item hover/active state
-        &:hover, &.active {
+        &:hover,
+        &.active,
+        &:focus-within {
           background-color: var(--tblr-navbar-active-bg);
-          a {
+          > a {
             text-decoration: none;
           }
-          .btn-group {
+          .dropdown-item-buttons {
             visibility: visible;
           }
         }
-
       }
     }
   }
@@ -43,7 +58,6 @@
 
   // Logo text for non-community editions
   .navbar-brand {
-
     // Reduce logo padding on mobile view
     @include media-breakpoint-down(lg) {
       padding: 0.2rem 0;
@@ -58,9 +72,9 @@
   img.motif {
     bottom: 0;
     display: none;
-    left:0;
-    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.00) 0%, rgba(0, 0, 0, 0.30) 100%);
-    opacity: .5;
+    left: 0;
+    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.3) 100%);
+    opacity: 0.5;
     position: fixed;
     user-drag: none;
     user-select: none;
@@ -68,7 +82,7 @@
     -webkit-user-drag: none;
     -webkit-user-select: none;
     -ms-user-select: none;
-    width:18rem;
+    width: 18rem;
 
     @include media-breakpoint-up(lg) {
       display: block;
@@ -77,32 +91,34 @@
 }
 
 // Light theme styling
-html[data-bs-theme=light] .navbar-vertical.navbar-expand-lg {
+html[data-bs-theme='light'] .navbar-vertical.navbar-expand-lg {
   // Background Gradient
-  background: linear-gradient(180deg, rgba(0, 133, 125, 0.00) 0%, rgba(0, 133, 125, 0.10) 100%), #FFF;
+  background: linear-gradient(180deg, rgba(0, 133, 125, 0) 0%, rgba(0, 133, 125, 0.1) 100%), #fff;
 }
 
 // Dark theme styling
-html[data-bs-theme=dark] .navbar-vertical.navbar-expand-lg {
-
+html[data-bs-theme='dark'] .navbar-vertical.navbar-expand-lg {
   // Background Gradient
-  background: linear-gradient(180deg, rgba(0, 242, 212, 0.00) 0%, rgba(0, 242, 212, 0.10) 100%), #001423;
+  background:
+    linear-gradient(180deg, rgba(0, 242, 212, 0) 0%, rgba(0, 242, 212, 0.1) 100%), #001423;
 
   // Border color for active dropdown list
   .nav-item.dropdown.active:after {
     border-color: $bright-teal !important;
   }
 
-  .nav-link-title, .nav-link-icon {
+  .nav-link-title,
+  .nav-link-icon {
     color: white !important;
   }
 
   // Adjust hover color & style for menu items
   .dropdown-item {
-    a {
+    > a {
       color: white !important;
     }
-    &.active, &:hover {
+    &.active,
+    &:hover {
       background-color: $navbar-dark-active-bg !important;
     }
   }
@@ -111,6 +127,6 @@ html[data-bs-theme=dark] .navbar-vertical.navbar-expand-lg {
   }
 
   img.motif {
-    opacity: .25;
+    opacity: 0.25;
   }
 }

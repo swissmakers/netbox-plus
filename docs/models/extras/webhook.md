@@ -32,7 +32,12 @@ The events which will trigger the webhook. At least one event type must be selec
 
 ### URL
 
-The URL to which the webhook HTTP request will be made.
+The URL to which the webhook HTTP request will be made. Must be `http://` or `https://`, though
+part or all of the value may be a Jinja2 template rendered at send time (e.g.
+`http://{{ data.name }}.example.com/hook`, or `{{ data.custom_fields.callback_url }}` if the whole
+URL comes from a template). A literal scheme is always validated as such, even if the rest of the
+URL is templated; otherwise the value is checked only for valid Jinja2 syntax, since its rendered
+value isn't known until the webhook actually fires.
 
 ### HTTP Method
 
@@ -51,6 +56,13 @@ The content type to indicate in the outgoing HTTP request header. See [this list
 ### Additional Headers
 
 Any additional header to include with the outgoing HTTP request. These should be defined in the format `Name: Value`, with each header on a separate line. Jinja2 templating is supported for this field.
+
+!!! warning "Sanitize interpolated header values"
+    When interpolating data which may be influenced by other users (such as object attributes) into a header value, apply the `header_safe` filter to guard against HTTP header (CR/LF) injection. This filter strips newlines and other control characters which could otherwise be used to smuggle additional headers into the request. For example:
+
+    ```
+    X-Object-Name: {{ data.name | header_safe }}
+    ```
 
 ### Body Template
 
@@ -81,10 +93,13 @@ The following context variables are available to the text and link templates.
 
 | Variable      | Description                                          |
 |---------------|------------------------------------------------------|
-| `event`       | The event type (`created`, `updated`, or `deleted`)  |
+| `event`       | The event type (`create`, `update`, or `delete`)     |
 | `timestamp`   | The time at which the event occurred                 |
 | `object_type` | The type of object impacted (`app_label.model_name`) |
 | `username`    | The name of the user associated with the change      |
 | `request_id`  | The unique request ID                                |
 | `data`        | A complete serialized representation of the object   |
 | `snapshots`   | Pre- and post-change snapshots of the object         |
+
+!!! warning "Deprecation of legacy fields"
+    The `request_id` and `username` fields in the webhook payload above are deprecated and should no longer be used. Support for them will be removed in NetBox v4.7.0. Use `request.user` and `request.id` from the `request` object included in the callback context instead. (Note that `request` is populated in the context only when the webhook is associated with a triggering request.)

@@ -1,10 +1,13 @@
 import django_filters
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.db import models
-from django.test import TestCase
+from django.http import QueryDict
+from django.test import RequestFactory, TestCase
 from mptt.fields import TreeForeignKey
 from taggit.managers import TaggableManager
 
+from core.models import ObjectType
 from dcim.choices import *
 from dcim.fields import MACAddressField
 from dcim.filtersets import DeviceFilterSet, InterfaceFilterSet, SiteFilterSet
@@ -21,7 +24,7 @@ from dcim.models import (
     Site,
 )
 from extras.filters import TagFilter
-from extras.models import TaggedItem
+from extras.models import SavedFilter, Tag, TaggedItem
 from ipam.filtersets import ASNFilterSet
 from ipam.models import ASN, RIR
 from netbox.filtersets import BaseFilterSet
@@ -36,8 +39,10 @@ from utilities.filters import (
 )
 from wireless.choices import WirelessRoleChoices
 
+User = get_user_model()
 
-class TreeNodeMultipleChoiceFilterTest(TestCase):
+
+class TreeNodeMultipleChoiceFilterTestCase(TestCase):
 
     class SiteFilterSet(django_filters.FilterSet):
         region = TreeNodeMultipleChoiceFilter(
@@ -94,6 +99,69 @@ class TreeNodeMultipleChoiceFilterTest(TestCase):
         self.assertEqual(qs[1], self.site3)
 
 
+class TagFilterTestCase(TestCase):
+    """
+    Verify the AND (default), OR (`any`), and NOR (`n`) semantics of TagFilter/TagIDFilter.
+    """
+    queryset = Site.objects.all()
+    filterset = SiteFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        tags = (
+            Tag(name='Tag 1', slug='tag-1'),
+            Tag(name='Tag 2', slug='tag-2'),
+            Tag(name='Tag 3', slug='tag-3'),
+        )
+        Tag.objects.bulk_create(tags)
+
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+        )
+        Site.objects.bulk_create(sites)
+        sites[0].tags.set([tags[0], tags[1]])  # tag-1, tag-2
+        sites[1].tags.set([tags[1]])  # tag-2 only
+        sites[2].tags.set([tags[2]])  # tag-3 only
+
+    def test_tag_and(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-2'))
+        params = {'tag': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-1')
+
+        params = {'tag_id': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-1')
+
+    def test_tag_any(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-3'))
+        params = {'tag__any': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual({site.slug for site in qs}, {'site-1', 'site-3'})
+
+        params = {'tag_id__any': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual({site.slug for site in qs}, {'site-1', 'site-3'})
+
+    def test_tag_negation(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-3'))
+        params = {'tag__n': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-2')
+
+        params = {'tag_id__n': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-2')
+
+
 class DummyModel(models.Model):
     """
     Dummy model used by BaseFilterSetTest for filter validation. Should never appear in a schema migration.
@@ -121,7 +189,7 @@ class DummyModel(models.Model):
     tags = TaggableManager(through=TaggedItem)
 
 
-class BaseFilterSetTest(TestCase):
+class BaseFilterSetTestCase(TestCase):
     """
     Ensure that a BaseFilterSet automatically creates the expected set of filters for each filter type.
     """
@@ -375,8 +443,13 @@ class BaseFilterSetTest(TestCase):
         self.assertIsInstance(self.filters['tagfield'], TagFilter)
         self.assertEqual(self.filters['tagfield'].lookup_expr, 'exact')
         self.assertEqual(self.filters['tagfield'].exclude, False)
+        self.assertEqual(self.filters['tagfield'].conjoined, True)
         self.assertEqual(self.filters['tagfield__n'].lookup_expr, 'exact')
         self.assertEqual(self.filters['tagfield__n'].exclude, True)
+        self.assertEqual(self.filters['tagfield__n'].conjoined, True)
+        self.assertEqual(self.filters['tagfield__any'].lookup_expr, 'exact')
+        self.assertEqual(self.filters['tagfield__any'].exclude, False)
+        self.assertEqual(self.filters['tagfield__any'].conjoined, False)
 
     def test_tree_node_multiple_choice_filter(self):
         self.assertIsInstance(self.filters['treeforeignkeyfield'], TreeNodeMultipleChoiceFilter)
@@ -387,7 +460,7 @@ class BaseFilterSetTest(TestCase):
         self.assertEqual(self.filters['treeforeignkeyfield__n'].exclude, True)
 
 
-class DynamicFilterLookupExpressionTest(TestCase):
+class DynamicFilterLookupExpressionTestCase(TestCase):
     """
     Validate function of automatically generated filters using the Device model as an example.
     """
@@ -670,3 +743,101 @@ class DynamicFilterLookupExpressionTest(TestCase):
         self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 5)
         params = {'rf_role__empty': 'false'}
         self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 1)
+
+
+class SavedFilterApplicationTestCase(TestCase):
+    """
+    Validate the application of referenced SavedFilters to a FilterSet's data.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        sites = (
+            Site(name='Site 1', slug='site-1', status=SiteStatusChoices.STATUS_ACTIVE),
+            Site(name='Site 2', slug='site-2', status=SiteStatusChoices.STATUS_PLANNED),
+        )
+        Site.objects.bulk_create(sites)
+
+        cls.saved_filter = SavedFilter.objects.create(
+            name='Active Sites',
+            slug='active-sites',
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        cls.saved_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+    def setUp(self):
+        self.request = RequestFactory().get('/')
+        self.request.user = User.objects.create_user('testuser')
+
+    def test_filter_id_valid(self):
+        # A referenced SavedFilter's parameters are applied to the queryset
+        data = QueryDict(f'filter_id={self.saved_filter.pk}')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 1)
+
+    def test_filter_id_nonexistent(self):
+        # A non-existent (but valid integer) filter_id is ignored
+        data = QueryDict('filter_id=999999')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 2)
+
+    def test_filter_id_non_integer(self):
+        # A non-integer filter_id is ignored rather than raising a ValueError (#22568)
+        data = QueryDict('filter_id=abc')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 2)
+
+    def test_filter_slug(self):
+        # A referenced SavedFilter may also be applied by slug
+        data = QueryDict('filter=active-sites')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 1)
+
+    def test_private_filter_not_applied_for_other_user(self):
+        # A private SavedFilter owned by another user must not be applied (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        request = RequestFactory().get('/')
+        request.user = User.objects.create_user('other')
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=request).qs.count(), 2)
+
+    def test_private_filter_applied_for_owner(self):
+        # The owner of a private SavedFilter can still apply it (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        request = RequestFactory().get('/')
+        request.user = owner
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=request).qs.count(), 1)
+
+    def test_shared_filter_applied_without_request(self):
+        # Without a request, a shared SavedFilter is still applied (anonymous visibility)
+        data = QueryDict('filter=active-sites')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all()).qs.count(), 1)
+
+    def test_private_filter_not_applied_without_request(self):
+        # Without a request, a private SavedFilter is not applied (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all()).qs.count(), 2)

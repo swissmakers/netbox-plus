@@ -68,7 +68,7 @@ class Command(BaseCommand):
                 'info': logging.INFO,
                 'warning': logging.WARNING,
             }[loglevel])
-        except KeyError:
+        except KeyError:  # pragma: no cover
             raise CommandError(f"Invalid log level: {loglevel}")
 
         # Initialize the script form
@@ -85,6 +85,7 @@ class Command(BaseCommand):
         form.cleaned_data.pop('_schedule_at')
         form.cleaned_data.pop('_interval')
         form.cleaned_data.pop('_commit')
+        notifications = form.cleaned_data.pop('_notifications')
 
         # Execute the script.
         job = ScriptJob.enqueue(
@@ -92,6 +93,7 @@ class Command(BaseCommand):
             user=user,
             immediate=True,
             data=form.cleaned_data,
+            notifications=notifications,
             request=NetBoxFakeRequest({
                 'META': {},
                 'COOKIES': {},

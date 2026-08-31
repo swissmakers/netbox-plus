@@ -1,18 +1,26 @@
 import datetime
+from unittest.mock import patch
 
 from django.contrib.contenttypes.models import ContentType
-from django.test import override_settings
+from django.db.backends.postgresql.psycopg_any import NumericRange
+from django.test import RequestFactory
 from django.urls import reverse
 from netaddr import IPNetwork
 
-from core.models import ObjectType
+from core.choices import ObjectChangeActionChoices
+from core.models import ObjectChange, ObjectType
 from dcim.constants import InterfaceTypeChoices
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from extras.choices import CustomFieldTypeChoices
+from extras.models import CustomField, SavedFilter
+from ipam import filtersets
 from ipam.choices import *
 from ipam.models import *
+from ipam.utils import AvailableIPSpace
+from ipam.views import AggregatePrefixesView, PrefixPrefixesView
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
 from tenancy.models import Tenant
-from users.models import ObjectPermission
+from users.models import Group, ObjectPermission, Owner
 from utilities.testing import ViewTestCases, create_tags
 
 
@@ -84,6 +92,12 @@ class ASNTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         ]
         RIR.objects.bulk_create(rirs)
 
+        roles = (
+            Role(name='Role 1', slug='role-1'),
+            Role(name='Role 2', slug='role-2'),
+        )
+        Role.objects.bulk_create(roles)
+
         sites = (
             Site(name='Site 1', slug='site-1'),
             Site(name='Site 2', slug='site-2')
@@ -97,10 +111,10 @@ class ASNTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         Tenant.objects.bulk_create(tenants)
 
         asns = (
-            ASN(asn=65001, rir=rirs[0], tenant=tenants[0]),
-            ASN(asn=65002, rir=rirs[1], tenant=tenants[1]),
-            ASN(asn=4200000001, rir=rirs[0], tenant=tenants[0]),
-            ASN(asn=4200000002, rir=rirs[1], tenant=tenants[1]),
+            ASN(asn=65001, rir=rirs[0], role=roles[0], tenant=tenants[0]),
+            ASN(asn=65002, rir=rirs[1], role=roles[1], tenant=tenants[1]),
+            ASN(asn=4200000001, rir=rirs[0], role=roles[0], tenant=tenants[0]),
+            ASN(asn=4200000002, rir=rirs[1], role=roles[1], tenant=tenants[1]),
         )
         ASN.objects.bulk_create(asns)
 
@@ -114,6 +128,7 @@ class ASNTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         cls.form_data = {
             'asn': 65000,
             'rir': rirs[0].pk,
+            'role': roles[0].pk,
             'tenant': tenants[0].pk,
             'site': sites[0].pk,
             'description': 'A new ASN',
@@ -121,11 +136,11 @@ class ASNTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         }
 
         cls.csv_data = (
-            "asn,rir",
-            "65003,RIR 1",
-            "65004,RIR 2",
-            "4200000003,RIR 1",
-            "4200000004,RIR 2",
+            "asn,rir,role",
+            f"65003,RIR 1,{roles[0].name}",
+            f"65004,RIR 2,{roles[1].name}",
+            f"4200000003,RIR 1,{roles[0].name}",
+            f"4200000004,RIR 2,{roles[1].name}",
         )
 
         cls.csv_update_data = (
@@ -137,6 +152,7 @@ class ASNTestCase(ViewTestCases.PrimaryObjectViewTestCase):
 
         cls.bulk_edit_data = {
             'rir': rirs[1].pk,
+            'role': roles[1].pk,
             'description': 'Next description',
         }
 
@@ -330,8 +346,8 @@ class AggregateTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'description': 'New description',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_aggregate_prefixes(self):
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
         rir = RIR.objects.first()
         aggregate = Aggregate.objects.create(prefix=IPNetwork('192.168.0.0/16'), rir=rir)
         prefixes = (
@@ -344,6 +360,239 @@ class AggregateTestCase(ViewTestCases.PrimaryObjectViewTestCase):
 
         url = reverse('ipam:aggregate_prefixes', kwargs={'pk': aggregate.pk})
         self.assertHttpStatus(self.client.get(url), 200)
+
+    def test_aggregate_prefixes_filter_suppresses_available_prefixes(self):
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        tenants = (
+            Tenant(name='Aggregate Tenant 1', slug='aggregate-tenant-1'),
+            Tenant(name='Aggregate Tenant 2', slug='aggregate-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        aggregate = Aggregate.objects.create(
+            prefix=IPNetwork('203.0.113.0/24'),
+            rir=RIR.objects.first()
+        )
+        prefixes = (
+            Prefix(prefix=IPNetwork('203.0.113.0/26'), tenant=tenants[0]),
+            Prefix(prefix=IPNetwork('203.0.113.64/26'), tenant=tenants[1]),
+        )
+        Prefix.objects.bulk_create(prefixes)
+
+        url = reverse('ipam:aggregate_prefixes', kwargs={'pk': aggregate.pk})
+        response = self.client.get(url, {'tenant_id': tenants[0].pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '203.0.113.0/26')
+        self.assertNotContains(response, '203.0.113.64/26')
+
+    def test_aggregate_prefixes_saved_filter(self):
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        tenants = (
+            Tenant(name='Aggregate Saved Tenant 1', slug='aggregate-saved-tenant-1'),
+            Tenant(name='Aggregate Saved Tenant 2', slug='aggregate-saved-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        aggregate = Aggregate.objects.create(
+            prefix=IPNetwork('203.0.114.0/24'),
+            rir=RIR.objects.first()
+        )
+        prefixes = (
+            Prefix(prefix=IPNetwork('203.0.114.0/26'), tenant=tenants[0]),
+            Prefix(prefix=IPNetwork('203.0.114.64/26'), tenant=tenants[1]),
+        )
+        Prefix.objects.bulk_create(prefixes)
+
+        saved_filter = SavedFilter.objects.create(
+            name='Aggregate Tenant 1 prefixes',
+            slug='aggregate-tenant-1-prefixes',
+            parameters={
+                'tenant_id': [str(tenants[0].pk)],
+            },
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        url = reverse('ipam:aggregate_prefixes', kwargs={'pk': aggregate.pk})
+        response = self.client.get(url, {'filter_id': saved_filter.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '203.0.114.0/26')
+        self.assertNotContains(response, '203.0.114.64/26')
+
+    def test_aggregate_prefixes_custom_field_constraint_shows_available(self):
+        """A tenant custom-field permission constraint does not suppress available-prefix rows."""
+        cf = CustomField.objects.create(name='integerCustomField', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(Tenant)])
+        tenant = Tenant.objects.create(
+            name='Agg CF Tenant', slug='agg-cf-tenant', custom_field_data={'integerCustomField': 1}
+        )
+
+        aggregate = Aggregate.objects.create(prefix=IPNetwork('198.51.100.0/24'), rir=RIR.objects.first())
+        child = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/26'), tenant=tenant)
+
+        self.add_permissions('ipam.view_aggregate')
+        obj_perm = ObjectPermission(
+            name='View prefixes', actions=['view'], constraints={'tenant__custom_field_data__integerCustomField': 1}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        self.assertIn(child, Prefix.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:aggregate_prefixes', kwargs={'pk': aggregate.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertTrue(response.context['show_available'])
+        self.assertGreater(len(response.context['table'].data), 1)
+
+    def has_active_child_filters(self, **params):
+        """Run the child filter detector on a fresh view for the given query parameters."""
+        view = AggregatePrefixesView()
+        request = RequestFactory().get('/', params)
+        request.user = self.user
+        return view._has_active_child_filters(request)
+
+    def test_has_active_child_filters_declared_filters(self):
+        """A declared filter with a real value counts as active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        tenant = Tenant.objects.create(name='Declared Tenant', slug='declared-tenant')
+
+        self.assertTrue(self.has_active_child_filters(tenant_id=tenant.pk))
+        self.assertTrue(self.has_active_child_filters(q='test'))
+        # A boolean false is a value, not an absent filter.
+        self.assertTrue(self.has_active_child_filters(is_pool='false'))
+
+    def test_has_active_child_filters_lookup_variants(self):
+        """Lookup variants generated by get_filters() count as active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        self.assertTrue(self.has_active_child_filters(status__n=PrefixStatusChoices.STATUS_ACTIVE))
+        self.assertTrue(self.has_active_child_filters(description__empty='true'))
+
+    def test_has_active_child_filters_custom_field_filters(self):
+        """Custom field filters registered on the filterset instance count as active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        cf = CustomField.objects.create(name='edge_cf', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(Prefix)])
+
+        self.assertTrue(self.has_active_child_filters(cf_edge_cf='1'))
+        self.assertTrue(self.has_active_child_filters(cf_edge_cf__gte='1'))
+
+    def test_has_active_child_filters_saved_filter(self):
+        """A populated saved filter counts as active filtering by slug or by id."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        tenant = Tenant.objects.create(name='Saved Ref Tenant', slug='saved-ref-tenant')
+        saved_filter = SavedFilter.objects.create(
+            name='Saved ref', slug='saved-ref', parameters={'tenant_id': [str(tenant.pk)]}
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        self.assertTrue(self.has_active_child_filters(filter=saved_filter.slug))
+        self.assertTrue(self.has_active_child_filters(filter_id=saved_filter.pk))
+
+    def test_has_active_child_filters_unresolved_saved_filter(self):
+        """A saved filter reference that expands to nothing is not active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        saved_filter = SavedFilter.objects.create(name='Empty', slug='empty-saved-filter', parameters={})
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        self.assertFalse(self.has_active_child_filters(filter_id=saved_filter.pk))
+        self.assertFalse(self.has_active_child_filters(filter_id='99999999'))
+
+    def test_has_active_child_filters_without_values(self):
+        """A request with no parameters or only empty ones is not active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        self.assertFalse(self.has_active_child_filters())
+        self.assertFalse(self.has_active_child_filters(tenant_id=''))
+        self.assertFalse(self.has_active_child_filters(q=''))
+
+    def test_has_active_child_filters_invalid_value(self):
+        """A filter value that fails validation is not applied, so it is not active filtering."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        self.assertFalse(self.has_active_child_filters(tenant_id='99999999'))
+
+    def test_has_active_child_filters_valid_beside_invalid_value(self):
+        """A valid filter is still active when another submitted value is invalid."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        tenant = Tenant.objects.create(name='Mixed Tenant', slug='mixed-tenant')
+
+        self.assertTrue(self.has_active_child_filters(tenant_id=tenant.pk, status='not-a-valid-status'))
+
+    def test_has_active_child_filters_non_filter_params(self):
+        """Unknown parameters, display toggles, and table controls are not filters."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+
+        self.assertFalse(self.has_active_child_filters(not_a_filter='x'))
+        self.assertFalse(self.has_active_child_filters(show_available='false'))
+        self.assertFalse(self.has_active_child_filters(show_assigned='true'))
+        self.assertFalse(self.has_active_child_filters(page='2', per_page='100', sort='prefix', tableconfig_id='1'))
+
+    def test_has_active_child_filters_control_beside_filter(self):
+        """A table control submitted alongside a filter does not mask the filter."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        tenant = Tenant.objects.create(name='Control Tenant', slug='control-tenant')
+
+        self.assertTrue(self.has_active_child_filters(page='2', tenant_id=tenant.pk))
+
+    def test_has_active_child_filters_without_filterset(self):
+        """A view without a filterset reports no active filters."""
+        view = AggregatePrefixesView()
+        view.filterset = None
+        request = RequestFactory().get('/', {'tenant_id': '1'})
+        request.user = self.user
+        self.assertFalse(view._has_active_child_filters(request))
+
+    def test_has_active_child_filters_reuses_view_filterset(self):
+        """The detector evaluates the FilterSet already bound by the view, not a fresh one."""
+        aggregate = Aggregate.objects.create(prefix=IPNetwork('203.0.115.0/24'), rir=RIR.objects.first())
+        tenant = Tenant.objects.create(name='Reuse Tenant', slug='reuse-tenant')
+
+        view = AggregatePrefixesView()
+        request = RequestFactory().get('/')
+        request.user = self.user
+
+        # The bound FilterSet is authoritative: it reports a filter the request itself does not carry.
+        view.filterset_instance = AggregatePrefixesView.filterset(
+            {'tenant_id': [str(tenant.pk)]}, view.get_children(request, aggregate), request=request
+        )
+
+        request = RequestFactory().get('/', {'page': '2'})
+        request.user = self.user
+        self.assertTrue(view._has_active_child_filters(request))
+
+    def test_child_tab_binds_filterset_once(self):
+        """A filtered child tab binds the FilterSet once; the detector reuses it instead of rebuilding."""
+        self.add_permissions('ipam.view_aggregate', 'ipam.view_prefix')
+        aggregate = Aggregate.objects.create(prefix=IPNetwork('203.0.116.0/24'), rir=RIR.objects.first())
+        tenant = Tenant.objects.create(name='Bind Once Tenant', slug='bind-once-tenant')
+        Prefix.objects.create(prefix=IPNetwork('203.0.116.0/26'), tenant=tenant)
+
+        # Count only data-bound instantiations: the filter form separately builds an unbound
+        # FilterSet to resolve field modifiers, which is unrelated to filter detection.
+        bound = []
+        original_init = filtersets.PrefixFilterSet.__init__
+
+        def counting_init(fs, *args, **kwargs):
+            if args or 'data' in kwargs:
+                bound.append(fs)
+            original_init(fs, *args, **kwargs)
+
+        url = reverse('ipam:aggregate_prefixes', kwargs={'pk': aggregate.pk})
+        with patch.object(filtersets.PrefixFilterSet, '__init__', counting_init):
+            response = self.client.get(url, {'tenant_id': tenant.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(bound), 1)
+        self.assertFalse(response.context['show_available'])
 
 
 class RoleTestCase(ViewTestCases.OrganizationalObjectViewTestCase):
@@ -467,8 +716,107 @@ class PrefixTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'description': 'New description',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_bulk_add_ipv4_prefixes(self):
+        """Test bulk creating IPv4 prefixes using a pattern."""
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        initial_count = Prefix.objects.count()
+        url = reverse('ipam:prefix_bulk_add')
+        data = {
+            'pattern': '10.0.[0-2].0/24',
+            'status': PrefixStatusChoices.STATUS_ACTIVE,
+        }
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(Prefix.objects.count(), initial_count + 3)
+
+        for i in range(3):
+            self.assertTrue(Prefix.objects.filter(prefix=IPNetwork(f'10.0.{i}.0/24')).exists())
+
+    def test_bulk_add_ipv6_prefixes(self):
+        """Test bulk creating IPv6 prefixes using a pattern."""
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        initial_count = Prefix.objects.count()
+        url = reverse('ipam:prefix_bulk_add')
+        data = {
+            'pattern': 'fd00:db8:[0-3]::/48',
+            'status': PrefixStatusChoices.STATUS_ACTIVE,
+        }
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(Prefix.objects.count(), initial_count + 4)
+
+        for i in range(4):
+            self.assertTrue(Prefix.objects.filter(prefix=IPNetwork(f'fd00:db8:{i}::/48')).exists())
+
+    def test_bulk_add_ipv6_prefixes_uppercase_hex(self):
+        """Test bulk creating IPv6 prefixes using uppercase hex in the pattern."""
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        initial_count = Prefix.objects.count()
+        url = reverse('ipam:prefix_bulk_add')
+        data = {
+            'pattern': 'fd00:0:0:[48-4F]00::/56',
+            'status': PrefixStatusChoices.STATUS_ACTIVE,
+        }
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(Prefix.objects.count(), initial_count + 8)
+
+        expected_hex = ['48', '49', '4a', '4b', '4c', '4d', '4e', '4f']
+        for h in expected_hex:
+            prefix_str = f'fd00:0:0:{h}00::/56'
+            self.assertTrue(
+                Prefix.objects.filter(prefix=IPNetwork(prefix_str)).exists(),
+                f'Expected prefix {prefix_str} was not created'
+            )
+
+    def test_bulk_add_prefixes_with_changelog_message(self):
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        changelog_message = 'Bulk-created prefixes'
+        prefixes = [IPNetwork(f'198.18.{i}.0/24') for i in range(3)]
+        url = reverse('ipam:prefix_bulk_add')
+        data = {
+            'pattern': '198.18.[0-2].0/24',
+            'status': PrefixStatusChoices.STATUS_ACTIVE,
+            'changelog_message': changelog_message,
+        }
+
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+
+        created_prefixes = list(Prefix.objects.filter(prefix__in=prefixes))
+        self.assertEqual(len(created_prefixes), len(prefixes))
+
+        objectchanges = ObjectChange.objects.filter(
+            action=ObjectChangeActionChoices.ACTION_CREATE,
+            changed_object_type=ContentType.objects.get_for_model(Prefix),
+            changed_object_id__in=[obj.pk for obj in created_prefixes],
+        )
+        self.assertEqual(objectchanges.count(), len(prefixes))
+        for objectchange in objectchanges:
+            self.assertEqual(objectchange.message, changelog_message)
+
     def test_prefix_prefixes(self):
+        self.add_permissions('ipam.view_prefix')
         prefixes = (
             Prefix(prefix=IPNetwork('192.168.0.0/16')),
             Prefix(prefix=IPNetwork('192.168.1.0/24')),
@@ -481,8 +829,65 @@ class PrefixTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         url = reverse('ipam:prefix_prefixes', kwargs={'pk': prefixes[0].pk})
         self.assertHttpStatus(self.client.get(url), 200)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_prefix_prefixes_filter_suppresses_available_prefixes(self):
+        self.add_permissions('ipam.view_prefix')
+
+        tenants = (
+            Tenant(name='Prefix Tenant 1', slug='prefix-tenant-1'),
+            Tenant(name='Prefix Tenant 2', slug='prefix-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/24'))
+        prefixes = (
+            Prefix(prefix=IPNetwork('198.51.100.0/26'), tenant=tenants[0]),
+            Prefix(prefix=IPNetwork('198.51.100.64/26'), tenant=tenants[1]),
+        )
+        Prefix.objects.bulk_create(prefixes)
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url, {'tenant_id': tenants[0].pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '198.51.100.0/26')
+        self.assertNotContains(response, '198.51.100.64/26')
+
+    def test_prefix_prefixes_saved_filter_suppresses_available_prefixes(self):
+        self.add_permissions('ipam.view_prefix')
+
+        tenants = (
+            Tenant(name='Prefix Saved Tenant 1', slug='prefix-saved-tenant-1'),
+            Tenant(name='Prefix Saved Tenant 2', slug='prefix-saved-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.101.0/24'))
+        prefixes = (
+            Prefix(prefix=IPNetwork('198.51.101.0/26'), tenant=tenants[0]),
+            Prefix(prefix=IPNetwork('198.51.101.64/26'), tenant=tenants[1]),
+        )
+        Prefix.objects.bulk_create(prefixes)
+
+        saved_filter = SavedFilter.objects.create(
+            name='Prefix Tenant 1 prefixes',
+            slug='prefix-tenant-1-prefixes',
+            parameters={
+                'tenant_id': [str(tenants[0].pk)],
+            },
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url, {'filter_id': saved_filter.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '198.51.101.0/26')
+        self.assertNotContains(response, '198.51.101.64/26')
+
     def test_prefix_ipranges(self):
+        self.add_permissions('ipam.view_prefix', 'ipam.view_iprange')
         prefix = Prefix.objects.create(prefix=IPNetwork('192.168.0.0/16'))
         ip_ranges = (
             IPRange(start_address='192.168.0.1/24', end_address='192.168.0.100/24', size=99),
@@ -495,8 +900,8 @@ class PrefixTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         url = reverse('ipam:prefix_ipranges', kwargs={'pk': prefix.pk})
         self.assertHttpStatus(self.client.get(url), 200)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_prefix_ipaddresses(self):
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
         prefix = Prefix.objects.create(prefix=IPNetwork('192.168.0.0/16'))
         ip_addresses = (
             IPAddress(address=IPNetwork('192.168.0.1/16')),
@@ -509,11 +914,603 @@ class PrefixTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
         self.assertHttpStatus(self.client.get(url), 200)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_prefix_ipaddresses_filter(self):
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+
+        tenants = (
+            Tenant(name='IP Address Tenant 1', slug='ip-address-tenant-1'),
+            Tenant(name='IP Address Tenant 2', slug='ip-address-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        ip_addresses = (
+            IPAddress(address=IPNetwork('192.0.2.1/24'), tenant=tenants[0]),
+            IPAddress(address=IPNetwork('192.0.2.2/24'), tenant=tenants[1]),
+        )
+        IPAddress.objects.bulk_create(ip_addresses)
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'tenant_id': tenants[0].pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '192.0.2.1/24')
+        self.assertNotContains(response, '192.0.2.2/24')
+
+    def test_prefix_ipaddresses_saved_filter(self):
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+
+        tenants = (
+            Tenant(name='Saved Filter Tenant 1', slug='saved-filter-tenant-1'),
+            Tenant(name='Saved Filter Tenant 2', slug='saved-filter-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        ip_addresses = (
+            IPAddress(address=IPNetwork('192.0.2.1/24'), tenant=tenants[0]),
+            IPAddress(address=IPNetwork('192.0.2.2/24'), tenant=tenants[1]),
+        )
+        IPAddress.objects.bulk_create(ip_addresses)
+
+        saved_filter = SavedFilter.objects.create(
+            name='Tenant 1 IP addresses',
+            slug='tenant-1-ip-addresses',
+            parameters={
+                'tenant_id': [str(tenants[0].pk)],
+            },
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'filter_id': saved_filter.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '192.0.2.1/24')
+        self.assertNotContains(response, '192.0.2.2/24')
+
+    def assertIPAvailabilityShown(self, response, visible_ip):
+        """The permitted IP renders as a real row and synthetic available-space rows are present."""
+        records = list(response.context['table'].data)
+        rendered_ip_pks = {r.pk for r in records if isinstance(r, IPAddress)}
+        self.assertIn(visible_ip.pk, rendered_ip_pks)
+        self.assertTrue(any(isinstance(r, AvailableIPSpace) for r in records))
+
+    def test_prefix_ipaddresses_unfiltered_shows_available_space(self):
+        """An unfiltered IP Addresses tab injects synthetic available-space rows."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_custom_field_constraint_shows_available(self):
+        """A permission constraint on a related object's custom field data does not suppress the available-IP rows."""
+        cf = CustomField.objects.create(name='integerCustomField', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(Tenant)])
+
+        tenant = Tenant.objects.create(name='CF Tenant', slug='cf-tenant', custom_field_data={'integerCustomField': 1})
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'), tenant=tenant)
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), tenant=tenant)
+
+        # The issue reports the JSON string "1", but an integer custom field stores an int, so a
+        # string constraint would not match and would hide the parent. Use 1 and prove access below.
+        constraint = {'tenant__custom_field_data__integerCustomField': 1}
+        for model in (Prefix, IPAddress):
+            obj_perm = ObjectPermission(
+                name=f'View {model._meta.verbose_name}', actions=['view'], constraints=constraint
+            )
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(model))
+
+        # Self-verifying: the constraint must actually grant access to both objects, or the
+        # availability assertion could pass through an unrestricted re-query instead of the fix.
+        self.assertIn(prefix, Prefix.objects.restrict(self.user, 'view'))
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_related_field_constraint_shows_available(self):
+        """A permission constraint on a related object field does not suppress the available-IP rows."""
+        tenant = Tenant.objects.create(name='Plain Constraint Tenant', slug='plain-constraint-tenant')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'), tenant=tenant)
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), tenant=tenant)
+
+        constraint = {'tenant__slug': 'plain-constraint-tenant'}
+        for model in (Prefix, IPAddress):
+            obj_perm = ObjectPermission(
+                name=f'View {model._meta.verbose_name}', actions=['view'], constraints=constraint
+            )
+            obj_perm.save()
+            obj_perm.users.add(self.user)
+            obj_perm.object_types.add(ObjectType.objects.get_for_model(model))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_constraint_with_direct_filter_suppresses(self):
+        """A direct filter still suppresses available-IP rows for a constrained user."""
+        tenants = (
+            Tenant(name='Constraint Direct 1', slug='constraint-direct-1'),
+            Tenant(name='Constraint Direct 2', slug='constraint-direct-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        ip1 = IPAddress.objects.create(address=IPNetwork('192.0.2.1/24'), tenant=tenants[0])
+        ip2 = IPAddress.objects.create(address=IPNetwork('192.0.2.2/24'), tenant=tenants[1])
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs', actions=['view'], constraints={'tenant__slug__startswith': 'constraint-direct'}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        # Both IPs are visible under the constraint, so suppression below is due to the filter, not permissions.
+        self.assertIn(ip1, IPAddress.objects.restrict(self.user, 'view'))
+        self.assertIn(ip2, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'tenant_id': tenants[0].pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '192.0.2.1/24')
+        self.assertNotContains(response, '192.0.2.2/24')
+
+    def test_prefix_ipaddresses_constraint_with_saved_filter_suppresses(self):
+        """A saved filter still suppresses available-IP rows for a constrained user."""
+        tenants = (
+            Tenant(name='Constraint Saved 1', slug='constraint-saved-1'),
+            Tenant(name='Constraint Saved 2', slug='constraint-saved-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        ip1 = IPAddress.objects.create(address=IPNetwork('192.0.2.1/24'), tenant=tenants[0])
+        ip2 = IPAddress.objects.create(address=IPNetwork('192.0.2.2/24'), tenant=tenants[1])
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs', actions=['view'], constraints={'tenant__slug__startswith': 'constraint-saved'}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        # Both IPs are visible under the constraint, so suppression below is due to the filter, not permissions.
+        self.assertIn(ip1, IPAddress.objects.restrict(self.user, 'view'))
+        self.assertIn(ip2, IPAddress.objects.restrict(self.user, 'view'))
+
+        saved_filter = SavedFilter.objects.create(
+            name='Constraint saved tenant 1', slug='constraint-saved-tenant-1',
+            parameters={'tenant_id': [str(tenants[0].pk)]},
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'filter_id': saved_filter.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, '192.0.2.1/24')
+        self.assertNotContains(response, '192.0.2.2/24')
+
+    def test_prefix_ipaddresses_direct_field_constraint_shows_available(self):
+        """A permission constraint on the IP Address status field does not suppress the available-IP rows."""
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), status=IPAddressStatusChoices.STATUS_ACTIVE)
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs', actions=['view'], constraints={'status': IPAddressStatusChoices.STATUS_ACTIVE}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_own_custom_field_constraint_shows_available(self):
+        """A permission constraint on the IP Address custom field data does not suppress the available-IP rows."""
+        cf = CustomField.objects.create(name='ip_cf', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(IPAddress)])
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), custom_field_data={'ip_cf': 1})
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(name='View IPs', actions=['view'], constraints={'custom_field_data__ip_cf': 1})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_multikey_constraint_shows_available(self):
+        """A permission constraint combining a direct and a related field does not suppress the available-IP rows."""
+        tenant = Tenant.objects.create(name='Multi Key Tenant', slug='multi-key-tenant')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(
+            address=IPNetwork('192.0.2.1/29'), status=IPAddressStatusChoices.STATUS_ACTIVE, tenant=tenant
+        )
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs',
+            actions=['view'],
+            constraints={'status': IPAddressStatusChoices.STATUS_ACTIVE, 'tenant__slug': 'multi-key-tenant'},
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_or_constraint_shows_available(self):
+        """A permission granting access through either of two constraints does not suppress the available-IP rows."""
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), status=IPAddressStatusChoices.STATUS_ACTIVE)
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs',
+            actions=['view'],
+            constraints=[
+                {'status': IPAddressStatusChoices.STATUS_ACTIVE},
+                {'status': IPAddressStatusChoices.STATUS_RESERVED},
+            ],
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_address_startswith_constraint_shows_available(self):
+        """The #22539 address__startswith constraint does not suppress the available-IP rows."""
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.168.0.0/24'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.168.0.1/24'))
+
+        self.add_permissions('ipam.view_prefix')
+        obj_perm = ObjectPermission(
+            name='View IPs', actions=['view'], constraints={'address__startswith': '192.168.0.'}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_prefixes_show_available_false_skips_filter_detection(self):
+        """With availability already off, the filter detector never runs."""
+        self.add_permissions('ipam.view_prefix')
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.104.0/24'))
+        Prefix.objects.create(prefix=IPNetwork('198.51.104.0/26'))
+
+        view = PrefixPrefixesView()
+        request = RequestFactory().get('/', {'show_available': 'false'})
+        request.user = self.user
+        view.prep_table_data(request, view.get_children(request, parent), parent)
+
+        self.assertFalse(hasattr(view, '_active_child_filters'))
+
+    def test_prefix_ipaddresses_valid_plus_invalid_filter_suppresses(self):
+        """A valid filter is applied and suppresses synthetic rows even when another filter value is invalid."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress')
+        tenant = Tenant.objects.create(name='VPI Tenant', slug='vpi-tenant')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        matching = IPAddress.objects.create(address=IPNetwork('192.0.2.1/24'), tenant=tenant)
+        IPAddress.objects.create(address=IPNetwork('192.0.2.2/24'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'tenant_id': tenant.pk, 'status': 'not-a-valid-status'})
+
+        self.assertHttpStatus(response, 200)
+        records = list(response.context['table'].data)
+        self.assertFalse(any(isinstance(r, AvailableIPSpace) for r in records))
+        self.assertEqual({r.pk for r in records if isinstance(r, IPAddress)}, {matching.pk})
+
+    def test_prefix_ipaddresses_htmx_direct_filter_suppresses(self):
+        """An HTMX table refresh with a direct filter suppresses available-IP rows."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress')
+        tenants = (
+            Tenant(name='HTMX Tenant 1', slug='htmx-tenant-1'),
+            Tenant(name='HTMX Tenant 2', slug='htmx-tenant-2'),
+        )
+        Tenant.objects.bulk_create(tenants)
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/24'))
+        IPAddress.objects.create(address=IPNetwork('192.0.2.1/24'), tenant=tenants[0])
+        IPAddress.objects.create(address=IPNetwork('192.0.2.2/24'), tenant=tenants[1])
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'tenant_id': tenants[0].pk}, HTTP_HX_REQUEST='true')
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+
+    def test_prefix_ipaddresses_htmx_unfiltered_shows_available(self):
+        """An HTMX table refresh with no filter still injects available-IP rows."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, HTTP_HX_REQUEST='true')
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_group_constraint_shows_available(self):
+        """A constraint granted through a group does not suppress the available-IP rows."""
+        self.add_permissions('ipam.view_prefix')
+        tenant = Tenant.objects.create(name='Group Grant', slug='group-grant')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), tenant=tenant)
+
+        group = Group.objects.create(name='IP Viewers')
+        self.user.groups.add(group)
+        obj_perm = ObjectPermission(name='View IPs', actions=['view'], constraints={'tenant__slug': 'group-grant'})
+        obj_perm.save()
+        obj_perm.groups.add(group)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        # The group grant must resolve, or the assertion below would be vacuous.
+        self.assertIn(ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_ipaddresses_partial_visibility_shows_available(self):
+        """A constraint that hides one child IP keeps availability rows and omits the hidden IP."""
+        self.add_permissions('ipam.view_prefix')
+        visible_tenant = Tenant.objects.create(name='Partial Vis', slug='partial-vis')
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        visible_ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'), tenant=visible_tenant)
+        hidden_ip = IPAddress.objects.create(address=IPNetwork('192.0.2.6/29'))
+
+        obj_perm = ObjectPermission(name='View IPs', actions=['view'], constraints={'tenant__slug': 'partial-vis'})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        # Exactly one child IP is visible, so the constraint is doing real work.
+        self.assertIn(visible_ip, IPAddress.objects.restrict(self.user, 'view'))
+        self.assertNotIn(hidden_ip, IPAddress.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        # The hidden IP is omitted and its slot is counted as available space.
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, visible_ip)
+        records = list(response.context['table'].data)
+        self.assertNotIn(hidden_ip.pk, {r.pk for r in records if isinstance(r, IPAddress)})
+        self.assertEqual(sum(r.size for r in records if isinstance(r, AvailableIPSpace)), 5)
+
+    def test_prefix_ipaddresses_partial_visibility_omits_hidden_range(self):
+        """A constraint on child ranges keeps the permitted range and omits the hidden one."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress')
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'))
+        visible_range = IPRange.objects.create(
+            start_address=IPNetwork('192.0.2.2/29'),
+            end_address=IPNetwork('192.0.2.3/29'),
+            size=2,
+            mark_populated=True,
+            description='visible',
+        )
+        hidden_range = IPRange.objects.create(
+            start_address=IPNetwork('192.0.2.4/29'),
+            end_address=IPNetwork('192.0.2.5/29'),
+            size=2,
+            mark_populated=True,
+        )
+
+        obj_perm = ObjectPermission(name='View ranges', actions=['view'], constraints={'description': 'visible'})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPRange))
+
+        # Exactly one child range is visible, so the constraint is doing real work.
+        self.assertIn(visible_range, IPRange.objects.restrict(self.user, 'view'))
+        self.assertNotIn(hidden_range, IPRange.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+        records = list(response.context['table'].data)
+        self.assertEqual({r.pk for r in records if isinstance(r, IPRange)}, {visible_range.pk})
+        self.assertEqual(sum(r.size for r in records if isinstance(r, AvailableIPSpace)), 3)
+
+    def test_prefix_ipaddresses_sorted_suppresses_available(self):
+        """A sorted IP Addresses tab drops synthetic rows so ordering stays in SQL."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'sort': 'address'})
+
+        self.assertHttpStatus(response, 200)
+        records = list(response.context['table'].data)
+        self.assertEqual({r.pk for r in records if isinstance(r, IPAddress)}, {ip.pk})
+        self.assertFalse(any(isinstance(r, AvailableIPSpace) for r in records))
+
+    def test_prefix_ipaddresses_empty_sort_shows_available(self):
+        """An empty sort value is not an ordering, so synthetic rows survive."""
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.0.2.0/29'))
+        ip = IPAddress.objects.create(address=IPNetwork('192.0.2.1/29'))
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url, {'sort': ''})
+
+        self.assertHttpStatus(response, 200)
+        self.assertIPAvailabilityShown(response, ip)
+
+    def test_prefix_prefixes_unfiltered_shows_available_prefixes(self):
+        """An unfiltered Child Prefixes tab injects synthetic available-prefix rows."""
+        self.add_permissions('ipam.view_prefix')
+
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.102.0/24'))
+        Prefix.objects.create(prefix=IPNetwork('198.51.102.0/26'))
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertGreater(len(response.context['table'].data), 1)
+
+    def test_prefix_prefixes_custom_field_constraint_shows_available(self):
+        """A tenant custom-field permission constraint does not suppress available child-prefix rows."""
+        cf = CustomField.objects.create(name='integerCustomField', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(Tenant)])
+        tenant = Tenant.objects.create(
+            name='Child CF Tenant', slug='child-cf-tenant', custom_field_data={'integerCustomField': 1}
+        )
+
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/24'), tenant=tenant)
+        child = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/26'), tenant=tenant)
+
+        obj_perm = ObjectPermission(
+            name='View prefixes', actions=['view'], constraints={'tenant__custom_field_data__integerCustomField': 1}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        self.assertIn(child, Prefix.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertTrue(response.context['show_available'])
+        self.assertGreater(len(response.context['table'].data), 1)
+
+    def test_prefix_prefixes_available_only_shows_available(self):
+        """The Available button's parameters render synthetic rows and no assigned rows."""
+        self.add_permissions('ipam.view_prefix')
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.104.0/24'))
+        Prefix.objects.create(prefix=IPNetwork('198.51.104.0/26'))
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url, {'show_assigned': 'false', 'show_available': 'true'})
+
+        self.assertHttpStatus(response, 200)
+        rendered = list(response.context['table'].data)
+        self.assertTrue([p for p in rendered if p.pk is None])
+        self.assertFalse([p for p in rendered if p.pk is not None])
+
+    def test_prefix_prefixes_partial_visibility_shows_available(self):
+        """A constraint that hides one child prefix does not suppress the available-prefix rows."""
+        visible_tenant = Tenant.objects.create(name='PP Partial', slug='pp-partial')
+
+        # The parent carries the visible tenant, so the single constrained grant covers the tab itself.
+        parent = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/24'), tenant=visible_tenant)
+        visible_child = Prefix.objects.create(prefix=IPNetwork('198.51.100.0/26'), tenant=visible_tenant)
+        hidden_child = Prefix.objects.create(prefix=IPNetwork('198.51.100.64/26'))
+
+        obj_perm = ObjectPermission(
+            name='View prefixes', actions=['view'], constraints={'tenant__slug': 'pp-partial'}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Prefix))
+
+        self.assertIn(visible_child, Prefix.objects.restrict(self.user, 'view'))
+        self.assertNotIn(hidden_child, Prefix.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:prefix_prefixes', kwargs={'pk': parent.pk})
+        response = self.client.get(url)
+
+        # Pins that a constraint does not suppress availability, not how the hidden child is handled.
+        self.assertHttpStatus(response, 200)
+        self.assertTrue(response.context['show_available'])
+        self.assertTrue([p for p in response.context['table'].data if p.pk is None])
+
+    def test_prefix_ipaddresses_with_single_address_range(self):
+        self.add_permissions('ipam.view_prefix', 'ipam.view_ipaddress', 'ipam.view_iprange')
+        # The IP Addresses tab annotates child IP addresses alongside any
+        # mark-populated child IP ranges. Make sure a single-address range
+        # (start_address == end_address) renders without errors and is shown
+        # in its range-like display form rather than as a plain IP address.
+        prefix = Prefix.objects.create(prefix=IPNetwork('192.168.0.0/16'))
+        IPAddress.objects.create(address=IPNetwork('192.168.0.1/16'))
+        IPRange.objects.create(
+            start_address=IPNetwork('192.168.0.50/16'),
+            end_address=IPNetwork('192.168.0.50/16'),
+            mark_populated=True,
+        )
+
+        url = reverse('ipam:prefix_ipaddresses', kwargs={'pk': prefix.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        # The single-address range is rendered with both endpoints, not as
+        # 192.168.0.50/16 (which would make it indistinguishable from an
+        # IPAddress row in this mixed-record view).
+        self.assertContains(response, '192.168.0.50-192.168.0.50/16')
+
     def test_prefix_import(self):
         """
         Custom import test for YAML-based imports (versus CSV)
         """
+        self.add_permissions('dcim.view_site', 'ipam.view_vlan')
         site = Site.objects.get(name='Site 1')
         IMPORT_DATA = f"""
 prefix: 10.1.1.0/24
@@ -540,11 +1537,11 @@ scope_id: {site.pk}
         self.assertEqual(prefix.vlan.vid, 101)
         self.assertEqual(prefix.scope, site)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_prefix_import_with_scope_name(self):
         """
         Test YAML-based import using scope_name instead of scope_id.
         """
+        self.add_permissions('dcim.view_site')
         site = Site.objects.get(name='Site 1')
         IMPORT_DATA = """
 prefix: 10.1.3.0/24
@@ -566,11 +1563,11 @@ scope_name: Site 1
         self.assertEqual(prefix.status, PrefixStatusChoices.STATUS_ACTIVE)
         self.assertEqual(prefix.scope, site)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_prefix_import_with_vlan_group(self):
         """
         This test covers a unique import edge case where VLAN group is specified during the import.
         """
+        self.add_permissions('dcim.view_site', 'ipam.view_vlan', 'ipam.view_vlangroup')
         site = Site.objects.get(name='Site 1')
         IMPORT_DATA = f"""
 prefix: 10.1.2.0/24
@@ -598,12 +1595,12 @@ vlan: 102
         self.assertEqual(prefix.vlan.vid, 102)
         self.assertEqual(prefix.scope, site)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_prefix_import_with_vlan_site_multiple_vlans_same_vid(self):
         """
         Test import when multiple VLANs exist with the same vid but different sites.
         Ref: #20560
         """
+        self.add_permissions('dcim.view_site', 'ipam.view_vlan')
         site1 = Site.objects.get(name='Site 1')
         site2 = Site.objects.get(name='Site 2')
 
@@ -636,13 +1633,13 @@ description: LOC02-MGMT
         prefix = Prefix.objects.get(prefix='10.11.0.0/22')
         self.assertEqual(prefix.vlan, vlan1)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_prefix_import_with_vlan_site_and_global_vlan(self):
         """
         Test import when a global VLAN (no site) and site-specific VLAN exist with same vid.
         When vlan_site is specified, should prefer the site-specific VLAN.
         Ref: #20560
         """
+        self.add_permissions('dcim.view_site', 'ipam.view_vlan')
         site1 = Site.objects.get(name='Site 1')
 
         # Create a global VLAN (no site) and a site-specific VLAN with the same vid
@@ -722,6 +1719,8 @@ class IPRangeTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             "VRF 1,10.1.0.1/16,10.1.9.254/16,active",
             "VRF 1,10.2.0.1/16,10.2.9.254/16,active",
             "VRF 1,10.3.0.1/16,10.3.9.254/16,active",
+            # Single-address range (start == end)
+            "VRF 1,10.4.0.1/16,10.4.0.1/16,active",
         )
 
         cls.csv_update_data = (
@@ -739,8 +1738,8 @@ class IPRangeTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'description': 'New description',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_iprange_ipaddresses(self):
+        self.add_permissions('ipam.view_iprange', 'ipam.view_ipaddress')
         iprange = IPRange.objects.create(
             start_address=IPNetwork('192.168.0.1/24'),
             end_address=IPNetwork('192.168.0.100/24'),
@@ -756,6 +1755,28 @@ class IPRangeTestCase(ViewTestCases.PrimaryObjectViewTestCase):
 
         url = reverse('ipam:iprange_ipaddresses', kwargs={'pk': iprange.pk})
         self.assertHttpStatus(self.client.get(url), 200)
+
+    def test_create_single_address_range(self):
+        # Exercise the UI form path with start_address == end_address. The
+        # generic test_create_object_with_permission covers the multi-address
+        # case via cls.form_data; this test mirrors that flow for the single-
+        # address case so both paths stay covered.
+        self.add_permissions('ipam.add_iprange')
+        form_data = {
+            'start_address': '192.0.6.10/24',
+            'end_address': '192.0.6.10/24',
+            'status': IPRangeStatusChoices.STATUS_ACTIVE,
+        }
+        initial_count = IPRange.objects.count()
+
+        response = self.client.post(reverse('ipam:iprange_add'), data=form_data)
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(IPRange.objects.count(), initial_count + 1)
+
+        iprange = IPRange.objects.order_by('pk').last()
+        self.assertEqual(str(iprange.start_address), '192.0.6.10/24')
+        self.assertEqual(str(iprange.end_address), '192.0.6.10/24')
+        self.assertEqual(iprange.size, 1)
 
 
 class IPAddressTestCase(ViewTestCases.PrimaryObjectViewTestCase):
@@ -831,6 +1852,39 @@ class IPAddressTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'dns_name': 'example',
             'description': 'New description',
         }
+
+    def test_bulk_add_ipaddresses_with_changelog_message(self):
+        self.add_permissions('ipam.view_ipaddress', 'ipam.view_vrf')
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+
+        vrf = VRF.objects.get(name='VRF 1')
+        changelog_message = 'Bulk-created IP addresses'
+        addresses = [IPNetwork(f'198.51.100.{i}/24') for i in range(10, 13)]
+        url = reverse('ipam:ipaddress_bulk_add')
+        data = {
+            'pattern': '198.51.100.[10-12]/24',
+            'vrf': vrf.pk,
+            'status': IPAddressStatusChoices.STATUS_ACTIVE,
+            'changelog_message': changelog_message,
+        }
+
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+
+        created_addresses = list(IPAddress.objects.filter(address__in=addresses, vrf=vrf))
+        self.assertEqual(len(created_addresses), len(addresses))
+
+        objectchanges = ObjectChange.objects.filter(
+            action=ObjectChangeActionChoices.ACTION_CREATE,
+            changed_object_type=ContentType.objects.get_for_model(IPAddress),
+            changed_object_id__in=[obj.pk for obj in created_addresses],
+        )
+        self.assertEqual(objectchanges.count(), len(addresses))
+        for objectchange in objectchanges:
+            self.assertEqual(objectchange.message, changelog_message)
 
 
 class FHRPGroupTestCase(ViewTestCases.PrimaryObjectViewTestCase):
@@ -944,6 +1998,137 @@ class VLANGroupTestCase(ViewTestCases.OrganizationalObjectViewTestCase):
             'description': 'New description',
         }
 
+    def test_vlans_filter_suppresses_available_vlans(self):
+        self.add_permissions('ipam.view_vlangroup', 'ipam.view_vlan')
+
+        group = VLANGroup.objects.create(
+            name='Filtered VLAN Group',
+            slug='filtered-vlan-group'
+        )
+        vlans = (
+            VLAN(group=group, vid=100, name='VLAN100'),
+            VLAN(group=group, vid=200, name='VLAN200'),
+        )
+        VLAN.objects.bulk_create(vlans)
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url, {'vid': 100})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, 'VLAN100')
+        self.assertNotContains(response, 'VLAN200')
+
+    def test_vlans_saved_filter_suppresses_available_vlans(self):
+        self.add_permissions('ipam.view_vlangroup', 'ipam.view_vlan')
+
+        group = VLANGroup.objects.create(
+            name='Saved Filter VLAN Group',
+            slug='saved-filter-vlan-group'
+        )
+        vlans = (
+            VLAN(group=group, vid=100, name='VLAN100'),
+            VLAN(group=group, vid=200, name='VLAN200'),
+        )
+        VLAN.objects.bulk_create(vlans)
+
+        saved_filter = SavedFilter.objects.create(
+            name='VLAN 100',
+            slug='vlan-100',
+            parameters={
+                'vid': ['100'],
+            },
+        )
+        saved_filter.object_types.add(ObjectType.objects.get_for_model(VLAN))
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url, {'filter_id': saved_filter.pk})
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(len(response.context['table'].data), 1)
+        self.assertContains(response, 'VLAN100')
+        self.assertNotContains(response, 'VLAN200')
+
+    def test_vlans_unfiltered_shows_available_vlans(self):
+        """An unfiltered VLANs tab injects synthetic available-VLAN rows."""
+        self.add_permissions('ipam.view_vlangroup', 'ipam.view_vlan')
+
+        group = VLANGroup.objects.create(name='Unfiltered VLAN Group', slug='unfiltered-vlan-group')
+        VLAN.objects.create(group=group, vid=1, name='VLAN0001')
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertGreater(len(response.context['table'].data), 1)
+
+    def test_vlans_custom_field_constraint_shows_available(self):
+        """A tenant custom-field permission constraint does not suppress available-VLAN rows."""
+        cf = CustomField.objects.create(name='integerCustomField', type=CustomFieldTypeChoices.TYPE_INTEGER)
+        cf.object_types.set([ObjectType.objects.get_for_model(Tenant)])
+        tenant = Tenant.objects.create(
+            name='VLAN CF Tenant', slug='vlan-cf-tenant', custom_field_data={'integerCustomField': 1}
+        )
+
+        group = VLANGroup.objects.create(name='CF VLAN Group', slug='cf-vlan-group')
+        vlan = VLAN.objects.create(group=group, vid=10, name='VLAN0010', tenant=tenant)
+
+        self.add_permissions('ipam.view_vlangroup')
+        obj_perm = ObjectPermission(
+            name='View VLANs', actions=['view'], constraints={'tenant__custom_field_data__integerCustomField': 1}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(VLAN))
+
+        self.assertIn(vlan, VLAN.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertGreater(len(response.context['table'].data), 1)
+
+    def test_vlans_partial_visibility_shows_available(self):
+        """A constraint that hides one VLAN does not suppress the available-VLAN rows."""
+        self.add_permissions('ipam.view_vlangroup')
+        visible_tenant = Tenant.objects.create(name='VLAN Partial', slug='vlan-partial')
+
+        group = VLANGroup.objects.create(name='Partial VLAN Group', slug='partial-vlan-group')
+        visible_vlan = VLAN.objects.create(group=group, vid=10, name='VLAN0010', tenant=visible_tenant)
+        hidden_vlan = VLAN.objects.create(group=group, vid=20, name='VLAN0020')
+
+        obj_perm = ObjectPermission(name='View VLANs', actions=['view'], constraints={'tenant__slug': 'vlan-partial'})
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(VLAN))
+
+        self.assertIn(visible_vlan, VLAN.objects.restrict(self.user, 'view'))
+        self.assertNotIn(hidden_vlan, VLAN.objects.restrict(self.user, 'view'))
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url)
+
+        # Pins that a constraint does not suppress availability, not how the hidden child is handled.
+        self.assertHttpStatus(response, 200)
+        rendered = list(response.context['table'].data)
+        self.assertIn(visible_vlan.vid, {r.vid for r in rendered if isinstance(r, VLAN)})
+        self.assertTrue([r for r in rendered if isinstance(r, dict)])  # synthetic available VLANs present
+
+    def test_vlans_sorted_suppresses_available(self):
+        """A sorted VLANs tab drops synthetic available-VLAN rows."""
+        self.add_permissions('ipam.view_vlangroup', 'ipam.view_vlan')
+        group = VLANGroup.objects.create(name='Sorted VLAN Group', slug='sorted-vlan-group')
+        vlan = VLAN.objects.create(group=group, vid=10, name='VLAN0010')
+
+        url = reverse('ipam:vlangroup_vlans', kwargs={'pk': group.pk})
+        response = self.client.get(url, {'sort': 'vid'})
+
+        self.assertHttpStatus(response, 200)
+        rendered = list(response.context['table'].data)
+        self.assertEqual({r.vid for r in rendered if isinstance(r, VLAN)}, {vlan.vid})
+        self.assertFalse([r for r in rendered if isinstance(r, dict)])  # no synthetic available VLANs
+
 
 class VLANTestCase(ViewTestCases.PrimaryObjectViewTestCase):
     model = VLAN
@@ -1012,6 +2197,178 @@ class VLANTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'role': roles[1].pk,
             'description': 'New description',
         }
+
+    def test_bulk_add_vlans(self):
+        self.add_permissions('ipam.add_vlan')
+
+        group = VLANGroup.objects.get(name='VLAN Group 1')
+        initial_count = VLAN.objects.count()
+        expected_vids = (110, 120, 121, 122)
+
+        form_data = {
+            'pattern': '110,120-122',
+            'group': group.pk,
+            'name': 'Pool-{vid}',
+            'status': VLANStatusChoices.STATUS_RESERVED,
+        }
+
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(VLAN.objects.count(), initial_count + len(expected_vids))
+
+        for vid in expected_vids:
+            self.assertTrue(
+                VLAN.objects.filter(
+                    group=group,
+                    vid=vid,
+                    name=f'Pool-{vid}'
+                ).exists()
+            )
+
+    def test_bulk_add_vlans_rolls_back_on_duplicate_name(self):
+        self.add_permissions('ipam.add_vlan')
+
+        group = VLANGroup.objects.get(name='VLAN Group 1')
+        initial_count = VLAN.objects.count()
+
+        form_data = {
+            'pattern': '110-112',
+            'group': group.pk,
+            'name': 'Duplicate name',
+            'status': VLANStatusChoices.STATUS_RESERVED,
+        }
+
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(VLAN.objects.count(), initial_count)
+        self.assertFalse(VLAN.objects.filter(group=group, vid=110).exists())
+
+    def test_bulk_add_vlans_rolls_back_when_any_id_outside_group_range(self):
+        self.add_permissions('ipam.add_vlan')
+
+        group = VLANGroup.objects.create(
+            name='Restricted VLAN Group',
+            slug='restricted-vlan-group',
+            vid_ranges=[NumericRange(200, 204)]  # Valid VIDs: 200-203
+        )
+        initial_count = VLAN.objects.count()
+
+        form_data = {
+            'pattern': '200-203,500',
+            'group': group.pk,
+            'name': 'Restricted-{vid}',
+            'status': VLANStatusChoices.STATUS_RESERVED,
+        }
+
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(VLAN.objects.count(), initial_count)
+        self.assertFalse(VLAN.objects.filter(group=group, vid=200).exists())
+        self.assertFalse(VLAN.objects.filter(group=group, vid=203).exists())
+        self.assertFalse(VLAN.objects.filter(group=group, vid=500).exists())
+
+    def test_bulk_add_vlans_pattern_shapes(self):
+        """Single values, multiple values, ranges, and combinations create the expected VLANs."""
+        self.add_permissions('ipam.add_vlan')
+        # The combination runs against a second group: subTests share one transaction, and VIDs
+        # 10 & 20 would otherwise collide with the multiple-values case via the (group, vid) constraint.
+        cases = (
+            ('500', (500,), 'VLAN Group 1'),
+            ('5,10,20', (5, 10, 20), 'VLAN Group 1'),
+            ('600-605', tuple(range(600, 606)), 'VLAN Group 1'),
+            ('1,10-20,300-305', (1, *range(10, 21), *range(300, 306)), 'VLAN Group 2'),
+        )
+        for pattern, expected_vids, group_name in cases:
+            with self.subTest(pattern=pattern):
+                group = VLANGroup.objects.get(name=group_name)
+                initial_count = VLAN.objects.count()
+                form_data = {
+                    'pattern': pattern,
+                    'group': group.pk,
+                    'name': 'Pool-{vid}',
+                    'status': VLANStatusChoices.STATUS_ACTIVE,
+                }
+                response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+                self.assertHttpStatus(response, 302)
+                self.assertEqual(VLAN.objects.count(), initial_count + len(expected_vids))
+                for vid in expected_vids:
+                    self.assertTrue(VLAN.objects.filter(group=group, vid=vid, name=f'Pool-{vid}').exists())
+
+    def test_bulk_add_vlans_invalid_pattern(self):
+        """An invalid pattern re-renders the form with a pattern error and creates nothing."""
+        self.add_permissions('ipam.add_vlan')
+        initial_count = VLAN.objects.count()
+
+        for pattern in ('abc', '20-10', '0', '4095', '10-'):
+            with self.subTest(pattern=pattern):
+                form_data = {
+                    'pattern': pattern,
+                    'name': 'Pool-{vid}',
+                    'status': VLANStatusChoices.STATUS_ACTIVE,
+                }
+                response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+                self.assertHttpStatus(response, 200)
+                self.assertIn('pattern', response.context['form'].errors)
+                self.assertEqual(VLAN.objects.count(), initial_count)
+
+    def test_bulk_add_vlans_static_name_without_group(self):
+        """A static name (no {vid} placeholder) is permitted across VLANs not assigned to a group."""
+        self.add_permissions('ipam.add_vlan')
+        initial_count = VLAN.objects.count()
+
+        form_data = {
+            'pattern': '710-712',
+            'name': 'Same name',
+            'status': VLANStatusChoices.STATUS_ACTIVE,
+        }
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 302)
+        self.assertEqual(VLAN.objects.count(), initial_count + 3)
+        self.assertEqual(VLAN.objects.filter(name='Same name').count(), 3)
+
+    def test_bulk_add_vlans_rolls_back_on_constrained_permission(self):
+        """Bulk creation rolls back when a generated VLAN falls outside the user's add constraints."""
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['add'],
+            constraints={'vid__lt': 120}
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(VLAN))
+
+        initial_count = VLAN.objects.count()
+        form_data = {
+            'pattern': '110,120-122',
+            'name': 'Pool-{vid}',
+            'status': VLANStatusChoices.STATUS_ACTIVE,
+        }
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(VLAN.objects.count(), initial_count)
+        self.assertTrue(response.context['form'].non_field_errors())
+
+    def test_bulk_add_vlans_propagates_field_errors(self):
+        """A per-object validation error on a non-pattern field is reported on the bulk-create form."""
+        self.add_permissions('ipam.add_vlan')
+        initial_count = VLAN.objects.count()
+
+        form_data = {
+            'pattern': '800',
+            'name': 'Pool-{vid}',
+            'status': VLANStatusChoices.STATUS_ACTIVE,
+            'qinq_role': VLANQinQRoleChoices.ROLE_CUSTOMER,  # Requires an SVLAN
+        }
+        response = self.client.post(reverse('ipam:vlan_bulk_add'), form_data)
+
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(VLAN.objects.count(), initial_count)
+        self.assertTrue(response.context['form'].non_field_errors())
 
 
 class VLANTranslationPolicyTestCase(ViewTestCases.PrimaryObjectViewTestCase):
@@ -1204,6 +2561,8 @@ class ServiceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         )
         IPAddress.objects.bulk_create(ip_addresses)
 
+        owner = Owner.objects.create(name='Owner 1')
+
         tags = create_tags('Alpha', 'Bravo', 'Charlie')
 
         cls.form_data = {
@@ -1214,6 +2573,7 @@ class ServiceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'ports': '104,105',
             'ipaddresses': [],
             'description': 'A new service',
+            'owner': owner.pk,
             'tags': [t.pk for t in tags],
         }
 
@@ -1238,8 +2598,8 @@ class ServiceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'description': 'New description',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
     def test_unassigned_ip_addresses(self):
+        self.add_permissions('ipam.view_service', 'dcim.view_device', 'ipam.view_ipaddress')
         device = Device.objects.first()
         addr = IPAddress.objects.create(address='192.0.2.4/24')
         csv_data = (
@@ -1268,8 +2628,8 @@ class ServiceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         self.assertIn(addr.address, form_errors['__all__'][0])
         self.assertEqual(self._get_queryset().count(), initial_count)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
     def test_alternate_csv_import(self):
+        self.add_permissions('ipam.view_service', 'dcim.view_device', 'ipam.view_ipaddress')
         device = Device.objects.first()
         interface = device.interfaces.first()
         addr = IPAddress.objects.create(assigned_object=interface, address='192.0.2.3/24')
@@ -1298,9 +2658,13 @@ class ServiceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         self.assertHttpStatus(response, 302)
         self.assertEqual(self._get_queryset().count(), initial_count + len(csv_data) - 1)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_create_from_template(self):
-        self.add_permissions('ipam.add_service')
+        self.add_permissions(
+            'ipam.view_service',
+            'ipam.add_service',
+            'dcim.view_device',
+            'ipam.view_servicetemplate',
+        )
 
         device = Device.objects.first()
         service_template = ServiceTemplate.objects.create(

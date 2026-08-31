@@ -7,10 +7,13 @@ __all__ = (
     'array_to_ranges',
     'array_to_string',
     'check_ranges_overlap',
+    'deep_compare_dict',
     'deepmerge',
     'drange',
     'flatten_dict',
     'get_config_value_ci',
+    'get_inclusive_integer_range_bounds',
+    'normalize_integer_range',
     'ranges_to_string',
     'ranges_to_string_list',
     'resolve_attr_path',
@@ -83,6 +86,35 @@ def shallow_compare_dict(source_dict, destination_dict, exclude=tuple()):
     return difference
 
 
+def deep_compare_dict(source_dict, destination_dict, exclude=tuple()):
+    """
+    Return a two-tuple of dictionaries (added, removed) representing the differences between source_dict and
+    destination_dict. For values which are themselves dicts, the comparison is performed recursively such that only
+    the changed keys within the nested dict are included. `exclude` is a list or tuple of keys to be ignored.
+    """
+    added = {}
+    removed = {}
+
+    all_keys = set(source_dict) | set(destination_dict)
+    for key in all_keys:
+        if key in exclude:
+            continue
+        src_val = source_dict.get(key)
+        dst_val = destination_dict.get(key)
+        if src_val == dst_val:
+            continue
+        if isinstance(src_val, dict) and isinstance(dst_val, dict):
+            sub_added, sub_removed = deep_compare_dict(src_val, dst_val)
+            if sub_added or sub_removed:
+                added[key] = sub_added
+                removed[key] = sub_removed
+        else:
+            added[key] = dst_val
+            removed[key] = src_val
+
+    return added, removed
+
+
 #
 # Array utilities
 #
@@ -139,16 +171,43 @@ def drange(start, end, step=decimal.Decimal(1)):
             start += step
 
 
+def get_inclusive_integer_range_bounds(value_range):
+    """
+    Return the lower and upper bounds of a bounded, non-empty discrete
+    integer range as inclusive values.
+
+    For example, ``[10, 20)`` is returned as ``(10, 19)``, while
+    ``[10, 20]`` is returned as ``(10, 20)``.
+
+    Both bounds must be non-``None``; unbounded ranges are not supported.
+    """
+    lower = value_range.lower if value_range.lower_inc else value_range.lower + 1
+    upper = value_range.upper if value_range.upper_inc else value_range.upper - 1
+
+    return lower, upper
+
+
+def normalize_integer_range(value_range):
+    """
+    Return an equivalent canonical half-open ``[)`` range for a bounded,
+    non-empty discrete integer range, regardless of the input range's
+    bounds metadata.
+    """
+    lower, upper = get_inclusive_integer_range_bounds(value_range)
+
+    return NumericRange(lower, upper + 1, bounds='[)')
+
+
 def check_ranges_overlap(ranges):
     """
-    Check for overlap in an iterable of NumericRanges.
+    Check for overlap in an iterable of NumericRanges. Does not mutate the input.
     """
-    ranges.sort(key=lambda x: x.lower)
+    ranges = sorted(ranges, key=lambda value_range: get_inclusive_integer_range_bounds(value_range)[0])
 
     for i in range(1, len(ranges)):
-        prev_range = ranges[i - 1]
-        prev_upper = prev_range.upper if prev_range.upper_inc else prev_range.upper - 1
-        lower = ranges[i].lower if ranges[i].lower_inc else ranges[i].lower + 1
+        prev_upper = get_inclusive_integer_range_bounds(ranges[i - 1])[1]
+        lower = get_inclusive_integer_range_bounds(ranges[i])[0]
+
         if prev_upper >= lower:
             return True
 
@@ -171,9 +230,7 @@ def ranges_to_string_list(ranges):
 
     output: list[str] = []
     for r in ranges:
-        # Compute inclusive bounds regardless of how the DB range is stored.
-        lower = r.lower if r.lower_inc else r.lower + 1
-        upper = r.upper if r.upper_inc else r.upper - 1
+        lower, upper = get_inclusive_integer_range_bounds(r)
         output.append(f"{lower}-{upper}" if lower != upper else str(lower))
     return output
 

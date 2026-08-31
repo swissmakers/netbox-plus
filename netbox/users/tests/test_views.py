@@ -1,6 +1,10 @@
+from django.urls import reverse
+
 from core.models import ObjectType
+from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
+from users.constants import TOKEN_PREFIX
 from users.models import *
-from utilities.testing import ViewTestCases, create_test_user
+from utilities.testing import TestCase, ViewTestCases, create_test_user
 
 
 class UserTestCase(
@@ -216,6 +220,8 @@ class TokenTestCase(
     model = Token
     maxDiff = None
     validation_excluded_fields = ['token', 'user']
+    # Tokens in form_data/csv_data are created for other users, which requires the grant_token permission
+    user_permissions = ('users.grant_token',)
 
     @classmethod
     def setUpTestData(cls):
@@ -233,7 +239,6 @@ class TokenTestCase(
 
         cls.form_data = {
             'version': 2,
-            'token': '4F9DAouzURLbicyoG55htImgqQ0b4UZHP5LUYgl5',
             'user': users[0].pk,
             'description': 'Test token',
             'enabled': True,
@@ -256,6 +261,279 @@ class TokenTestCase(
         cls.bulk_edit_data = {
             'description': 'New description',
         }
+
+
+class TokenOneTimeAuthStringTestCase(TestCase):
+    """
+    Verify that the plaintext value of a newly-created Token is surfaced exactly once via the detail view, and
+    that it is never persisted in the database.
+    """
+    user_permissions = ('users.add_token', 'users.view_token', 'users.view_user', 'users.grant_token')
+
+    def test_create_stashes_plaintext_and_detail_view_renders_it_once(self):
+        target_user = create_test_user('token_owner')
+
+        # Create a Token via the admin add view
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': target_user.pk,
+            'description': 'one-time-display test',
+            'enabled': 'on',
+            'write_enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+
+        token = Token.objects.get(description='one-time-display test')
+        # Plaintext must NEVER be persisted for v2 tokens
+        self.assertIsNone(token.plaintext)
+        self.assertIsNotNone(token.hmac_digest)
+        self.assertIsNotNone(token.key)
+
+        # Plaintext should be stashed on the session, keyed by token PK
+        session_key = f'_token_plaintext_{token.pk}'
+        self.assertIn(session_key, self.client.session)
+        plaintext = self.client.session[session_key]
+        self.assertEqual(len(plaintext), 40)
+        # Plaintext must validate against the stored digest
+        self.assertTrue(token.validate(plaintext))
+
+        # First GET on the detail view: full auth string should appear and be popped from the session
+        response = self.client.get(token.get_absolute_url())
+        self.assertEqual(response.status_code, 200)
+        expected_auth_string = f'Bearer {TOKEN_PREFIX}{token.key}.{plaintext}'
+        self.assertContains(response, expected_auth_string)
+        self.assertNotIn(session_key, self.client.session)
+
+        # Second GET: the banner must no longer render
+        response = self.client.get(token.get_absolute_url())
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, expected_auth_string)
+        # Specifically, the banner element must be gone
+        self.assertNotContains(response, 'id="new-token-auth-string"')
+
+    def test_form_ignores_user_supplied_token_field(self):
+        """
+        Submitting a 'token' POST parameter should be silently ignored: the model auto-generates plaintext on save.
+        """
+        target_user = create_test_user('token_owner_2')
+
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': target_user.pk,
+            'description': 'ignored-plaintext test',
+            'token': 'attacker_supplied_plaintext_value_xxxxxxx',
+            'enabled': 'on',
+            'write_enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+
+        token = Token.objects.get(description='ignored-plaintext test')
+        # The supplied plaintext must NOT have been used
+        self.assertFalse(token.validate('attacker_supplied_plaintext_value_xxxxxxx'))
+        # Whatever was auto-generated must validate
+        plaintext = self.client.session[f'_token_plaintext_{token.pk}']
+        self.assertTrue(token.validate(plaintext))
+
+
+class TokenGrantPermissionTestCase(TestCase):
+    """
+    Verify that creating a Token for another user via the UI requires the grant_token permission, consistent
+    with REST API enforcement.
+    """
+    user_permissions = ('users.add_token', 'users.change_token', 'users.view_token', 'users.view_user')
+
+    def test_create_token_for_self_without_grant(self):
+        # Creating a Token for oneself should not require the grant_token permission.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': self.user.pk,
+            'description': 'self token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='self token', user=self.user).exists())
+
+    def test_create_token_for_other_user_without_grant(self):
+        # Creating a Token for another user without the grant_token permission should be prohibited.
+        other_user = create_test_user('other_user')
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': other_user.pk,
+            'description': 'other token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=other_user).exists())
+
+    def test_create_token_for_other_user_with_grant(self):
+        # Creating a Token for another user with the grant_token permission should succeed.
+        self.add_permissions('users.grant_token')
+        other_user = create_test_user('other_user')
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': other_user.pk,
+            'description': 'other token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='other token', user=other_user).exists())
+
+    def test_edit_token_for_other_user_without_grant(self):
+        # Editing an existing Token owned by another user should not require the grant_token permission, since
+        # the user field is read-only on edits (consistent with the REST API).
+        other_user = create_test_user('other_user')
+        token = Token.objects.create(user=other_user, description='original')
+        response = self.client.post(reverse('users:token_edit', kwargs={'pk': token.pk}), data={
+            'version': token.version,
+            'user': other_user.pk,
+            'description': 'updated',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.description, 'updated')
+
+    def test_bulk_import_token_for_other_user_without_grant(self):
+        # Bulk-importing a Token for another user without the grant_token permission should be prohibited.
+        other_user = create_test_user('other_user')
+        csv_data = '\n'.join((
+            "user,description",
+            f"{other_user.pk},imported token",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=other_user).exists())
+
+    def test_bulk_import_token_for_other_user_with_grant(self):
+        # Bulk-importing a Token for another user with the grant_token permission should succeed.
+        self.add_permissions('users.grant_token')
+        other_user = create_test_user('other_user')
+        csv_data = '\n'.join((
+            "user,description",
+            f"{other_user.pk},imported token",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='imported token', user=other_user).exists())
+
+    def test_bulk_update_token_for_other_user_without_grant(self):
+        # Bulk-updating an existing Token owned by another user should not require the grant_token permission,
+        # even when the CSV includes the (unchanged) user column. Consistent with the UI edit path.
+        other_user = create_test_user('other_user')
+        token = Token.objects.create(user=other_user, description='original')
+        csv_data = '\n'.join((
+            "id,user,description",
+            f"{token.pk},{other_user.pk},updated",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.description, 'updated')
+
+    def test_bulk_update_cannot_reassign_token_owner(self):
+        # A bulk update must not be able to reassign a Token's owner, regardless of the grant_token permission
+        # (the user field is read-only on update, consistent with the REST API).
+        self.add_permissions('users.grant_token')
+        owner = create_test_user('owner')
+        new_owner = create_test_user('new_owner')
+        token = Token.objects.create(user=owner, description='original')
+        csv_data = '\n'.join((
+            "id,user,description",
+            f"{token.pk},{new_owner.pk},updated",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.user, owner)
+        self.assertEqual(token.description, 'updated')
+
+    def _add_constrained_grant_permission(self, constraints):
+        """Add a constrained grant_token ObjectPermission to self.user."""
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='constrained_grant_token',
+            constraints=constraints,
+            actions=['grant'],
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+    def test_create_token_via_form_constrained_grant_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not
+        be bypassed via the UI create form. has_perm(obj=None) short-circuits to True
+        without evaluating constraints; user_may_grant_token() applies them correctly.
+        """
+        superuser = User.objects.create_user(username='form_constrained_super', is_superuser=True)
+        regular = User.objects.create_user(username='form_constrained_regular')
+        self._add_constrained_grant_permission({'user__is_superuser': False})
+
+        # Constrained grant must deny token creation for a superuser.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': superuser.pk,
+            'description': 'constrained denied',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=superuser).exists())
+
+        # Constrained grant must allow token creation for a non-superuser.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': regular.pk,
+            'description': 'constrained allowed',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='constrained allowed', user=regular).exists())
+
+    def test_bulk_import_token_constrained_grant_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not
+        be bypassed via bulk CSV import. has_perm(obj=None) short-circuits to True
+        without evaluating constraints; user_may_grant_token() applies them correctly.
+        """
+        superuser = User.objects.create_user(username='bulk_constrained_super', is_superuser=True)
+        regular = User.objects.create_user(username='bulk_constrained_regular')
+        self._add_constrained_grant_permission({'user__is_superuser': False})
+
+        # Constrained grant must deny bulk import for a superuser.
+        csv_data = '\n'.join(('user,description', f"{superuser.pk},bulk denied"))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=superuser).exists())
+
+        # Constrained grant must allow bulk import for a non-superuser.
+        csv_data = '\n'.join(('user,description', f"{regular.pk},bulk allowed"))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='bulk allowed', user=regular).exists())
 
 
 class OwnerGroupTestCase(ViewTestCases.AdminModelViewTestCase):

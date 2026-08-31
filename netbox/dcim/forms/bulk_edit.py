@@ -35,6 +35,7 @@ from wireless.models import WirelessLAN, WirelessLANGroup
 
 __all__ = (
     'CableBulkEditForm',
+    'CableBundleBulkEditForm',
     'ConsolePortBulkEditForm',
     'ConsolePortTemplateBulkEditForm',
     'ConsoleServerPortBulkEditForm',
@@ -67,6 +68,7 @@ __all__ = (
     'PowerPortBulkEditForm',
     'PowerPortTemplateBulkEditForm',
     'RackBulkEditForm',
+    'RackGroupBulkEditForm',
     'RackReservationBulkEditForm',
     'RackRoleBulkEditForm',
     'RackTypeBulkEditForm',
@@ -207,6 +209,14 @@ class LocationBulkEditForm(NestedGroupModelBulkEditForm):
     nullable_fields = ('parent', 'tenant', 'facility', 'description', 'comments')
 
 
+class RackGroupBulkEditForm(OrganizationalModelBulkEditForm):
+    model = RackGroup
+    fieldsets = (
+        FieldSet('description'),
+    )
+    nullable_fields = ('description', 'comments')
+
+
 class RackRoleBulkEditForm(OrganizationalModelBulkEditForm):
     color = ColorField(
         label=_('Color'),
@@ -342,6 +352,11 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
             'site_id': '$site'
         }
     )
+    group = DynamicModelChoiceField(
+        label=_('Group'),
+        queryset=RackGroup.objects.all(),
+        required=False
+    )
     tenant = DynamicModelChoiceField(
         label=_('Tenant'),
         queryset=Tenant.objects.all(),
@@ -441,14 +456,16 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
 
     model = Rack
     fieldsets = (
-        FieldSet('status', 'role', 'tenant', 'serial', 'asset_tag', 'rack_type', 'description', name=_('Rack')),
+        FieldSet(
+            'status', 'group', 'role', 'tenant', 'serial', 'asset_tag', 'rack_type', 'description', name=_('Rack')
+        ),
         FieldSet('region', 'site_group', 'site', 'location', name=_('Location')),
         FieldSet('outer_width', 'outer_height', 'outer_depth', 'outer_unit', name=_('Outer Dimensions')),
         FieldSet('form_factor', 'width', 'u_height', 'desc_units', 'airflow', 'mounting_depth', name=_('Hardware')),
         FieldSet('weight', 'max_weight', 'weight_unit', name=_('Weight')),
     )
     nullable_fields = (
-        'location', 'tenant', 'role', 'serial', 'asset_tag', 'outer_width', 'outer_height', 'outer_depth',
+        'location', 'group', 'tenant', 'role', 'serial', 'asset_tag', 'outer_width', 'outer_height', 'outer_depth',
         'outer_unit', 'weight', 'max_weight', 'weight_unit', 'description', 'comments',
     )
 
@@ -776,6 +793,24 @@ class ModuleBulkEditForm(PrimaryModelBulkEditForm):
     nullable_fields = ('serial', 'description', 'comments')
 
 
+class CableBundleBulkEditForm(PrimaryModelBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=CableBundle.objects.all(),
+        widget=forms.MultipleHiddenInput
+    )
+    description = forms.CharField(
+        label=_('Description'),
+        max_length=200,
+        required=False,
+    )
+
+    model = CableBundle
+    fieldsets = (
+        FieldSet('description',),
+    )
+    nullable_fields = ('description', 'comments')
+
+
 class CableBulkEditForm(PrimaryModelBulkEditForm):
     type = forms.ChoiceField(
         label=_('Type'),
@@ -800,6 +835,11 @@ class CableBulkEditForm(PrimaryModelBulkEditForm):
         queryset=Tenant.objects.all(),
         required=False
     )
+    bundle = DynamicModelChoiceField(
+        label=_('Bundle'),
+        queryset=CableBundle.objects.all(),
+        required=False,
+    )
     label = forms.CharField(
         label=_('Label'),
         max_length=100,
@@ -823,11 +863,11 @@ class CableBulkEditForm(PrimaryModelBulkEditForm):
 
     model = Cable
     fieldsets = (
-        FieldSet('type', 'status', 'profile', 'tenant', 'label', 'description'),
+        FieldSet('type', 'status', 'profile', 'tenant', 'bundle', 'label', 'description'),
         FieldSet('color', 'length', 'length_unit', name=_('Attributes')),
     )
     nullable_fields = (
-        'type', 'status', 'profile', 'tenant', 'label', 'color', 'length', 'description', 'comments',
+        'type', 'status', 'profile', 'tenant', 'bundle', 'label', 'color', 'length', 'description', 'comments',
     )
 
 
@@ -949,7 +989,7 @@ class PowerFeedBulkEditForm(PrimaryModelBulkEditForm):
         FieldSet('power_panel', 'rack', 'status', 'type', 'mark_connected', 'description', 'tenant'),
         FieldSet('supply', 'phase', 'voltage', 'amperage', 'max_utilization', name=_('Power'))
     )
-    nullable_fields = ('location', 'tenant', 'description', 'comments')
+    nullable_fields = ('rack', 'tenant', 'description', 'comments')
 
 
 #
@@ -973,6 +1013,10 @@ class ConsolePortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     type = forms.ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(ConsolePortTypeChoices),
+        required=False
+    )
+    description = forms.CharField(
+        label=_('Description'),
         required=False
     )
 
@@ -1207,9 +1251,19 @@ class ModuleBayTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
+    position = forms.CharField(
+        label=_('Position'),
+        max_length=30,
+        required=False
+    )
     description = forms.CharField(
         label=_('Description'),
         required=False
+    )
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
     )
 
     nullable_fields = ('label', 'position', 'description')
@@ -1228,6 +1282,11 @@ class DeviceBayTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     description = forms.CharField(
         label=_('Description'),
         required=False
+    )
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
     )
 
     nullable_fields = ('label', 'description')
@@ -1255,6 +1314,11 @@ class InventoryItemTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     manufacturer = DynamicModelChoiceField(
         label=_('Manufacturer'),
         queryset=Manufacturer.objects.all(),
+        required=False
+    )
+    part_id = forms.CharField(
+        label=_('Part ID'),
+        max_length=50,
         required=False
     )
 
@@ -1653,23 +1717,23 @@ class RearPortBulkEditForm(
 
 
 class ModuleBayBulkEditForm(
-    form_from_model(ModuleBay, ['label', 'position', 'description']),
+    form_from_model(ModuleBay, ['label', 'position', 'enabled', 'description']),
     NetBoxModelBulkEditForm
 ):
     model = ModuleBay
     fieldsets = (
-        FieldSet('label', 'position', 'description'),
+        FieldSet('label', 'position', 'enabled', 'description'),
     )
     nullable_fields = ('label', 'position', 'description')
 
 
 class DeviceBayBulkEditForm(
-    form_from_model(DeviceBay, ['label', 'description']),
+    form_from_model(DeviceBay, ['label', 'enabled', 'description']),
     NetBoxModelBulkEditForm
 ):
     model = DeviceBay
     fieldsets = (
-        FieldSet('label', 'description'),
+        FieldSet('label', 'enabled', 'description'),
     )
     nullable_fields = ('label', 'description')
 
@@ -1753,6 +1817,13 @@ class VirtualDeviceContextBulkEditForm(PrimaryModelBulkEditForm):
         FieldSet('device', 'status', 'tenant'),
     )
     nullable_fields = ('device', 'tenant', )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # The ?device=<id> GET param is navigation context (filter), not an intent to change the
+        # device field — drop it from initial so Django's changed_data doesn't treat it as an edit.
+        self.initial.pop('device', None)
 
 
 #

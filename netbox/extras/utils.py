@@ -1,11 +1,11 @@
 import importlib
+import types
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured, SuspiciousFileOperation
 from django.core.files.storage import Storage, default_storage
 from django.core.files.utils import validate_file_name
 from django.db import models
-from django.db.models import Q
 from taggit.managers import _TaggableManager
 
 from netbox.context import current_request
@@ -21,6 +21,7 @@ __all__ = (
     'is_script',
     'is_taggable',
     'run_validators',
+    'validate_script_content',
 )
 
 
@@ -30,14 +31,7 @@ class SharedObjectViewMixin:
         """
         Return only shared objects, or those owned by the current user, unless this is a superuser.
         """
-        queryset = super().get_queryset(request)
-        if request.user.is_superuser:
-            return queryset
-        if request.user.is_anonymous:
-            return queryset.filter(shared=True)
-        return queryset.filter(
-            Q(shared=True) | Q(user=request.user)
-        )
+        return super().get_queryset(request).restrict_to_shared(request.user)
 
 
 def filename_from_model(model: models.Model) -> str:
@@ -132,6 +126,17 @@ def is_script(obj):
         return (issubclass(obj, Report) and obj != Report) or (issubclass(obj, Script) and obj != Script)
     except TypeError:
         return False
+
+
+def validate_script_content(content, filename):
+    """
+    Validate that the given content can be loaded as a Python module by compiling
+    and executing it. Raises an exception if the script cannot be loaded.
+    """
+    code = compile(content, filename, 'exec')
+    module_name = Path(filename).stem
+    module = types.ModuleType(module_name)
+    exec(code, module.__dict__)
 
 
 def is_report(obj):

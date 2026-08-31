@@ -39,6 +39,7 @@ from wireless.models import WirelessLAN, WirelessLANGroup
 from .common import InterfaceCommonForm, ModuleCommonForm
 
 __all__ = (
+    'CableBundleForm',
     'CableForm',
     'ConsolePortForm',
     'ConsolePortTemplateForm',
@@ -74,6 +75,7 @@ __all__ = (
     'PowerPortForm',
     'PowerPortTemplateForm',
     'RackForm',
+    'RackGroupForm',
     'RackReservationForm',
     'RackRoleForm',
     'RackTypeForm',
@@ -232,6 +234,18 @@ class LocationForm(TenancyForm, NestedGroupModelForm):
         )
 
 
+class RackGroupForm(OrganizationalModelForm):
+    fieldsets = (
+        FieldSet('name', 'slug', 'description', 'tags', name=_('Rack Group')),
+    )
+
+    class Meta:
+        model = RackGroup
+        fields = [
+            'name', 'slug', 'description', 'owner', 'comments', 'tags',
+        ]
+
+
 class RackRoleForm(OrganizationalModelForm):
     fieldsets = (
         FieldSet('name', 'slug', 'color', 'description', 'tags', name=_('Rack Role')),
@@ -289,6 +303,11 @@ class RackForm(TenancyForm, PrimaryModelForm):
             'site_id': '$site'
         }
     )
+    group = DynamicModelChoiceField(
+        label=_('Rack Group'),
+        queryset=RackGroup.objects.all(),
+        required=False
+    )
     role = DynamicModelChoiceField(
         label=_('Role'),
         queryset=RackRole.objects.all(),
@@ -304,7 +323,7 @@ class RackForm(TenancyForm, PrimaryModelForm):
 
     fieldsets = (
         FieldSet(
-            'site', 'location', 'name', 'status', 'role', 'rack_type', 'description', 'airflow', 'tags',
+            'site', 'location', 'group', 'name', 'status', 'role', 'rack_type', 'description', 'airflow', 'tags',
             name=_('Rack')
         ),
         FieldSet('facility_id', 'serial', 'asset_tag', name=_('Inventory Control')),
@@ -314,7 +333,7 @@ class RackForm(TenancyForm, PrimaryModelForm):
     class Meta:
         model = Rack
         fields = [
-            'site', 'location', 'name', 'facility_id', 'tenant_group', 'tenant', 'status', 'role', 'serial',
+            'site', 'location', 'group', 'name', 'facility_id', 'tenant_group', 'tenant', 'status', 'role', 'serial',
             'asset_tag', 'rack_type', 'form_factor', 'width', 'u_height', 'starting_unit', 'desc_units', 'outer_width',
             'outer_height', 'outer_depth', 'outer_unit', 'mounting_depth', 'airflow', 'weight', 'max_weight',
             'weight_unit', 'description', 'owner', 'comments', 'tags',
@@ -671,7 +690,8 @@ class DeviceForm(TenancyForm, PrimaryModelForm):
     )
     local_context_data = JSONField(
         required=False,
-        label=''
+        label='',
+        widget=forms.Textarea(attrs={'aria-label': _('Local config context data')})
     )
     virtual_chassis = DynamicModelChoiceField(
         label=_('Virtual chassis'),
@@ -784,7 +804,7 @@ class ModuleForm(ModuleCommonForm, PrimaryModelForm):
             'device_id': '$device',
         },
         context={
-            'disabled': 'installed_module',
+            'disabled': '_occupied',
         },
     )
     module_type = DynamicModelChoiceField(
@@ -838,6 +858,17 @@ def get_termination_type_choices():
     ])
 
 
+class CableBundleForm(PrimaryModelForm):
+
+    fieldsets = (
+        FieldSet('name', 'description', 'tags', name=_('Cable Bundle')),
+    )
+
+    class Meta:
+        model = CableBundle
+        fields = ['name', 'description', 'owner', 'comments', 'tags']
+
+
 class CableForm(TenancyForm, PrimaryModelForm):
     a_terminations_type = forms.ChoiceField(
         choices=get_termination_type_choices,
@@ -851,12 +882,17 @@ class CableForm(TenancyForm, PrimaryModelForm):
         widget=HTMXSelect(),
         label=_('Type')
     )
+    bundle = DynamicModelChoiceField(
+        queryset=CableBundle.objects.all(),
+        required=False,
+        label=_('Bundle'),
+    )
 
     class Meta:
         model = Cable
         fields = [
             'a_terminations_type', 'b_terminations_type', 'type', 'status', 'profile', 'tenant_group', 'tenant',
-            'label', 'color', 'length', 'length_unit', 'description', 'owner', 'comments', 'tags',
+            'bundle', 'label', 'color', 'length', 'length_unit', 'description', 'owner', 'comments', 'tags',
         ]
 
 
@@ -1063,7 +1099,9 @@ class ModularComponentTemplateForm(ComponentTemplateForm):
         self.fields['name'].help_text = _(
             "Alphanumeric ranges are supported for bulk creation. Mixed cases and types within a single range are not "
             "supported (example: <code>[ge,xe]-0/0/[0-9]</code>). The token <code>{module}</code>, if present, will be "
-            "automatically replaced with the position value when creating a new module."
+            "automatically replaced with the position value when creating a new module. "
+            "The token <code>{vc_position}</code> will be replaced with the device's Virtual Chassis position "
+            "(use <code>{vc_position:1}</code> to specify a fallback (default is 0))"
         )
 
 
@@ -1166,7 +1204,7 @@ class FrontPortTemplateForm(FrontPortFormMixin, ModularComponentTemplateForm):
                 FieldSet('device_type', name=_('Device Type')),
                 FieldSet('module_type', name=_('Module Type')),
             ),
-            'name', 'label', 'type', 'positions', 'rear_ports', 'description',
+            'name', 'label', 'type', 'color', 'positions', 'rear_ports', 'description',
         ),
     )
 
@@ -1224,26 +1262,26 @@ class ModuleBayTemplateForm(ModularComponentTemplateForm):
                 FieldSet('device_type', name=_('Device Type')),
                 FieldSet('module_type', name=_('Module Type')),
             ),
-            'name', 'label', 'position', 'description',
+            'name', 'label', 'position', 'enabled', 'description',
         ),
     )
 
     class Meta:
         model = ModuleBayTemplate
         fields = [
-            'device_type', 'module_type', 'name', 'label', 'position', 'description',
+            'device_type', 'module_type', 'name', 'label', 'position', 'enabled', 'description',
         ]
 
 
 class DeviceBayTemplateForm(ComponentTemplateForm):
     fieldsets = (
-        FieldSet('device_type', 'name', 'label', 'description'),
+        FieldSet('device_type', 'name', 'label', 'enabled', 'description'),
     )
 
     class Meta:
         model = DeviceBayTemplate
         fields = [
-            'device_type', 'name', 'label', 'description',
+            'device_type', 'name', 'label', 'enabled', 'description',
         ]
 
 
@@ -1479,7 +1517,7 @@ class PowerOutletForm(ModularDeviceComponentForm):
     fieldsets = (
         FieldSet(
             'device', 'module', 'name', 'label', 'type', 'status', 'color', 'power_port', 'feed_leg', 'mark_connected',
-            'description', 'owner', 'tags',
+            'description', 'tags',
         ),
     )
 
@@ -1487,7 +1525,7 @@ class PowerOutletForm(ModularDeviceComponentForm):
         model = PowerOutlet
         fields = [
             'device', 'module', 'name', 'label', 'type', 'status', 'color', 'power_port', 'feed_leg', 'mark_connected',
-            'description', 'tags',
+            'description', 'owner', 'tags',
         ]
 
 
@@ -1689,25 +1727,25 @@ class RearPortForm(ModularDeviceComponentForm):
 
 class ModuleBayForm(ModularDeviceComponentForm):
     fieldsets = (
-        FieldSet('device', 'module', 'name', 'label', 'position', 'description', 'tags',),
+        FieldSet('device', 'module', 'name', 'label', 'position', 'enabled', 'description', 'tags',),
     )
 
     class Meta:
         model = ModuleBay
         fields = [
-            'device', 'module', 'name', 'label', 'position', 'description', 'owner', 'tags',
+            'device', 'module', 'name', 'label', 'position', 'enabled', 'description', 'owner', 'tags',
         ]
 
 
 class DeviceBayForm(DeviceComponentForm):
     fieldsets = (
-        FieldSet('device', 'name', 'label', 'description', 'tags',),
+        FieldSet('device', 'name', 'label', 'enabled', 'description', 'tags',),
     )
 
     class Meta:
         model = DeviceBay
         fields = [
-            'device', 'name', 'label', 'description', 'owner', 'tags',
+            'device', 'name', 'label', 'enabled', 'description', 'owner', 'tags',
         ]
 
 
@@ -1974,7 +2012,7 @@ class MACAddressForm(PrimaryModelForm):
     class Meta:
         model = MACAddress
         fields = [
-            'mac_address', 'interface', 'vminterface', 'description', 'owner', 'tags',
+            'mac_address', 'interface', 'vminterface', 'description', 'owner', 'comments', 'tags',
         ]
 
     def __init__(self, *args, **kwargs):

@@ -9,9 +9,9 @@ class WirelessLANGroupPanel(panels.NestedGroupObjectPanel):
 
 class WirelessLANPanel(panels.ObjectAttributesPanel):
     ssid = attrs.TextAttr('ssid', label=_('SSID'))
-    group = attrs.RelatedObjectAttr('group', linkify=True)
+    group = attrs.NestedObjectAttr('group', linkify=True)
     status = attrs.ChoiceAttr('status')
-    scope = attrs.GenericForeignKeyAttr('scope', linkify=True)
+    scope = attrs.GenericForeignKeyAttr('scope', linkify=True, nested=True, max_depth=3)
     description = attrs.TextAttr('description')
     vlan = attrs.RelatedObjectAttr('vlan', label=_('VLAN'), linkify=True)
     tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
@@ -34,10 +34,10 @@ class WirelessLinkInterfacePanel(panels.ObjectPanel):
         self.title = title
 
     def get_context(self, context):
-        obj = context['object']
+        ctx = super().get_context(context)
         return {
-            **super().get_context(context),
-            'interface': getattr(obj, self.interface_attr),
+            **ctx,
+            'interface': getattr(ctx['object'], self.interface_attr),
         }
 
 
@@ -48,4 +48,4 @@ class WirelessLinkPropertiesPanel(panels.ObjectAttributesPanel):
     ssid = attrs.TextAttr('ssid', label=_('SSID'))
     tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
     description = attrs.TextAttr('description')
-    distance = attrs.NumericAttr('distance', unit_accessor='get_distance_unit_display')
+    distance = attrs.DistanceAttr('distance')

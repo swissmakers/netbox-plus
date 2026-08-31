@@ -18,6 +18,7 @@ from netbox.config import PARAMS as CONFIG_PARAMS
 from netbox.constants import RQ_QUEUE_DEFAULT, RQ_QUEUE_HIGH, RQ_QUEUE_LOW
 from netbox.plugins import PluginConfig
 from netbox.registry import registry
+from netbox.settings_utils import get_configuration_dir, load_configuration, resolve_install_paths, secret_key_hint
 from utilities.release import load_release_data
 from utilities.security import validate_peppers
 from utilities.string import trailing_slash
@@ -30,8 +31,18 @@ from .monkey import get_unique_validators
 
 RELEASE = load_release_data()
 VERSION = RELEASE.full_version  # Retained for backward compatibility
-# Set the base directory two levels up
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Settings package directory (settings.py lives here in both checkout & wheel).
+_SETTINGS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# All wheel-vs-checkout path branching is centralized in resolve_install_paths(): a wheel
+# bundles package data under netbox/_data and keeps mutable instance files under an external
+# instance root (NETBOX_ROOT, default /opt/netbox); a checkout keeps both roots as the project
+# directory, so archive/git behavior is unchanged.
+_PATHS = resolve_install_paths(_SETTINGS_DIR, os.environ)
+NETBOX_INSTALL_MODE = _PATHS.install_mode
+BASE_DIR = _PATHS.base_dir
+# Instance root for wheel installs (holds conf/, media/, reports/, scripts/, static/, units).
+NETBOX_ROOT = _PATHS.netbox_root
 
 # Validate the Python version
 if sys.version_info < (3, 12):  # noqa: UP036
@@ -43,17 +54,15 @@ if sys.version_info < (3, 12):  # noqa: UP036
 # Configuration import
 #
 
-# Import the configuration module
-config_path = os.getenv('NETBOX_CONFIGURATION', 'netbox.configuration')
-try:
-    configuration = importlib.import_module(config_path)
-except ModuleNotFoundError as e:
-    if getattr(e, 'name') == config_path:
-        raise ImproperlyConfigured(
-            f"Specified configuration module ({config_path}) not found. Please define netbox/netbox/configuration.py "
-            f"per the documentation, or specify an alternate module in the NETBOX_CONFIGURATION environment variable."
-        )
-    raise
+# Import the configuration module (wheel mode prefers NETBOX_ROOT/conf/configuration.py).
+configuration = load_configuration(
+    install_mode=NETBOX_INSTALL_MODE,
+    install_root=NETBOX_ROOT,
+    environ=os.environ,
+)
+
+# The directory holding the active configuration.py; ldap_config.py lives beside it.
+CONFIGURATION_DIR = get_configuration_dir(configuration)
 
 # Check for missing/conflicting required configuration parameters
 for parameter in ('ALLOWED_HOSTS', 'SECRET_KEY', 'REDIS'):
@@ -121,8 +130,9 @@ DEFAULT_PERMISSIONS = getattr(configuration, 'DEFAULT_PERMISSIONS', {
     'users.delete_token': ({'user': '$user'},),
 })
 DEVELOPER = getattr(configuration, 'DEVELOPER', False)
-DOCS_ROOT = getattr(configuration, 'DOCS_ROOT', os.path.join(os.path.dirname(BASE_DIR), 'docs'))
+DOCS_ROOT = getattr(configuration, 'DOCS_ROOT', _PATHS.docs_root)
 EMAIL = getattr(configuration, 'EMAIL', {})
+STREAMING_EXPORTS = getattr(configuration, 'STREAMING_EXPORTS', False)
 EVENTS_PIPELINE = getattr(configuration, 'EVENTS_PIPELINE', [
     'extras.events.process_event_queue',
 ])
@@ -131,10 +141,17 @@ FIELD_CHOICES = getattr(configuration, 'FIELD_CHOICES', {})
 FILE_UPLOAD_MAX_MEMORY_SIZE = getattr(configuration, 'FILE_UPLOAD_MAX_MEMORY_SIZE', 2621440)
 GRAPHQL_DEFAULT_VERSION = getattr(configuration, 'GRAPHQL_DEFAULT_VERSION', 1)
 GRAPHQL_MAX_ALIASES = getattr(configuration, 'GRAPHQL_MAX_ALIASES', 10)
+GRAPHQL_MAX_QUERY_DEPTH = getattr(configuration, 'GRAPHQL_MAX_QUERY_DEPTH', None)
 HOSTNAME = getattr(configuration, 'HOSTNAME', platform.node())
+HTTP_CLIENT_IP_HEADERS = getattr(configuration, 'HTTP_CLIENT_IP_HEADERS', (
+    'HTTP_X_REAL_IP',
+    'HTTP_X_FORWARDED_FOR',
+    'REMOTE_ADDR',
+))
 HTTP_PROXIES = getattr(configuration, 'HTTP_PROXIES', {})
 INTERNAL_IPS = getattr(configuration, 'INTERNAL_IPS', ('127.0.0.1', '::1'))
 ISOLATED_DEPLOYMENT = getattr(configuration, 'ISOLATED_DEPLOYMENT', False)
+JINJA_ENVIRONMENT_PARAMS = getattr(configuration, 'JINJA_ENVIRONMENT_PARAMS', [])
 JINJA2_FILTERS = getattr(configuration, 'JINJA2_FILTERS', {})
 LANGUAGE_CODE = getattr(configuration, 'DEFAULT_LANGUAGE', 'en-us')
 LANGUAGE_COOKIE_PATH = CSRF_COOKIE_PATH
@@ -144,7 +161,7 @@ LOGIN_REQUIRED = getattr(configuration, 'LOGIN_REQUIRED', True)
 LOGIN_TIMEOUT = getattr(configuration, 'LOGIN_TIMEOUT', None)
 LOGIN_FORM_HIDDEN = getattr(configuration, 'LOGIN_FORM_HIDDEN', False)
 LOGOUT_REDIRECT_URL = getattr(configuration, 'LOGOUT_REDIRECT_URL', 'home')
-MEDIA_ROOT = getattr(configuration, 'MEDIA_ROOT', os.path.join(BASE_DIR, 'media')).rstrip('/')
+MEDIA_ROOT = getattr(configuration, 'MEDIA_ROOT', os.path.join(NETBOX_ROOT, 'media')).rstrip('/')
 METRICS_ENABLED = getattr(configuration, 'METRICS_ENABLED', False)
 PLUGINS = getattr(configuration, 'PLUGINS', [])
 PLUGINS_CONFIG = getattr(configuration, 'PLUGINS_CONFIG', {})
@@ -169,12 +186,19 @@ REMOTE_AUTH_USER_EMAIL = getattr(configuration, 'REMOTE_AUTH_USER_EMAIL', 'HTTP_
 REMOTE_AUTH_USER_FIRST_NAME = getattr(configuration, 'REMOTE_AUTH_USER_FIRST_NAME', 'HTTP_REMOTE_USER_FIRST_NAME')
 REMOTE_AUTH_USER_LAST_NAME = getattr(configuration, 'REMOTE_AUTH_USER_LAST_NAME', 'HTTP_REMOTE_USER_LAST_NAME')
 # Required by extras/migrations/0109_script_models.py
-REPORTS_ROOT = getattr(configuration, 'REPORTS_ROOT', os.path.join(BASE_DIR, 'reports')).rstrip('/')
+REPORTS_ROOT = getattr(configuration, 'REPORTS_ROOT', os.path.join(NETBOX_ROOT, 'reports')).rstrip('/')
 RQ = getattr(configuration, 'RQ', {})
+if 'WORKER_CLASS' in RQ and RQ['WORKER_CLASS'] != 'utilities.rqworker.NetBoxRQWorker':
+    warnings.warn(
+        f"RQ['WORKER_CLASS'] is set to {RQ['WORKER_CLASS']!r}; NetBoxRQWorker's self-healing heartbeat "
+        f"logic will not be applied. Workers may not automatically recover from a Redis outage."
+    )
+else:
+    RQ.setdefault('WORKER_CLASS', 'utilities.rqworker.NetBoxRQWorker')
 RQ_DEFAULT_TIMEOUT = getattr(configuration, 'RQ_DEFAULT_TIMEOUT', 300)
 RQ_RETRY_INTERVAL = getattr(configuration, 'RQ_RETRY_INTERVAL', 60)
 RQ_RETRY_MAX = getattr(configuration, 'RQ_RETRY_MAX', 0)
-SCRIPTS_ROOT = getattr(configuration, 'SCRIPTS_ROOT', os.path.join(BASE_DIR, 'scripts')).rstrip('/')
+SCRIPTS_ROOT = getattr(configuration, 'SCRIPTS_ROOT', os.path.join(NETBOX_ROOT, 'scripts')).rstrip('/')
 SEARCH_BACKEND = getattr(configuration, 'SEARCH_BACKEND', 'netbox.search.backends.CachedValueSearchBackend')
 SECRET_KEY = getattr(configuration, 'SECRET_KEY')  # Required
 SECURE_HSTS_INCLUDE_SUBDOMAINS = getattr(configuration, 'SECURE_HSTS_INCLUDE_SUBDOMAINS', False)
@@ -182,15 +206,15 @@ SECURE_HSTS_PRELOAD = getattr(configuration, 'SECURE_HSTS_PRELOAD', False)
 SECURE_HSTS_SECONDS = getattr(configuration, 'SECURE_HSTS_SECONDS', 0)
 SECURE_SSL_REDIRECT = getattr(configuration, 'SECURE_SSL_REDIRECT', False)
 SENTRY_CONFIG = getattr(configuration, 'SENTRY_CONFIG', {})
-# TODO: Remove in NetBox v4.5
+# TODO: Remove in NetBox v4.7
 SENTRY_DSN = getattr(configuration, 'SENTRY_DSN', None)
 SENTRY_ENABLED = getattr(configuration, 'SENTRY_ENABLED', False)
-# TODO: Remove in NetBox v4.5
+# TODO: Remove in NetBox v4.7
 SENTRY_SAMPLE_RATE = getattr(configuration, 'SENTRY_SAMPLE_RATE', 1.0)
-# TODO: Remove in NetBox v4.5
+# TODO: Remove in NetBox v4.7
 SENTRY_SEND_DEFAULT_PII = getattr(configuration, 'SENTRY_SEND_DEFAULT_PII', False)
 SENTRY_TAGS = getattr(configuration, 'SENTRY_TAGS', {})
-# TODO: Remove in NetBox v4.5
+# TODO: Remove in NetBox v4.7
 SENTRY_TRACES_SAMPLE_RATE = getattr(configuration, 'SENTRY_TRACES_SAMPLE_RATE', 0)
 SESSION_COOKIE_NAME = getattr(configuration, 'SESSION_COOKIE_NAME', 'sessionid')
 SESSION_COOKIE_PATH = CSRF_COOKIE_PATH
@@ -219,7 +243,7 @@ if type(SECRET_KEY) is not str:
 if len(SECRET_KEY) < 50:
     raise ImproperlyConfigured(
         f"SECRET_KEY must be at least 50 characters in length. To generate a suitable key, run the following command:\n"
-        f"  python {BASE_DIR}/generate_secret_key.py"
+        f"  {secret_key_hint(NETBOX_INSTALL_MODE, BASE_DIR)}"
     )
 
 # Validate API token peppers
@@ -244,6 +268,20 @@ for path in PROXY_ROUTERS:
             import_string(path)
         except ImportError:
             raise ImproperlyConfigured(f"Invalid path in PROXY_ROUTERS: {path}")
+
+# Warn on the presence of deprecated configuration parameters
+if not LOGIN_REQUIRED:
+    warnings.warn(
+        "LOGIN_REQUIRED is deprecated and will be removed in NetBox v5.0. Unauthenticated access to the application "
+        "will no longer be supported. Please plan to require authentication for all users before upgrading.",
+        FutureWarning,
+    )
+elif hasattr(configuration, 'LOGIN_REQUIRED'):
+    warnings.warn(
+        "LOGIN_REQUIRED is deprecated and will be removed in NetBox v5.0. This parameter can be removed from your "
+        "configuration file.",
+        FutureWarning,
+    )
 
 
 #
@@ -272,12 +310,14 @@ if STORAGE_BACKEND is not None:
         )
     else:
         warnings.warn(
-            "STORAGE_BACKEND is deprecated, use the new STORAGES setting instead."
+            "STORAGE_BACKEND is deprecated, use the new STORAGES setting instead.",
+            FutureWarning,
         )
 
 if STORAGE_CONFIG is not None:
     warnings.warn(
-        "STORAGE_CONFIG is deprecated, use the new STORAGES setting instead."
+        "STORAGE_CONFIG is deprecated, use the new STORAGES setting instead.",
+        FutureWarning,
     )
 
 # Default STORAGES for Django
@@ -375,6 +415,7 @@ CACHES = {
         'LOCATION': CACHING_REDIS_URL,
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'USERNAME': CACHING_REDIS_USERNAME,
             'PASSWORD': CACHING_REDIS_PASSWORD,
         }
     }
@@ -438,6 +479,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django.contrib.humanize',
+    'django.contrib.postgres',
     'django.forms',
     'corsheaders',
     'debug_toolbar',
@@ -487,6 +529,7 @@ MIDDLEWARE = [
     'netbox.middleware.RemoteUserMiddleware',
     'netbox.middleware.CoreMiddleware',
     'netbox.middleware.MaintenanceModeMiddleware',
+    'netbox.middleware.SocialAuthExceptionMiddleware',
 ]
 
 if DEBUG:
@@ -566,13 +609,16 @@ USE_X_FORWARDED_HOST = True
 X_FRAME_OPTIONS = 'SAMEORIGIN'
 
 # Static files (CSS, JavaScript, Images)
-STATIC_ROOT = BASE_DIR + '/static'
+# STATIC_ROOT is deliberately not a configuration parameter; static files are collected to <NETBOX_ROOT>/static.
+STATIC_ROOT = os.path.join(NETBOX_ROOT, 'static')
 STATIC_URL = f'/{BASE_PATH}static/'
 STATICFILES_DIRS = (
     os.path.join(BASE_DIR, 'project-static', 'dist'),
     os.path.join(BASE_DIR, 'project-static', 'img'),
     os.path.join(BASE_DIR, 'project-static', 'js'),
-    ('docs', os.path.join(BASE_DIR, 'project-static', 'docs')),  # Prefix with /docs
+    # May not exist on a checkout until `manage.py upgrade --build-docs` runs (wheels bundle
+    # the pre-rendered site); collectstatic tolerates that.
+    ('docs', _PATHS.static_docs_root),  # Prefix with /docs
 )
 
 # When True, Django serves collected static files from STATIC_ROOT (e.g. Gunicorn-only Docker). Reverse proxies
@@ -594,6 +640,10 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 SERIALIZATION_MODULES = {
     'json': 'utilities.serializers.json',
+}
+
+DEBUG_TOOLBAR_CONFIG = {
+    'SHOW_TOOLBAR_CALLBACK': 'utilities.debug.show_toolbar',
 }
 
 
@@ -623,6 +673,14 @@ MAINTENANCE_EXEMPT_PATHS = (
 #
 # Sentry
 #
+
+# Warn on the presence of deprecated Sentry config parameters
+for config_param in ('SENTRY_DSN', 'SENTRY_SAMPLE_RATE', 'SENTRY_SEND_DEFAULT_PII', 'SENTRY_TRACES_SAMPLE_RATE'):
+    if hasattr(configuration, config_param):
+        warnings.warn(
+            f"{config_param} is deprecated and will be removed in NetBox v4.7. Use SENTRY_CONFIG instead.",
+            FutureWarning,
+        )
 
 if SENTRY_ENABLED:
     try:
@@ -690,6 +748,13 @@ SOCIAL_AUTH_PIPELINE = (
     'social_core.pipeline.user.user_details',
 )
 
+# Redirect users back to the login page (surfacing the error via the messages framework) when an
+# SSO/SAML authentication failure occurs, rather than raising an HTTP 500. Full exceptions are still
+# raised when DEBUG is enabled. LOGIN_URL is an absolute path which respects BASE_PATH; the social
+# auth middleware passes this value directly to an HttpResponseRedirect without reversing it.
+SOCIAL_AUTH_LOGIN_ERROR_URL = LOGIN_URL
+SOCIAL_AUTH_RAISE_EXCEPTIONS = DEBUG
+
 # Load all SOCIAL_AUTH_* settings from the user configuration
 for param in dir(configuration):
     if param.startswith('SOCIAL_AUTH_'):
@@ -733,7 +798,7 @@ REST_FRAMEWORK = {
         'rest_framework.filters.OrderingFilter',
     ),
     'DEFAULT_METADATA_CLASS': 'netbox.api.metadata.BulkOperationMetadata',
-    'DEFAULT_PAGINATION_CLASS': 'netbox.api.pagination.OptionalLimitOffsetPagination',
+    'DEFAULT_PAGINATION_CLASS': 'netbox.api.pagination.NetBoxPagination',
     'DEFAULT_PARSER_CLASSES': (
         'rest_framework.parsers.JSONParser',
         'rest_framework.parsers.MultiPartParser',
@@ -846,6 +911,7 @@ LANGUAGES = (
     ('fr', _('French')),
     ('it', _('Italian')),
     ('ja', _('Japanese')),
+    ('ko', _('Korean')),
     ('lv', _('Latvian')),
     ('nl', _('Dutch')),
     ('pl', _('Polish')),
@@ -866,6 +932,9 @@ STRAWBERRY_DJANGO = {
     "DEFAULT_PK_FIELD_NAME": "id",
     "TYPE_DESCRIPTION_FROM_MODEL_DOCSTRING": True,
     "PAGINATION_DEFAULT_LIMIT": 100,
+    # Disable the library's max-limit cap (introduced in strawberry-graphql-django 0.85); NetBox enforces its own
+    # page-size ceiling via MAX_PAGE_SIZE in netbox.graphql.pagination.apply_pagination().
+    "PAGINATION_MAX_LIMIT": None,
 }
 
 #

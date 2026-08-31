@@ -6,7 +6,7 @@
 {% block title %}{% trans "User Preferences" %}{% endblock %}
 
 {% block content %}
-  <form method="post" action="" class="object-edit" hx-disable="true" id="preferences-update">
+  <form method="post" action="" class="object-edit object-edit--with-sticky-actions" hx-disable="true" id="preferences-update">
     {% csrf_token %}
 
     {# Built-in preferences #}
@@ -44,7 +44,7 @@
                 <thead>
                   <tr>
                     <th>
-                      <input type="checkbox" class="toggle form-check-input" title="{% trans "Toggle All" %}">
+                      <input type="checkbox" class="toggle form-check-input" title="{% trans "Toggle All" %}" aria-label="{% trans "Toggle All" %}">
                     </th>
                     <th>{% trans "Table" %}</th>
                     <th>{% trans "Ordering" %}</th>
@@ -55,7 +55,7 @@
                   {% for table, prefs in request.user.config.data.tables.items %}
                     <tr>
                       <td>
-                        <input type="checkbox" name="pk" value="tables.{{ table }}" class="form-check-input" />
+                        <input type="checkbox" name="pk" value="tables.{{ table }}" class="form-check-input" aria-label="{% blocktrans with name=table %}Select {{ name }}{% endblocktrans %}" />
                       </td>
                       <td>{{ table }}</td>
                       <td>{{ prefs.ordering|join:", "|placeholder }}</td>
@@ -73,9 +73,12 @@
         {% endif %}
       </div>
     </div>
-    <div class="text-end my-3">
-      <a href="{% url 'account:preferences' %}" class="btn btn-outline-secondary">{% trans "Cancel" %}</a>
-      <button type="submit" name="_update" class="btn btn-primary">{% trans "Save" %}</button>
+
+    <div class="sticky-actions sticky-actions-footer d-print-none" data-sticky-position="full" data-sticky-when="always">
+      <div class="btn-list">
+        <a href="{% url 'account:preferences' %}" class="btn btn-outline-secondary">{% trans "Cancel" %}</a>
+        <button type="submit" name="_update" class="btn btn-primary">{% trans "Save" %}</button>
+      </div>
     </div>
   </form>
 {% endblock %}

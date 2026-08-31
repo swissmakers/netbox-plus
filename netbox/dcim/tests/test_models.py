@@ -1,5 +1,10 @@
+from decimal import Decimal
+from unittest.mock import patch
+
 from django.core.exceptions import ValidationError
-from django.test import TestCase, tag
+from django.db.models import ProtectedError
+from django.db.models.signals import post_save
+from django.test import TestCase, override_settings, tag
 
 from circuits.models import *
 from core.models import ObjectType
@@ -11,6 +16,7 @@ from ipam.models import Prefix
 from netbox.choices import WeightUnitChoices
 from tenancy.models import Tenant
 from utilities.data import drange
+from utilities.testing import PinnedConnectionRouter
 from virtualization.models import Cluster, ClusterType
 
 
@@ -112,6 +118,110 @@ class LocationTestCase(TestCase):
         self.assertEqual(Device.objects.get(pk=device1.pk).site, site_b)
         self.assertEqual(Device.objects.get(pk=device2.pk).site, site_b)
         self.assertEqual(PowerPanel.objects.get(pk=powerpanel1.pk).site, site_b)
+
+
+class DeviceTypeTestCase(TestCase):
+
+    def test_component_template_counts(self):
+        """
+        DeviceType component template counters should track the addition and removal of templates.
+        """
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer, model='Device Type 1', slug='device-type-1'
+        )
+
+        # Counters should start at zero
+        self.assertEqual(device_type.interface_template_count, 0)
+        self.assertEqual(device_type.console_port_template_count, 0)
+        self.assertEqual(device_type.module_bay_template_count, 0)
+        self.assertEqual(device_type.device_bay_template_count, 0)
+
+        # Adding templates should increment the relevant counters
+        InterfaceTemplate.objects.create(device_type=device_type, name='Interface 1')
+        InterfaceTemplate.objects.create(device_type=device_type, name='Interface 2')
+        ConsolePortTemplate.objects.create(device_type=device_type, name='Console 1')
+        ModuleBayTemplate.objects.create(device_type=device_type, name='Module Bay 1')
+        DeviceBayTemplate.objects.create(device_type=device_type, name='Device Bay 1')
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.interface_template_count, 2)
+        self.assertEqual(device_type.console_port_template_count, 1)
+        self.assertEqual(device_type.module_bay_template_count, 1)
+        self.assertEqual(device_type.device_bay_template_count, 1)
+
+        # Deleting a template should decrement the counter
+        InterfaceTemplate.objects.get(device_type=device_type, name='Interface 1').delete()
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.interface_template_count, 1)
+
+
+class ModuleTypeTestCase(TestCase):
+
+    def test_component_template_counts(self):
+        """
+        ModuleType component template counters should track the addition and removal of templates.
+        """
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Module Type 1')
+
+        # Counters should start at zero
+        self.assertEqual(module_type.interface_template_count, 0)
+        self.assertEqual(module_type.console_port_template_count, 0)
+        self.assertEqual(module_type.module_bay_template_count, 0)
+
+        # Adding templates should increment the relevant counters
+        InterfaceTemplate.objects.create(module_type=module_type, name='Interface 1')
+        InterfaceTemplate.objects.create(module_type=module_type, name='Interface 2')
+        ConsolePortTemplate.objects.create(module_type=module_type, name='Console 1')
+        ModuleBayTemplate.objects.create(module_type=module_type, name='Module Bay 1')
+        module_type.refresh_from_db()
+        self.assertEqual(module_type.interface_template_count, 2)
+        self.assertEqual(module_type.console_port_template_count, 1)
+        self.assertEqual(module_type.module_bay_template_count, 1)
+
+        # Deleting a template should decrement the counter
+        InterfaceTemplate.objects.get(module_type=module_type, name='Interface 1').delete()
+        module_type.refresh_from_db()
+        self.assertEqual(module_type.interface_template_count, 1)
+
+    def test_attributes(self):
+        """
+        ModuleType.attributes should normalize iterable values into strings for presentation.
+        """
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        profile = ModuleTypeProfile.objects.create(
+            name='Module Type Profile 1',
+            schema={
+                'properties': {
+                    'media': {
+                        'title': 'Media',
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                    },
+                    'enabled': {
+                        'title': 'Enabled',
+                        'type': 'boolean',
+                    },
+                },
+            },
+        )
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Module Type 1',
+            profile=profile,
+            attribute_data={
+                'media': ['sfp', 'qsfp28'],
+                'enabled': True,
+            },
+        )
+
+        self.assertEqual(
+            module_type.attributes,
+            {
+                'Enabled': True,
+                'Media': 'sfp, qsfp28',
+            },
+        )
 
 
 class RackTypeTestCase(TestCase):
@@ -638,6 +748,42 @@ class DeviceTestCase(TestCase):
         device2.full_clean()
         device2.save()
 
+    def test_empty_asset_tag_coerced_to_null_on_clean(self):
+        """
+        An empty string assigned to a unique nullable CharField (e.g. asset_tag) must be coerced
+        to None on save so that multiple objects can be saved without violating the unique
+        constraint. Test that this is done on clean().
+        """
+        common_kwargs = {
+            'site': Site.objects.first(),
+            'device_type': DeviceType.objects.first(),
+            'role': DeviceRole.objects.first(),
+        }
+        device1 = Device(name='Device 1', asset_tag='', **common_kwargs)
+        device1.clean()
+        self.assertIsNone(device1.asset_tag)
+
+    def test_empty_asset_tag_coerced_to_null_on_save(self):
+        """
+        An empty string assigned to a unique nullable CharField (e.g. asset_tag) must be coerced
+        to None on save so that multiple objects can be saved without violating the unique
+        constraint. Test that this is done on save().
+        """
+        common_kwargs = {
+            'site': Site.objects.first(),
+            'device_type': DeviceType.objects.first(),
+            'role': DeviceRole.objects.first(),
+        }
+        device1 = Device(name='Device 1', asset_tag='', **common_kwargs)
+        device1.save()
+        device2 = Device(name='Device 2', asset_tag='', **common_kwargs)
+        device2.save()
+
+        device1.refresh_from_db()
+        device2.refresh_from_db()
+        self.assertIsNone(device1.asset_tag)
+        self.assertIsNone(device2.asset_tag)
+
     def test_device_label(self):
         device1 = Device(
             site=Site.objects.first(),
@@ -712,6 +858,156 @@ class DeviceTestCase(TestCase):
                 cluster=clusters[1]
             ).full_clean()
 
+    @tag('regression')  # Ref: #22717
+    def test_device_mismatched_location_cluster(self):
+        """
+        A cluster scoped to a different location than the device must be rejected
+        with a field validation error naming that location.
+        """
+        site = Site.objects.create(name='Site 1', slug='site-1')
+        locations = (
+            Location(site=site, name='Location A', slug='location-a'),
+            Location(site=site, name='Location B', slug='location-b'),
+        )
+        for location in locations:
+            location.save()
+
+        cluster_type = ClusterType.objects.create(name='Cluster Type 1', slug='cluster-type-1')
+        cluster = Cluster.objects.create(name='Cluster 1', type=cluster_type, scope=locations[0])
+
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        # Device in the cluster's location should pass
+        Device(
+            name='device1',
+            site=site,
+            location=locations[0],
+            device_type=device_type,
+            role=device_role,
+            cluster=cluster
+        ).full_clean()
+
+        # Device in a different location of the same site should fail
+        with self.assertRaisesMessage(
+            ValidationError,
+            'The assigned cluster belongs to a different location (Location A)'
+        ):
+            Device(
+                name='device1',
+                site=site,
+                location=locations[1],
+                device_type=device_type,
+                role=device_role,
+                cluster=cluster
+            ).full_clean()
+
+
+class DeviceBayTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        site = Site.objects.create(name='Test Site 1', slug='test-site-1')
+        manufacturer = Manufacturer.objects.create(name='Test Manufacturer 1', slug='test-manufacturer-1')
+
+        # Parent device type must support device bays (is_parent_device=True)
+        parent_device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model='Parent Device Type',
+            slug='parent-device-type',
+            subdevice_role=SubdeviceRoleChoices.ROLE_PARENT
+        )
+        # Child device type for installation
+        child_device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model='Child Device Type',
+            slug='child-device-type',
+            u_height=0,
+            subdevice_role=SubdeviceRoleChoices.ROLE_CHILD
+        )
+        device_role = DeviceRole.objects.create(name='Test Role 1', slug='test-role-1')
+
+        cls.parent_device = Device.objects.create(
+            name='Parent Device',
+            device_type=parent_device_type,
+            role=device_role,
+            site=site
+        )
+        cls.child_device = Device.objects.create(
+            name='Child Device',
+            device_type=child_device_type,
+            role=device_role,
+            site=site
+        )
+        cls.child_device_2 = Device.objects.create(
+            name='Child Device 2',
+            device_type=child_device_type,
+            role=device_role,
+            site=site
+        )
+
+    def test_cannot_install_device_in_disabled_bay(self):
+        """
+        Test that a device cannot be installed into a disabled DeviceBay.
+        """
+        # Create a disabled device bay with a device being installed
+        device_bay = DeviceBay(
+            device=self.parent_device,
+            name='Disabled Bay',
+            enabled=False,
+            installed_device=self.child_device
+        )
+
+        with self.assertRaises(ValidationError) as cm:
+            device_bay.clean()
+
+        self.assertIn('installed_device', cm.exception.message_dict)
+        self.assertIn('disabled device bay', str(cm.exception.message_dict['installed_device']))
+
+    def test_can_disable_bay_with_existing_device(self):
+        """
+        Test that disabling a bay that already has a device installed does NOT raise an error
+        (same installed_device_id).
+        """
+        # First, create an enabled device bay with a device installed
+        device_bay = DeviceBay.objects.create(
+            device=self.parent_device,
+            name='Bay To Disable',
+            enabled=True,
+            installed_device=self.child_device
+        )
+
+        # Now disable the bay while keeping the same installed device
+        device_bay.enabled = False
+        # This should NOT raise a ValidationError
+        device_bay.clean()
+        device_bay.save()
+
+        device_bay.refresh_from_db()
+        self.assertFalse(device_bay.enabled)
+        self.assertEqual(device_bay.installed_device, self.child_device)
+
+    def test_cannot_change_installed_device_in_disabled_bay(self):
+        """
+        Test that changing the installed device in a disabled bay raises a ValidationError.
+        """
+        # Create an enabled device bay with a device installed
+        device_bay = DeviceBay.objects.create(
+            device=self.parent_device,
+            name='Bay With Device',
+            enabled=True,
+            installed_device=self.child_device
+        )
+
+        # Disable the bay and try to change the installed device
+        device_bay.enabled = False
+        device_bay.installed_device = self.child_device_2
+
+        with self.assertRaises(ValidationError) as cm:
+            device_bay.clean()
+
+        self.assertIn('installed_device', cm.exception.message_dict)
+
 
 class ModuleBayTestCase(TestCase):
 
@@ -772,6 +1068,311 @@ class ModuleBayTestCase(TestCase):
             module_1.module_bay = module_bay_3
             module_1.clean()
             module_1.save()
+
+    @tag('regression')  # #22146
+    def test_module_bay_ordering_after_recreate(self):
+        """
+        Module bays must remain in name order after a delete-and-recreate cycle,
+        even though MPTT no longer renumbers tree_ids on root insertion.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Ordering Test Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        for name in ('Bay 1', 'Bay 2', 'Bay 3', 'Bay 4'):
+            ModuleBay.objects.create(device=device, name=name)
+
+        ModuleBay.objects.get(device=device, name='Bay 3').delete()
+        ModuleBay.objects.create(device=device, name='Bay 3')
+
+        names = list(ModuleBay.objects.filter(device=device).values_list('name', flat=True))
+        self.assertEqual(names, ['Bay 1', 'Bay 2', 'Bay 3', 'Bay 4'])
+
+    @tag('regression')  # #22146
+    def test_module_bay_natural_ordering(self):
+        """
+        Module bays must be returned in natural (numeric-aware) order, e.g.
+        "Bay 2" before "Bay 10".
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Natural Sort Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        # Insert in non-natural order to confirm sort is not insertion-driven.
+        for name in ('Bay 10', 'Bay 1', 'Bay 2', 'Bay 11'):
+            ModuleBay.objects.create(device=device, name=name)
+
+        names = list(ModuleBay.objects.filter(device=device).values_list('name', flat=True))
+        self.assertEqual(names, ['Bay 1', 'Bay 2', 'Bay 10', 'Bay 11'])
+
+    @tag('regression')  # #22146
+    def test_child_module_bay_ordering(self):
+        """
+        Child module bays inside a module must be returned in name order even
+        when inserted out of order.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Child Ordering Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        root_bay = ModuleBay.objects.create(device=device, name='Bay 1')
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer, model='Child Ordering Type'
+        )
+        module = Module.objects.create(
+            device=device, module_bay=root_bay, module_type=module_type
+        )
+        # Insert children out of name order.
+        for name in ('Bay 1.1', 'Bay 1.3', 'Bay 1.2'):
+            ModuleBay.objects.create(device=device, module=module, name=name)
+
+        names = list(ModuleBay.objects.filter(device=device).values_list('name', flat=True))
+        self.assertEqual(names, ['Bay 1', 'Bay 1.1', 'Bay 1.2', 'Bay 1.3'])
+
+    @tag('regression')  # #22146
+    def test_root_module_bay_rename_preserves_tree_ids(self):
+        """
+        Renaming a root module bay must not renumber any other root tree's
+        tree_id. The renamed bay's own tree_id is also expected to remain
+        stable, but the load-bearing assertion is that the *other* bays are
+        not shifted.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Rename TreeID Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        for name in ('Bay 1', 'Bay 2', 'Bay 3', 'Bay 4'):
+            ModuleBay.objects.create(device=device, name=name)
+
+        tree_ids_before = {
+            bay.name: bay.tree_id
+            for bay in ModuleBay.objects.filter(device=device)
+        }
+
+        bay = ModuleBay.objects.get(device=device, name='Bay 2')
+        bay.name = 'Bay 99'
+        bay.save()
+
+        tree_ids_after = {
+            bay.name: bay.tree_id
+            for bay in ModuleBay.objects.filter(device=device)
+        }
+        for name in ('Bay 1', 'Bay 3', 'Bay 4'):
+            self.assertEqual(tree_ids_after[name], tree_ids_before[name])
+        self.assertEqual(tree_ids_after['Bay 99'], tree_ids_before['Bay 2'])
+
+    @tag('regression')  # #22146
+    def test_root_module_bay_rename_updates_display_order(self):
+        """
+        Even though renaming a root module bay does not renumber tree_ids,
+        the manager's _root_name annotation must reflect the new name so the
+        display ordering is correct.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Rename Order Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        for name in ('Bay 1', 'Bay 2', 'Bay 3'):
+            ModuleBay.objects.create(device=device, name=name)
+
+        bay = ModuleBay.objects.get(device=device, name='Bay 1')
+        bay.name = 'Bay 4'
+        bay.save()
+
+        names = list(ModuleBay.objects.filter(device=device).values_list('name', flat=True))
+        self.assertEqual(names, ['Bay 2', 'Bay 3', 'Bay 4'])
+
+    @tag('regression')  # #22146
+    def test_child_module_bay_rename_preserves_intra_tree_ordering(self):
+        """
+        Renaming a *child* module bay must still trigger MPTT's intra-tree
+        reorder, so siblings appear in name order after the rename. The
+        rename-bypass only covers root bays.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Child Rename Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        root_bay = ModuleBay.objects.create(device=device, name='Bay 1')
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer, model='Child Rename Type'
+        )
+        module = Module.objects.create(
+            device=device, module_bay=root_bay, module_type=module_type
+        )
+        for name in ('Bay 1.1', 'Bay 1.2', 'Bay 1.3'):
+            ModuleBay.objects.create(device=device, module=module, name=name)
+
+        child = ModuleBay.objects.get(device=device, name='Bay 1.1')
+        child.name = 'Bay 1.4'
+        child.save()
+
+        names = list(ModuleBay.objects.filter(device=device).values_list('name', flat=True))
+        self.assertEqual(names, ['Bay 1', 'Bay 1.2', 'Bay 1.3', 'Bay 1.4'])
+
+    @tag('regression')  # #22146
+    def test_root_to_child_transition_still_relocates(self):
+        """
+        Promoting an existing root module bay to a child (by assigning a
+        module) must still flow through MPTT's normal move logic. The
+        rename-bypass must not suppress legitimate parent changes.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Root To Child Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        host_bay = ModuleBay.objects.create(device=device, name='Host Bay')
+        movable_bay = ModuleBay.objects.create(device=device, name='Movable Bay')
+
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer, model='Root To Child Type'
+        )
+        host_module = Module.objects.create(
+            device=device, module_bay=host_bay, module_type=module_type
+        )
+
+        movable_bay.module = host_module
+        movable_bay.save()
+
+        movable_bay.refresh_from_db()
+        host_bay.refresh_from_db()
+        self.assertEqual(movable_bay.parent_id, host_bay.pk)
+        self.assertEqual(movable_bay.tree_id, host_bay.tree_id)
+
+    @tag('regression')  # #22251
+    def test_moving_module_reparents_child_module_bays(self):
+        """
+        When a module is moved to a different module bay, each child ModuleBay
+        (a bay that belongs to the module) must have its MPTT parent updated
+        to the new host bay. Without the fix the children stay parented to the
+        old bay even though Module.module_bay_id has changed.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Move Module Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        bay_a = ModuleBay.objects.create(device=device, name='Bay A')
+        bay_b = ModuleBay.objects.create(device=device, name='Bay B')
+
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer, model='Move Module Type'
+        )
+        module = Module.objects.create(
+            device=device, module_bay=bay_a, module_type=module_type
+        )
+
+        child_1 = ModuleBay.objects.create(device=device, module=module, name='Child Bay 1')
+        child_2 = ModuleBay.objects.create(device=device, module=module, name='Child Bay 2')
+        self.assertEqual(child_1.parent_id, bay_a.pk)
+        self.assertEqual(child_2.parent_id, bay_a.pk)
+
+        # Move the module to bay_b.
+        module.module_bay = bay_b
+        module.save()
+
+        child_1.refresh_from_db()
+        child_2.refresh_from_db()
+        self.assertEqual(child_1.parent_id, bay_b.pk)
+        self.assertEqual(child_2.parent_id, bay_b.pk)
+        # Children must share the same MPTT tree as their new parent.
+        bay_b.refresh_from_db()
+        self.assertEqual(child_1.tree_id, bay_b.tree_id)
+        self.assertEqual(child_2.tree_id, bay_b.tree_id)
+
+    @tag('regression')  # #22251
+    def test_moving_module_reparents_grandchild_module_bays(self):
+        """
+        When a module is moved, grandchild ModuleBays (bays inside a module
+        that is itself installed inside a child bay of the moved module) must
+        also land in the new MPTT tree. MPTT moves subtrees atomically, so
+        calling save() only on direct children is sufficient — this test
+        documents and preserves that invariant for future tree-backend changes.
+        """
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+        site = Site.objects.first()
+        device = Device.objects.create(
+            name='Grandchild Move Device',
+            device_type=device_type,
+            role=device_role,
+            site=site,
+        )
+        bay_a = ModuleBay.objects.create(device=device, name='Bay A')
+        bay_b = ModuleBay.objects.create(device=device, name='Bay B')
+
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(
+            manufacturer=manufacturer, model='Grandchild Move Type'
+        )
+        # Depth-1: module installed in bay_a, with one child bay.
+        module_1 = Module.objects.create(device=device, module_bay=bay_a, module_type=module_type)
+        child_bay = ModuleBay.objects.create(device=device, module=module_1, name='Child Bay')
+
+        # Depth-2: module installed in child_bay, with one grandchild bay.
+        module_2 = Module.objects.create(device=device, module_bay=child_bay, module_type=module_type)
+        grandchild_bay = ModuleBay.objects.create(device=device, module=module_2, name='Grandchild Bay')
+
+        self.assertEqual(child_bay.parent_id, bay_a.pk)
+        self.assertEqual(grandchild_bay.parent_id, child_bay.pk)
+        self.assertEqual(grandchild_bay.tree_id, bay_a.tree_id)
+
+        # Move the top-level module to bay_b.
+        module_1.module_bay = bay_b
+        module_1.save()
+
+        child_bay.refresh_from_db()
+        grandchild_bay.refresh_from_db()
+        bay_b.refresh_from_db()
+
+        self.assertEqual(child_bay.parent_id, bay_b.pk)
+        self.assertEqual(child_bay.tree_id, bay_b.tree_id)
+        # Grandchild's direct parent (child_bay) is unchanged; only tree placement moves.
+        self.assertEqual(grandchild_bay.parent_id, child_bay.pk)
+        self.assertEqual(grandchild_bay.tree_id, bay_b.tree_id)
 
     def test_single_module_token(self):
         device_type = DeviceType.objects.first()
@@ -894,12 +1495,15 @@ class ModuleBayTestCase(TestCase):
         nested_bay = module.modulebays.get(name='Sub-bay 1-1')
         self.assertEqual(nested_bay.position, '1-1')
 
-    @tag('regression')  # #20474
-    def test_single_module_token_at_nested_depth(self):
+    #
+    # Position inheritance tests (#19796)
+    #
+
+    def test_position_inheritance_depth_2(self):
         """
-        A module type with a single {module} token should install at depth > 1
-        without raising a token count mismatch error, resolving to the immediate
-        parent bay's position.
+        A module bay with position '{module}/2' under a parent bay with position '1'
+        should resolve to position '1/2'. A single {module} in the interface template
+        should then resolve to '1/2'.
         """
         manufacturer = Manufacturer.objects.first()
         site = Site.objects.first()
@@ -907,33 +1511,33 @@ class ModuleBayTestCase(TestCase):
 
         device_type = DeviceType.objects.create(
             manufacturer=manufacturer,
-            model='Chassis with Rear Card',
-            slug='chassis-with-rear-card'
+            model='Chassis for Inheritance',
+            slug='chassis-for-inheritance'
         )
         ModuleBayTemplate.objects.create(
             device_type=device_type,
-            name='Rear card slot',
+            name='Line card slot 1',
             position='1'
         )
 
-        rear_card_type = ModuleType.objects.create(
+        line_card_type = ModuleType.objects.create(
             manufacturer=manufacturer,
-            model='Rear Card'
+            model='Line Card with Inherited Bays'
         )
         ModuleBayTemplate.objects.create(
-            module_type=rear_card_type,
-            name='SFP slot 1',
-            position='1'
+            module_type=line_card_type,
+            name='SFP bay {module}/1',
+            position='{module}/1'
         )
         ModuleBayTemplate.objects.create(
-            module_type=rear_card_type,
-            name='SFP slot 2',
-            position='2'
+            module_type=line_card_type,
+            name='SFP bay {module}/2',
+            position='{module}/2'
         )
 
         sfp_type = ModuleType.objects.create(
             manufacturer=manufacturer,
-            model='SFP Module'
+            model='SFP with Inherited Path'
         )
         InterfaceTemplate.objects.create(
             module_type=sfp_type,
@@ -942,20 +1546,20 @@ class ModuleBayTestCase(TestCase):
         )
 
         device = Device.objects.create(
-            name='Test Chassis',
+            name='Inheritance Chassis',
             device_type=device_type,
             role=device_role,
             site=site
         )
 
-        rear_card_bay = device.modulebays.get(name='Rear card slot')
-        rear_card = Module.objects.create(
+        lc_bay = device.modulebays.get(name='Line card slot 1')
+        line_card = Module.objects.create(
             device=device,
-            module_bay=rear_card_bay,
-            module_type=rear_card_type
+            module_bay=lc_bay,
+            module_type=line_card_type
         )
 
-        sfp_bay = rear_card.modulebays.get(name='SFP slot 2')
+        sfp_bay = line_card.modulebays.get(name='SFP bay 1/2')
         sfp_module = Module.objects.create(
             device=device,
             module_bay=sfp_bay,
@@ -963,7 +1567,200 @@ class ModuleBayTestCase(TestCase):
         )
 
         interface = sfp_module.interfaces.first()
-        self.assertEqual(interface.name, 'SFP 2')
+        self.assertEqual(interface.name, 'SFP 1/2')
+
+    def test_position_inheritance_depth_3(self):
+        """
+        Position inheritance at depth 3: positions should chain through the tree.
+        """
+        manufacturer = Manufacturer.objects.first()
+        site = Site.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model='Deep Chassis',
+            slug='deep-chassis'
+        )
+        ModuleBayTemplate.objects.create(
+            device_type=device_type,
+            name='Slot A',
+            position='A'
+        )
+
+        mid_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Mid Module'
+        )
+        ModuleBayTemplate.objects.create(
+            module_type=mid_type,
+            name='Sub {module}-1',
+            position='{module}-1'
+        )
+
+        leaf_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Leaf Module'
+        )
+        InterfaceTemplate.objects.create(
+            module_type=leaf_type,
+            name='Port {module}',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED
+        )
+
+        device = Device.objects.create(
+            name='Deep Device',
+            device_type=device_type,
+            role=device_role,
+            site=site
+        )
+
+        slot_a = device.modulebays.get(name='Slot A')
+        mid_module = Module.objects.create(
+            device=device,
+            module_bay=slot_a,
+            module_type=mid_type
+        )
+
+        sub_bay = mid_module.modulebays.get(name='Sub A-1')
+        self.assertEqual(sub_bay.position, 'A-1')
+
+        leaf_module = Module.objects.create(
+            device=device,
+            module_bay=sub_bay,
+            module_type=leaf_type
+        )
+
+        interface = leaf_module.interfaces.first()
+        self.assertEqual(interface.name, 'Port A-1')
+
+    def test_position_inheritance_custom_separator(self):
+        """
+        Users control the separator through the position field template.
+        Using '.' instead of '/' should work correctly.
+        """
+        manufacturer = Manufacturer.objects.first()
+        site = Site.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model='Dot Separator Chassis',
+            slug='dot-separator-chassis'
+        )
+        ModuleBayTemplate.objects.create(
+            device_type=device_type,
+            name='Bay 1',
+            position='1'
+        )
+
+        card_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Card with Dot Separator'
+        )
+        ModuleBayTemplate.objects.create(
+            module_type=card_type,
+            name='Port {module}.1',
+            position='{module}.1'
+        )
+
+        sfp_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='SFP Dot'
+        )
+        InterfaceTemplate.objects.create(
+            module_type=sfp_type,
+            name='eth{module}',
+            type=InterfaceTypeChoices.TYPE_10GE_SFP_PLUS
+        )
+
+        device = Device.objects.create(
+            name='Dot Device',
+            device_type=device_type,
+            role=device_role,
+            site=site
+        )
+
+        bay = device.modulebays.get(name='Bay 1')
+        card = Module.objects.create(
+            device=device,
+            module_bay=bay,
+            module_type=card_type
+        )
+
+        port_bay = card.modulebays.get(name='Port 1.1')
+        sfp = Module.objects.create(
+            device=device,
+            module_bay=port_bay,
+            module_type=sfp_type
+        )
+
+        interface = sfp.interfaces.first()
+        self.assertEqual(interface.name, 'eth1.1')
+
+    def test_multi_token_backwards_compat(self):
+        """
+        Multi-token {module}/{module} at matching depth should still resolve
+        level-by-level (backwards compatibility).
+        """
+        manufacturer = Manufacturer.objects.first()
+        site = Site.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer,
+            model='Multi Token Chassis',
+            slug='multi-token-chassis'
+        )
+        ModuleBayTemplate.objects.create(
+            device_type=device_type,
+            name='Slot 1',
+            position='1'
+        )
+
+        card_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Card for Multi Token'
+        )
+        ModuleBayTemplate.objects.create(
+            module_type=card_type,
+            name='Port 1',
+            position='2'
+        )
+
+        iface_type = ModuleType.objects.create(
+            manufacturer=manufacturer,
+            model='Interface Module Multi Token'
+        )
+        InterfaceTemplate.objects.create(
+            module_type=iface_type,
+            name='Gi{module}/{module}',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED
+        )
+
+        device = Device.objects.create(
+            name='Multi Token Device',
+            device_type=device_type,
+            role=device_role,
+            site=site
+        )
+
+        slot = device.modulebays.get(name='Slot 1')
+        card = Module.objects.create(
+            device=device,
+            module_bay=slot,
+            module_type=card_type
+        )
+
+        port = card.modulebays.get(name='Port 1')
+        iface_module = Module.objects.create(
+            device=device,
+            module_bay=port,
+            module_type=iface_type
+        )
+
+        interface = iface_module.interfaces.first()
+        self.assertEqual(interface.name, 'Gi1/2')
 
     @tag('regression')  # #20912
     def test_module_bay_parent_cleared_when_module_removed(self):
@@ -1126,6 +1923,25 @@ class ModuleBayTestCase(TestCase):
         self.assertEqual(FrontPort.objects.filter(module=module).count(), 12)
         self.assertEqual(RearPort.objects.filter(module=module).count(), 1)
         self.assertEqual(PortMapping.objects.filter(front_port__module=module).count(), 0)
+
+    def test_cannot_install_module_in_disabled_bay(self):
+        """
+        Test that a Module cannot be installed into a disabled ModuleBay.
+        """
+        device = Device.objects.first()
+        manufacturer = Manufacturer.objects.first()
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Test Module Type Disabled')
+
+        # Create a disabled module bay
+        disabled_bay = ModuleBay.objects.create(device=device, name='Disabled Bay', enabled=False)
+
+        # Attempt to install a module into the disabled bay
+        module = Module(device=device, module_bay=disabled_bay, module_type=module_type)
+        with self.assertRaises(ValidationError) as cm:
+            module.clean()
+
+        self.assertIn('module_bay', cm.exception.message_dict)
+        self.assertIn('disabled module bay', str(cm.exception.message_dict['module_bay']))
 
 
 class CableTestCase(TestCase):
@@ -1405,6 +2221,99 @@ class CableTestCase(TestCase):
         self.assertIsNone(data['connected_endpoints_type'])
         self.assertFalse(data['connected_endpoints_reachable'])
 
+    @tag('regression')  # #21338
+    def test_path_refreshes_unset_cablepath_reference(self):
+        """
+        An endpoint instance saved during cable creation, before path tracing,
+        should resolve its path and connected endpoints.
+
+        The stale-instance preconditions rely on Cable.save() saving each
+        CableTermination (which re-saves the endpoint) before trace_paths
+        creates the CablePath records.
+        """
+        device = Device.objects.get(name='TestDevice2')
+        interface_a = Interface.objects.create(device=device, name='eth2')
+        interface_b = Interface.objects.create(device=device, name='eth3')
+
+        # Capture the instances handed to the event machinery on save
+        saved_instances = []
+
+        def capture(sender, instance, **kwargs):
+            saved_instances.append(instance)
+
+        post_save.connect(capture, sender=Interface)
+        try:
+            Cable(a_terminations=[interface_a], b_terminations=[interface_b]).save()
+        finally:
+            post_save.disconnect(capture, sender=Interface)
+
+        self.assertEqual(len(saved_instances), 2)
+        captured_a = next(i for i in saved_instances if i.pk == interface_a.pk)
+        captured_b = next(i for i in saved_instances if i.pk == interface_b.pk)
+
+        # The captured instances predate path tracing: cabled, but no path yet
+        self.assertIsNotNone(captured_a.cable_id)
+        self.assertIsNone(captured_a._path_id)
+        self.assertIsNone(captured_b._path_id)
+
+        # The accessor must repair the unset denormalized reference
+        self.assertIsNotNone(captured_a.path)
+        self.assertEqual(captured_a.connected_endpoints, [interface_b])
+
+        # Serialization as performed by the event queue must see the peer
+        data = serialize_for_event(captured_b)
+        self.assertEqual([endpoint['id'] for endpoint in data['connected_endpoints']], [interface_a.pk])
+        self.assertEqual([peer['id'] for peer in data['link_peers']], [interface_a.pk])
+        self.assertTrue(data['connected_endpoints_reachable'])
+
+    def test_path_returns_none_for_unsaved_endpoint(self):
+        """
+        An unsaved endpoint with a link assigned should report no path rather
+        than attempting a database refresh.
+        """
+        device = Device.objects.get(name='TestDevice1')
+        cable = Cable.objects.first()
+        interface = Interface(device=device, name='tmp', cable=cable)
+        self.assertIsNone(interface.path)
+
+    def test_cable_length_normalization_large_kilometer_value(self):
+        """
+        A large kilometer length must pass validation and fit in the normalized length field.
+        """
+        cable = Cable.objects.first()
+        cable.length = Decimal('1234')
+        cable.length_unit = CableLengthUnitChoices.UNIT_KILOMETER
+        cable.full_clean()
+        cable.save()
+        cable.refresh_from_db()
+
+        self.assertEqual(cable._abs_length, Decimal('1234000.0000'))
+
+    def test_cable_length_normalization_maximum_mile_value(self):
+        """
+        The maximum length value expressed in miles must fit in the normalized length field.
+        """
+        cable = Cable.objects.first()
+        cable.length = Decimal('999999.99')
+        cable.length_unit = CableLengthUnitChoices.UNIT_MILE
+        cable.full_clean()
+        cable.save()
+        cable.refresh_from_db()
+
+        self.assertEqual(cable._abs_length, Decimal('1609343983.9066'))
+
+
+class CableTerminationTestCase(TestCase):
+
+    def test_cache_related_objects_requires_resolvable_termination(self):
+        """cache_related_objects raises ValueError when the termination cannot be resolved."""
+        cable_termination = CableTermination(
+            termination_type=ObjectType.objects.get_for_model(Interface),
+            termination_id=0,
+        )
+        with self.assertRaises(ValueError):
+            cable_termination.cache_related_objects()
+
 
 class VirtualDeviceContextTestCase(TestCase):
 
@@ -1523,6 +2432,59 @@ class VirtualChassisTestCase(TestCase):
         self.assertIsNone(device2.vc_position)
         self.assertIsNone(device2.vc_priority)
 
+    @tag('regression')  # Ref: #22720
+    def test_virtualchassis_deletion_blocked_by_cross_chassis_lag(self):
+        """
+        Deleting a VirtualChassis whose members form a cross-chassis LAG must
+        raise ProtectedError exposing the blocking interfaces, leaving the VC
+        and its member assignments unchanged.
+        """
+        device1 = Device.objects.get(name='TestDevice1')
+        device2 = Device.objects.get(name='TestDevice2')
+
+        vc = VirtualChassis.objects.create(name='Test VC', master=device1)
+
+        device1.virtual_chassis = vc
+        device1.vc_position = 1
+        device1.vc_priority = 10
+        device1.save()
+
+        device2.virtual_chassis = vc
+        device2.vc_position = 2
+        device2.vc_priority = 20
+        device2.save()
+
+        lag = Interface.objects.create(device=device1, name='lag0', type=InterfaceTypeChoices.TYPE_LAG)
+        member_interface = Interface(
+            device=device2,
+            name='eth0',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+            lag=lag,
+        )
+        # A cross-chassis LAG member is valid while both devices share the VC
+        member_interface.full_clean()
+        member_interface.save()
+
+        with self.assertRaises(ProtectedError) as cm:
+            vc.delete()
+
+        self.assertEqual(
+            cm.exception.args[0],
+            'Unable to delete virtual chassis Test VC. One or more member interfaces form a cross-chassis LAG.'
+        )
+        self.assertEqual(set(cm.exception.protected_objects), {member_interface})
+
+        # The failed deletion must not clear the VC or its member assignments
+        self.assertTrue(VirtualChassis.objects.filter(pk=vc.pk).exists())
+        device1.refresh_from_db()
+        device2.refresh_from_db()
+        self.assertEqual(device1.virtual_chassis, vc)
+        self.assertEqual(device1.vc_position, 1)
+        self.assertEqual(device1.vc_priority, 10)
+        self.assertEqual(device2.virtual_chassis, vc)
+        self.assertEqual(device2.vc_position, 2)
+        self.assertEqual(device2.vc_priority, 20)
+
     def test_virtualchassis_duplicate_vc_position(self):
         """
         Test that two devices cannot be assigned to the same vc_position
@@ -1548,6 +2510,231 @@ class VirtualChassisTestCase(TestCase):
             device2.full_clean()
 
 
+class VCPositionTokenTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        Site.objects.create(name='Test Site 1', slug='test-site-1')
+        manufacturer = Manufacturer.objects.create(name='Test Manufacturer 1', slug='test-manufacturer-1')
+        DeviceType.objects.create(
+            manufacturer=manufacturer, model='Test Device Type 1', slug='test-device-type-1'
+        )
+        ModuleType.objects.create(
+            manufacturer=manufacturer, model='Test Module Type 1'
+        )
+        DeviceRole.objects.create(name='Test Role 1', slug='test-role-1')
+
+    def test_vc_position_token_in_vc(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        module_type = ModuleType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name='ge-{vc_position}/{module}/0',
+            type='1000base-t',
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 1')
+        device = Device.objects.create(
+            name='Device VC 1', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=8,
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Bay 1', position='1')
+        Module.objects.create(device=device, module_bay=module_bay, module_type=module_type)
+
+        interface = device.interfaces.get(name='ge-8/1/0')
+        self.assertEqual(interface.name, 'ge-8/1/0')
+
+    def test_vc_position_token_not_in_vc_default_fallback(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        module_type = ModuleType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name='ge-{vc_position}/{module}/0',
+            type='1000base-t',
+        )
+        device = Device.objects.create(
+            name='Device NoVC 1', device_type=device_type, role=device_role,
+            site=site,
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Bay 1', position='1')
+        Module.objects.create(device=device, module_bay=module_bay, module_type=module_type)
+
+        interface = device.interfaces.get(name='ge-0/1/0')
+        self.assertEqual(interface.name, 'ge-0/1/0')
+
+    def test_vc_position_token_explicit_fallback(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        module_type = ModuleType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name='ge-{vc_position:18}/{module}/0',
+            type='1000base-t',
+        )
+        device = Device.objects.create(
+            name='Device NoVC 2', device_type=device_type, role=device_role,
+            site=site,
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Bay 1', position='1')
+        Module.objects.create(device=device, module_bay=module_bay, module_type=module_type)
+
+        interface = device.interfaces.get(name='ge-18/1/0')
+        self.assertEqual(interface.name, 'ge-18/1/0')
+
+    def test_vc_position_token_explicit_fallback_ignored_when_in_vc(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        module_type = ModuleType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name='ge-{vc_position:99}/{module}/0',
+            type='1000base-t',
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 2')
+        device = Device.objects.create(
+            name='Device VC 2', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=2,
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Bay 1', position='1')
+        Module.objects.create(device=device, module_bay=module_bay, module_type=module_type)
+
+        interface = device.interfaces.get(name='ge-2/1/0')
+        self.assertEqual(interface.name, 'ge-2/1/0')
+
+    def test_vc_position_token_device_type_template(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='ge-{vc_position:0}/0/0',
+            type='1000base-t',
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 3')
+        device = Device.objects.create(
+            name='Device VC 3', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=3,
+        )
+
+        interface = device.interfaces.get(name='ge-3/0/0')
+        self.assertEqual(interface.name, 'ge-3/0/0')
+
+    def test_vc_position_token_device_type_template_not_in_vc(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='ge-{vc_position:0}/0/0',
+            type='1000base-t',
+        )
+        device = Device.objects.create(
+            name='Device NoVC 3', device_type=device_type, role=device_role,
+            site=site,
+        )
+
+        interface = device.interfaces.get(name='ge-0/0/0')
+        self.assertEqual(interface.name, 'ge-0/0/0')
+
+    def test_vc_position_token_label_resolution(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        module_type = ModuleType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        InterfaceTemplate.objects.create(
+            module_type=module_type,
+            name='ge-{vc_position}/{module}/0',
+            label='Member {vc_position:0} / Slot {module}',
+            type='1000base-t',
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 4')
+        device = Device.objects.create(
+            name='Device VC 4', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=2,
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Bay 1', position='1')
+        Module.objects.create(device=device, module_bay=module_bay, module_type=module_type)
+
+        interface = device.interfaces.get(name='ge-2/1/0')
+        self.assertEqual(interface.label, 'Member 2 / Slot 1')
+
+    @tag('regression')  # Ref: #22707
+    def test_vc_position_token_interface_bridge_device_type_template(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        bridge_template = InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='br-{vc_position}',
+            type='bridge',
+        )
+        InterfaceTemplate.objects.create(
+            device_type=device_type,
+            name='ge-{vc_position}/0/1',
+            type='1000base-t',
+            bridge=bridge_template,
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 5')
+        device = Device.objects.create(
+            name='Device VC 5', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=5,
+        )
+
+        interface = device.interfaces.get(name='ge-5/0/1')
+        self.assertEqual(interface.bridge, device.interfaces.get(name='br-5'))
+
+    @tag('regression')  # Ref: #22707
+    def test_vc_position_token_port_mapping_device_type_template(self):
+        site = Site.objects.first()
+        device_type = DeviceType.objects.first()
+        device_role = DeviceRole.objects.first()
+
+        rear_port_template = RearPortTemplate.objects.create(
+            device_type=device_type,
+            name='rp-{vc_position}/1',
+            type=PortTypeChoices.TYPE_LC,
+            positions=1,
+        )
+        front_port_template = FrontPortTemplate.objects.create(
+            device_type=device_type,
+            name='fp-{vc_position}/1',
+            type=PortTypeChoices.TYPE_LC,
+            positions=1,
+        )
+        PortTemplateMapping.objects.create(
+            device_type=device_type,
+            front_port=front_port_template,
+            front_port_position=1,
+            rear_port=rear_port_template,
+            rear_port_position=1,
+        )
+        vc = VirtualChassis.objects.create(name='Test VC 6')
+        device = Device.objects.create(
+            name='Device VC 6', device_type=device_type, role=device_role,
+            site=site, virtual_chassis=vc, vc_position=6,
+        )
+
+        front_port = FrontPort.objects.get(device=device, name='fp-6/1')
+        rear_port = RearPort.objects.get(device=device, name='rp-6/1')
+        mapping = PortMapping.objects.get(device=device, front_port=front_port)
+        self.assertEqual(mapping.rear_port, rear_port)
+        self.assertEqual(mapping.front_port_position, 1)
+        self.assertEqual(mapping.rear_port_position, 1)
+
+
 class SiteSignalTestCase(TestCase):
 
     @tag('regression')
@@ -1557,3 +2744,305 @@ class SiteSignalTestCase(TestCase):
 
         # Regression test for #21045: should not raise ValueError
         site.save()
+
+
+class PowerPortDrawTestCase(TestCase):
+    """
+    Tests for PowerPort.get_power_draw() power aggregation logic.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.site = Site.objects.create(name='Test Site', slug='test-site')
+        manufacturer = Manufacturer.objects.create(name='Generic', slug='generic')
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model='Test Device Type')
+        role = DeviceRole.objects.create(name='Test Role', slug='test-role')
+        cls.pdu = Device.objects.create(
+            device_type=device_type, role=role, site=cls.site, name='pdu'
+        )
+        cls.server = Device.objects.create(
+            device_type=device_type, role=role, site=cls.site, name='server'
+        )
+
+    def test_direct_draw_aggregation(self):
+        """
+        Sanity check: with one PowerOutlet chained directly to a downstream PSU PowerPort,
+        the upstream PowerPort should reflect the PSU's allocated/maximum draw.
+
+            [main] -- [outlet] --C-- [psu]
+        """
+        main = PowerPort.objects.create(device=self.pdu, name='main')
+        outlet = PowerOutlet.objects.create(device=self.pdu, name='outlet', power_port=main)
+        psu = PowerPort.objects.create(
+            device=self.server, name='psu', allocated_draw=200, maximum_draw=400
+        )
+        Cable(a_terminations=[outlet], b_terminations=[psu]).save()
+
+        draw = main.get_power_draw()
+        self.assertEqual(draw['allocated'], 200)
+        self.assertEqual(draw['maximum'], 400)
+
+    @tag('regression')
+    def test_recursive_draw_through_intermediate_powerport(self):
+        """
+        Regression test for #21949: A PDU modeled with internal fuses (intermediate PowerPorts in
+        auto mode) should still aggregate downstream PSU draw up to the main PowerPort.
+
+            [main] -- [feedback] --C-- [fuse] -- [outlet] --C-- [psu]
+
+        Both `main` and `fuse` are in auto mode (no allocated_draw/maximum_draw set). The draw
+        reported by `psu` must propagate through `fuse` and be reflected at `main`.
+        """
+        main = PowerPort.objects.create(device=self.pdu, name='main')
+        feedback = PowerOutlet.objects.create(device=self.pdu, name='feedback', power_port=main)
+        fuse = PowerPort.objects.create(device=self.pdu, name='fuse')
+        outlet = PowerOutlet.objects.create(device=self.pdu, name='outlet', power_port=fuse)
+        psu = PowerPort.objects.create(
+            device=self.server, name='psu', allocated_draw=150, maximum_draw=300
+        )
+        Cable(a_terminations=[feedback], b_terminations=[fuse]).save()
+        Cable(a_terminations=[outlet], b_terminations=[psu]).save()
+
+        fuse_draw = fuse.get_power_draw()
+        self.assertEqual(fuse_draw['allocated'], 150)
+        self.assertEqual(fuse_draw['maximum'], 300)
+
+        main_draw = main.get_power_draw()
+        self.assertEqual(main_draw['allocated'], 150)
+        self.assertEqual(main_draw['maximum'], 300)
+
+    def test_intermediate_manual_override_stops_recursion(self):
+        """
+        When an intermediate PowerPort has an explicit allocated_draw/maximum_draw, recursion should
+        stop there and the administratively defined values should be used.
+        """
+        main = PowerPort.objects.create(device=self.pdu, name='main')
+        feedback = PowerOutlet.objects.create(device=self.pdu, name='feedback', power_port=main)
+        fuse = PowerPort.objects.create(
+            device=self.pdu, name='fuse', allocated_draw=500, maximum_draw=1000
+        )
+        outlet = PowerOutlet.objects.create(device=self.pdu, name='outlet', power_port=fuse)
+        psu = PowerPort.objects.create(
+            device=self.server, name='psu', allocated_draw=150, maximum_draw=300
+        )
+        Cable(a_terminations=[feedback], b_terminations=[fuse]).save()
+        Cable(a_terminations=[outlet], b_terminations=[psu]).save()
+
+        main_draw = main.get_power_draw()
+        self.assertEqual(main_draw['allocated'], 500)
+        self.assertEqual(main_draw['maximum'], 1000)
+
+    def _connect_three_phase_feed(self, powerport):
+        """
+        Helper: attach `powerport` via cable to a newly-created three-phase PowerFeed.
+        """
+        power_panel = PowerPanel.objects.create(site=self.site, name='Panel')
+        power_feed = PowerFeed.objects.create(
+            power_panel=power_panel,
+            name='Feed',
+            phase=PowerFeedPhaseChoices.PHASE_3PHASE,
+        )
+        Cable(a_terminations=[powerport], b_terminations=[power_feed]).save()
+
+    @tag('regression')
+    def test_three_phase_per_leg_aggregation(self):
+        """
+        Regression test: per-leg totals for a main PowerPort connected to a three-phase PowerFeed
+        must be populated even when the full aggregation runs first. Previously, a shared visited
+        set caused downstream ports to be skipped during the per-leg passes, zeroing the legs.
+
+            [main] --C-- [3-phase PowerFeed]
+              ├── [outlet_A] (leg A) --C-- [portA] (allocated=100, maximum=200)
+              ├── [outlet_B] (leg B) --C-- [portB] (allocated=200, maximum=400)
+              └── [outlet_C] (leg C) --C-- [portC] (allocated=300, maximum=600)
+        """
+        main = PowerPort.objects.create(device=self.pdu, name='main')
+        self._connect_three_phase_feed(main)
+
+        leg_specs = [
+            (PowerOutletFeedLegChoices.FEED_LEG_A, 100, 200),
+            (PowerOutletFeedLegChoices.FEED_LEG_B, 200, 400),
+            (PowerOutletFeedLegChoices.FEED_LEG_C, 300, 600),
+        ]
+        for leg, allocated, maximum in leg_specs:
+            outlet = PowerOutlet.objects.create(
+                device=self.pdu, name=f'outlet_{leg}', power_port=main, feed_leg=leg
+            )
+            port = PowerPort.objects.create(
+                device=self.server, name=f'psu_{leg}',
+                allocated_draw=allocated, maximum_draw=maximum,
+            )
+            Cable(a_terminations=[outlet], b_terminations=[port]).save()
+
+        # Re-fetch to clear cached_property values populated before cable creation
+        main = PowerPort.objects.get(pk=main.pk)
+        draw = main.get_power_draw()
+        self.assertEqual(draw['allocated'], 600)
+        self.assertEqual(draw['maximum'], 1200)
+        legs_by_name = {leg['name']: leg for leg in draw['legs']}
+        self.assertEqual(legs_by_name['A']['allocated'], 100)
+        self.assertEqual(legs_by_name['A']['maximum'], 200)
+        self.assertEqual(legs_by_name['B']['allocated'], 200)
+        self.assertEqual(legs_by_name['B']['maximum'], 400)
+        self.assertEqual(legs_by_name['C']['allocated'], 300)
+        self.assertEqual(legs_by_name['C']['maximum'], 600)
+
+    @tag('regression')
+    def test_three_phase_per_leg_recursive_aggregation(self):
+        """
+        Regression test for #21949 on three-phase feeds: per-leg totals must aggregate through
+        intermediate auto-mode PowerPorts (the PDU-internal "fuse" pattern).
+
+            [main] --C-- [3-phase PowerFeed]
+              └── [feedback_A] (leg A) --C-- [fuse_A] (auto)
+                                            └── [outlet_A] (leg A) --C-- [psu_A] (allocated=100)
+        """
+        main = PowerPort.objects.create(device=self.pdu, name='main')
+        self._connect_three_phase_feed(main)
+
+        feedback = PowerOutlet.objects.create(
+            device=self.pdu, name='feedback_A', power_port=main,
+            feed_leg=PowerOutletFeedLegChoices.FEED_LEG_A,
+        )
+        fuse = PowerPort.objects.create(device=self.pdu, name='fuse_A')
+        outlet = PowerOutlet.objects.create(
+            device=self.pdu, name='outlet_A', power_port=fuse,
+            feed_leg=PowerOutletFeedLegChoices.FEED_LEG_A,
+        )
+        psu = PowerPort.objects.create(
+            device=self.server, name='psu_A', allocated_draw=100, maximum_draw=200
+        )
+        Cable(a_terminations=[feedback], b_terminations=[fuse]).save()
+        Cable(a_terminations=[outlet], b_terminations=[psu]).save()
+
+        # Re-fetch to clear cached_property values populated before cable creation
+        main = PowerPort.objects.get(pk=main.pk)
+        draw = main.get_power_draw()
+        self.assertEqual(draw['allocated'], 100)
+        self.assertEqual(draw['maximum'], 200)
+        legs_by_name = {leg['name']: leg for leg in draw['legs']}
+        self.assertEqual(legs_by_name['A']['allocated'], 100)
+        self.assertEqual(legs_by_name['A']['maximum'], 200)
+        self.assertEqual(legs_by_name['B']['allocated'], 0)
+        self.assertEqual(legs_by_name['C']['allocated'], 0)
+
+
+class ComponentInstantiationConnectionTestCase(TestCase):
+    """
+    Verify that component instantiation issues its queries against the connection the
+    parent object was written to, rather than letting DATABASE_ROUTERS select one. On an
+    installation with routers configured (e.g. netbox_branching), a routed query reads or
+    writes the component in the wrong database.
+
+    Where a path instantiates components, PinnedConnectionRouter cannot be used: Django's
+    own forward-relation descriptor consults the router when a related object is assigned
+    to an unsaved instance. Those paths are checked by capturing the alias handed to the
+    call instead.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.site = Site.objects.create(name='Site 1', slug='site-1')
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        cls.device_type = DeviceType.objects.create(manufacturer=manufacturer, model='Device Type 1')
+        cls.device_role = DeviceRole.objects.create(name='Device Role 1', slug='device-role-1')
+        cls.module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Module Type 1')
+
+    def _record_module_bay_save_aliases(self):
+        """
+        Patch ModuleBay.save() to record the database alias passed to each call.
+        """
+        aliases = []
+        original_save = ModuleBay.save
+
+        def record_alias(instance, *args, **kwargs):
+            aliases.append(kwargs.get('using'))
+            return original_save(instance, *args, **kwargs)
+
+        return aliases, patch.object(ModuleBay, 'save', record_alias)
+
+    def test_module_bay_tree_id_lookup_pinned_to_saving_connection(self):
+        """
+        Inserting a root ModuleBay looks up the highest existing tree ID, which must be
+        read from the connection the bay is being written to.
+        """
+        device = Device.objects.create(
+            name='Device 1', device_type=self.device_type, role=self.device_role, site=self.site
+        )
+        # Instantiate outside the router, as assigning the Device consults it.
+        module_bay = ModuleBay(device=device, name='Module Bay 1')
+
+        with override_settings(DATABASE_ROUTERS=[PinnedConnectionRouter(ModuleBay)]):
+            module_bay.save(using='default')
+
+        self.assertTrue(ModuleBay.objects.filter(pk=module_bay.pk).exists())
+
+    def test_device_module_bays_receive_saving_connection(self):
+        """
+        ModuleBays are instantiated individually (rather than in bulk) to maintain the MPTT
+        tree, so each save() must be given the Device's connection.
+        """
+        ModuleBayTemplate.objects.create(device_type=self.device_type, name='Module Bay 1')
+
+        device = Device(
+            name='Device 1', device_type=self.device_type, role=self.device_role, site=self.site
+        )
+        aliases, spy = self._record_module_bay_save_aliases()
+        with spy:
+            device.save()
+
+        self.assertEqual(aliases, [device._state.db])
+        self.assertEqual(ModuleBay.objects.filter(device=device).count(), 1)
+
+    def test_module_module_bays_receive_saving_connection(self):
+        """
+        Replicated MPTT components are likewise saved individually, and must be given the
+        Module's connection.
+        """
+        ModuleBayTemplate.objects.create(module_type=self.module_type, name='Module Bay 1')
+
+        device = Device.objects.create(
+            name='Device 1', device_type=self.device_type, role=self.device_role, site=self.site
+        )
+        parent_bay = ModuleBay.objects.create(device=device, name='Parent Bay')
+
+        module = Module(device=device, module_bay=parent_bay, module_type=self.module_type)
+        aliases, spy = self._record_module_bay_save_aliases()
+        with spy:
+            module.save()
+
+        self.assertEqual(aliases, [module._state.db])
+        self.assertEqual(ModuleBay.objects.filter(module=module).count(), 1)
+
+    def test_module_component_rebuild_uses_saving_connection(self):
+        """
+        Adopting existing components assigns them to the Module via bulk_update(), which
+        bypasses save() and so requires an explicit MPTT tree rebuild. That rebuild must
+        run on the Module's connection.
+        """
+        ModuleBayTemplate.objects.create(module_type=self.module_type, name='Module Bay 1')
+
+        device = Device.objects.create(
+            name='Device 1', device_type=self.device_type, role=self.device_role, site=self.site
+        )
+        parent_bay = ModuleBay.objects.create(device=device, name='Parent Bay')
+        child_bay = ModuleBay.objects.create(device=device, name='Module Bay 1')
+
+        aliases = []
+        manager_class = type(ModuleBay.objects)
+        original_rebuild = manager_class.rebuild
+
+        def record_alias(manager, *args, **kwargs):
+            # Manager.db falls back to the router, so the private attribute is the only
+            # indication of whether an alias was set explicitly.
+            aliases.append(manager._db)
+            return original_rebuild(manager, *args, **kwargs)
+
+        module = Module(device=device, module_bay=parent_bay, module_type=self.module_type)
+        module._adopt_components = True
+        module._disable_replication = True
+        with patch.object(manager_class, 'rebuild', record_alias):
+            module.save()
+
+        child_bay.refresh_from_db()
+        self.assertEqual(child_bay.module, module)
+        self.assertEqual(aliases, [module._state.db])

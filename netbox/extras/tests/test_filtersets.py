@@ -22,7 +22,7 @@ from virtualization.models import Cluster, ClusterGroup, ClusterType
 class CustomFieldTestCase(TestCase, ChangeLoggedFilterSetTests):
     queryset = CustomField.objects.all()
     filterset = CustomFieldFilterSet
-    ignore_fields = ('default', 'related_object_filter')
+    ignore_fields = ('default', 'related_object_filter', 'validation_schema')
 
     @classmethod
     def setUpTestData(cls):
@@ -160,8 +160,21 @@ class CustomFieldChoiceSetTestCase(TestCase, ChangeLoggedFilterSetTests):
     @classmethod
     def setUpTestData(cls):
         choice_sets = (
-            CustomFieldChoiceSet(name='Choice Set 1', extra_choices=['A', 'B', 'C'], description='foobar1'),
-            CustomFieldChoiceSet(name='Choice Set 2', extra_choices=['D', 'E', 'F'], description='foobar2'),
+            CustomFieldChoiceSet(
+                name='Choice Set 1',
+                extra_choices=['A', 'B', 'C'],
+                choice_colors={'A': CustomFieldChoiceColorChoices.RED},
+                description='foobar1',
+            ),
+            CustomFieldChoiceSet(
+                name='Choice Set 2',
+                extra_choices=['D', 'E', 'F'],
+                choice_colors={
+                    'D': CustomFieldChoiceColorChoices.GREEN,
+                    'E': CustomFieldChoiceColorChoices.RED,
+                },
+                description='foobar2',
+            ),
             CustomFieldChoiceSet(name='Choice Set 3', extra_choices=['G', 'H', 'I'], description='foobar3'),
         )
         CustomFieldChoiceSet.objects.bulk_create(choice_sets)
@@ -177,6 +190,16 @@ class CustomFieldChoiceSetTestCase(TestCase, ChangeLoggedFilterSetTests):
     def test_choice(self):
         params = {'choice': ['A', 'D']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_choice_colors(self):
+        params = {'choice_colors': [CustomFieldChoiceColorChoices.RED]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        params = {'choice_colors': [CustomFieldChoiceColorChoices.GREEN]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+        params = {'choice_colors': [CustomFieldChoiceColorChoices.YELLOW]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
 
     def test_description(self):
         params = {'description': ['foobar1', 'foobar2']}
@@ -718,7 +741,8 @@ class ImageAttachmentTestCase(TestCase, ChangeLoggedFilterSetTests):
                 name='Image Attachment 1',
                 image='http://example.com/image1.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=1024
             ),
             ImageAttachment(
                 object_type=site_ct,
@@ -726,7 +750,8 @@ class ImageAttachmentTestCase(TestCase, ChangeLoggedFilterSetTests):
                 name='Image Attachment 2',
                 image='http://example.com/image2.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=2048
             ),
             ImageAttachment(
                 object_type=rack_ct,
@@ -734,7 +759,8 @@ class ImageAttachmentTestCase(TestCase, ChangeLoggedFilterSetTests):
                 name='Image Attachment 3',
                 image='http://example.com/image3.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=4096
             ),
             ImageAttachment(
                 object_type=rack_ct,
@@ -742,7 +768,8 @@ class ImageAttachmentTestCase(TestCase, ChangeLoggedFilterSetTests):
                 name='Image Attachment 4',
                 image='http://example.com/image4.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=8192
             )
         )
         ImageAttachment.objects.bulk_create(image_attachments)
@@ -765,6 +792,73 @@ class ImageAttachmentTestCase(TestCase, ChangeLoggedFilterSetTests):
             'object_id': [Site.objects.first().pk],
         }
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_image_size(self):
+        # Fixtures set image_size to 1024, 2048, 4096, 8192.
+        params = {'image_size': [1024, 2048]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_image_size_range(self):
+        # __gte/__lte bound the 1024/2048/4096/8192 fixtures to the middle two. NetBox's auto-generated numeric
+        # lookups are multi-value, so values are passed as lists.
+        params = {'image_size__gte': [2048], 'image_size__lte': [4096]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+
+class TableConfigTestCase(TestCase, ChangeLoggedFilterSetTests):
+    queryset = TableConfig.objects.all()
+    filterset = TableConfigFilterSet
+    ignore_fields = ('columns', 'ordering')
+
+    @classmethod
+    def setUpTestData(cls):
+        site_ct = ContentType.objects.get_by_natural_key('dcim', 'site')
+        rack_ct = ContentType.objects.get_by_natural_key('dcim', 'rack')
+
+        users = (
+            User(username='user1'),
+            User(username='user2'),
+            User(username='user3'),
+        )
+        User.objects.bulk_create(users)
+
+        TableConfig.objects.bulk_create(
+            [
+                TableConfig(
+                    object_type=site_ct,
+                    table='SiteTable',
+                    name='Table Config 1',
+                    user=users[0],
+                    weight=100,
+                    enabled=True,
+                    shared=True,
+                    columns=['name', 'status'],
+                    ordering=[],
+                ),
+                TableConfig(
+                    object_type=site_ct,
+                    table='SiteTable',
+                    name='Table Config 2',
+                    user=users[1],
+                    weight=200,
+                    enabled=True,
+                    shared=False,
+                    columns=['name', 'region'],
+                    ordering=[],
+                ),
+                TableConfig(
+                    object_type=rack_ct,
+                    table='RackTable',
+                    name='Table Config 3',
+                    user=users[2],
+                    weight=300,
+                    enabled=False,
+                    shared=True,
+                    columns=['name', 'site'],
+                    ordering=[],
+                ),
+            ]
+        )
 
 
 class JournalEntryTestCase(TestCase, ChangeLoggedFilterSetTests):
@@ -1223,6 +1317,7 @@ class TagTestCase(TestCase, ChangeLoggedFilterSetTests):
         'asn',
         'asnrange',
         'cable',
+        'cablebundle',
         'circuit',
         'circuitgroup',
         'circuitgroupassignment',
@@ -1279,6 +1374,7 @@ class TagTestCase(TestCase, ChangeLoggedFilterSetTests):
         'provideraccount',
         'providernetwork',
         'rack',
+        'rackgroup',
         'rackreservation',
         'rackrole',
         'racktype',
@@ -1303,6 +1399,7 @@ class TagTestCase(TestCase, ChangeLoggedFilterSetTests):
         'virtualdevicecontext',
         'virtualdisk',
         'virtualmachine',
+        'virtualmachinetype',
         'vlan',
         'vlangroup',
         'vlantranslationpolicy',

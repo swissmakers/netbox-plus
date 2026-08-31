@@ -1,30 +1,39 @@
 import json
+import logging
 import uuid
+from io import BytesIO
 from unittest import skipIf
 from unittest.mock import Mock, patch
 
 import django_rq
 from django.conf import settings
 from django.http import HttpResponse
-from django.test import RequestFactory
+from django.test import RequestFactory, TestCase, override_settings, tag
 from django.urls import reverse
+from PIL import Image
 from requests import Session
 from rest_framework import status
 
+from core.choices import JobNotificationChoices, ManagedFileRootPathChoices
 from core.events import *
-from core.models import ObjectType
-from dcim.choices import SiteStatusChoices
-from dcim.models import Site
+from core.models import Job, ObjectType
+from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusChoices
+from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
 from extras.choices import EventRuleActionChoices
 from extras.events import enqueue_event, flush_events, serialize_for_event
-from extras.models import EventRule, Script, Tag, Webhook
+from extras.models import EventRule, Notification, Script, ScriptModule, Tag, Webhook
+from extras.scripts import Script as ScriptBase
 from extras.signals import process_job_end_event_rules
 from extras.webhooks import generate_signature, send_webhook
+from ipam.choices import IPAddressStatusChoices
+from ipam.models import IPAddress, Prefix
 from netbox.context_managers import event_tracking
-from utilities.testing import APITestCase
+from users.models import ObjectPermission
+from utilities.testing import APITestCase, create_test_device, disable_warnings
+from utilities.testing.mixins import RQQueueTestMixin
 
 
-class EventRuleTest(APITestCase):
+class EventRuleTestCase(RQQueueTestMixin, APITestCase):
 
     def setUp(self):
         super().setUp()
@@ -32,6 +41,22 @@ class EventRuleTest(APITestCase):
         # Ensure the queue has been cleared for each test
         self.queue = django_rq.get_queue('default')
         self.queue.empty()
+
+    def tearDown(self):
+        super().tearDown()
+
+        # Clear the queue so leftover jobs do not leak to the next test suite
+        self.queue.empty()
+
+    def test_enqueue_event_requires_saved_instance(self):
+        """enqueue_event raises ValueError for an unsaved instance."""
+        request = RequestFactory().get('/')
+        request.id = uuid.uuid4()
+        request.user = self.user
+        site = Site(name='Site 1', slug='site-1')
+        with patch('extras.events.has_feature', return_value=True):
+            with self.assertRaises(ValueError):
+                enqueue_event({}, site, request, OBJECT_CREATED)
 
     @classmethod
     def setUpTestData(cls):
@@ -127,7 +152,7 @@ class EventRuleTest(APITestCase):
             ]
         }
         url = reverse('dcim-api:site-list')
-        self.add_permissions('dcim.add_site')
+        self.add_permissions('dcim.add_site', 'extras.view_tag')
         response = self.client.post(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_201_CREATED)
         self.assertEqual(Site.objects.count(), 1)
@@ -144,6 +169,32 @@ class EventRuleTest(APITestCase):
         self.assertEqual(len(job.kwargs['data']['tags']), len(response.data['tags']))
         self.assertEqual(job.kwargs['snapshots']['postchange']['name'], 'Site 1')
         self.assertEqual(job.kwargs['snapshots']['postchange']['tags'], ['Bar', 'Foo'])
+
+    def test_single_create_rollback_discards_events(self):
+        """
+        Check that creating an object which is then rolled back by the object-level permission check
+        in perform_create() queues no background task.
+        """
+        # Permit the creation of active sites only. The new object is saved (queueing its event)
+        # before _validate_objects() rejects it and the transaction is rolled back.
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['add'],
+            constraints={'status': SiteStatusChoices.STATUS_ACTIVE},
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Site))
+
+        data = {'name': 'Site 1', 'slug': 'site-1', 'status': SiteStatusChoices.STATUS_PLANNED}
+        url = reverse('dcim-api:site-list')
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(Site.objects.count(), 0)
+
+        # No task may be queued for a creation that was rolled back
+        self.assertEqual(self.queue.count, 0)
 
     def test_bulk_create_process_eventrule(self):
         """
@@ -178,7 +229,7 @@ class EventRuleTest(APITestCase):
             },
         ]
         url = reverse('dcim-api:site-list')
-        self.add_permissions('dcim.add_site')
+        self.add_permissions('dcim.add_site', 'extras.view_tag')
         response = self.client.post(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_201_CREATED)
         self.assertEqual(Site.objects.count(), 3)
@@ -196,6 +247,72 @@ class EventRuleTest(APITestCase):
             self.assertEqual(job.kwargs['snapshots']['postchange']['name'], response.data[i]['name'])
             self.assertEqual(job.kwargs['snapshots']['postchange']['tags'], ['Bar', 'Foo'])
 
+    def test_bulk_create_rollback_discards_events(self):
+        """
+        Check that a sequential bulk create which is rolled back queues no background tasks for the
+        objects that were provisionally created before the failure.
+        """
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model='Device Type 1', slug='device-type-1')
+        role = DeviceRole.objects.create(name='Device Role 1', slug='device-role-1')
+        site = Site.objects.create(name='Site 1', slug='site-1')
+
+        # DeviceViewSet uses SequentialBulkCreatesMixin, so each valid object is provisionally
+        # created (and its event queued) before a later object fails validation.
+        event_rule = EventRule.objects.get(name='Event Rule 1')
+        event_rule.object_types.set([ObjectType.objects.get_for_model(Device)])
+
+        data = [
+            {
+                'name': 'Device 1',
+                'device_type': device_type.pk,
+                'role': role.pk,
+                'site': site.pk,
+                'status': DeviceStatusChoices.STATUS_ACTIVE,
+            },
+            {},  # Missing all required fields
+        ]
+        url = reverse('dcim-api:device-list')
+        self.add_permissions('dcim.add_device', 'dcim.view_site', 'dcim.view_devicetype', 'dcim.view_devicerole')
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Device.objects.count(), 0)
+
+        # No task may be queued for a creation that was rolled back
+        self.assertEqual(self.queue.count, 0)
+
+    def test_available_objects_create_rollback_discards_events(self):
+        """
+        Check that creating an object via an available-objects endpoint (e.g. available-ips) queues
+        no background task when the object-level permission check rolls the transaction back.
+        """
+        prefix = Prefix.objects.create(prefix='192.0.2.0/24')
+
+        event_rule = EventRule.objects.get(name='Event Rule 1')
+        event_rule.object_types.set([ObjectType.objects.get_for_model(IPAddress)])
+
+        # Permit the creation of active IP addresses only. The new object is saved (queueing its
+        # event) before _validate_objects() rejects it and the transaction is rolled back.
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['add'],
+            constraints={'status': IPAddressStatusChoices.STATUS_ACTIVE},
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(IPAddress))
+        self.add_permissions('ipam.view_prefix')
+
+        url = reverse('ipam-api:prefix-available-ips', kwargs={'pk': prefix.pk})
+        data = {'status': IPAddressStatusChoices.STATUS_RESERVED}
+        with disable_warnings('django.request'):
+            response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(IPAddress.objects.count(), 0)
+
+        # No task may be queued for a creation that was rolled back
+        self.assertEqual(self.queue.count, 0)
+
     def test_single_update_process_eventrule(self):
         """
         Check that updating an object with an applicable EventRule queues a background task for the rule's action.
@@ -212,7 +329,7 @@ class EventRuleTest(APITestCase):
             ]
         }
         url = reverse('dcim-api:site-detail', kwargs={'pk': site.pk})
-        self.add_permissions('dcim.change_site')
+        self.add_permissions('dcim.change_site', 'extras.view_tag')
         response = self.client.patch(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
@@ -229,6 +346,37 @@ class EventRuleTest(APITestCase):
         self.assertEqual(job.kwargs['snapshots']['prechange']['tags'], ['Bar', 'Foo'])
         self.assertEqual(job.kwargs['snapshots']['postchange']['name'], 'Site X')
         self.assertEqual(job.kwargs['snapshots']['postchange']['tags'], ['Baz'])
+
+    def test_single_update_rollback_discards_events(self):
+        """
+        Check that updating an object which is then rolled back by the object-level permission check
+        in perform_update() queues no background task.
+        """
+        site = Site.objects.create(name='Site 1', slug='site-1', status=SiteStatusChoices.STATUS_ACTIVE)
+
+        # Permit the modification of active sites only. Setting the status to "planned" takes the
+        # object outside the permission's scope, so it is saved (queueing its event) and then
+        # rejected by _validate_objects(), rolling the transaction back.
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['change'],
+            constraints={'status': SiteStatusChoices.STATUS_ACTIVE},
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Site))
+
+        url = reverse('dcim-api:site-detail', kwargs={'pk': site.pk})
+        with disable_warnings('django.request'):
+            response = self.client.patch(
+                url, {'status': SiteStatusChoices.STATUS_PLANNED}, format='json', **self.header
+            )
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        site.refresh_from_db()
+        self.assertEqual(site.status, SiteStatusChoices.STATUS_ACTIVE)
+
+        # No task may be queued for an update that was rolled back
+        self.assertEqual(self.queue.count, 0)
 
     def test_bulk_update_process_eventrule(self):
         """
@@ -269,7 +417,7 @@ class EventRuleTest(APITestCase):
             },
         ]
         url = reverse('dcim-api:site-list')
-        self.add_permissions('dcim.change_site')
+        self.add_permissions('dcim.change_site', 'extras.view_tag')
         response = self.client.patch(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
@@ -286,6 +434,38 @@ class EventRuleTest(APITestCase):
             self.assertEqual(job.kwargs['snapshots']['prechange']['tags'], ['Bar', 'Foo'])
             self.assertEqual(job.kwargs['snapshots']['postchange']['name'], response.data[i]['name'])
             self.assertEqual(job.kwargs['snapshots']['postchange']['tags'], ['Baz'])
+
+    def test_bulk_update_rollback_discards_events(self):
+        """
+        Check that a bulk update which is rolled back because one object failed validation queues no
+        background tasks for the objects that were provisionally updated.
+        """
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+        )
+        Site.objects.bulk_create(sites)
+
+        # The first two objects are valid and will be provisionally updated; the third fails
+        # validation, rolling the entire batch back.
+        data = [
+            {'id': sites[0].pk, 'name': 'Site X'},
+            {'id': sites[1].pk, 'name': 'Site Y'},
+            {'id': sites[2].pk, 'status': 'not-a-valid-status'},
+        ]
+        url = reverse('dcim-api:site-list')
+        self.add_permissions('dcim.change_site')
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+        # No object may have been modified
+        for site in sites:
+            site.refresh_from_db()
+        self.assertListEqual([site.name for site in sites], ['Site 1', 'Site 2', 'Site 3'])
+
+        # No task may be queued for an update that was rolled back
+        self.assertEqual(self.queue.count, 0)
 
     def test_single_delete_process_eventrule(self):
         """
@@ -310,6 +490,35 @@ class EventRuleTest(APITestCase):
         self.assertEqual(job.kwargs['data']['foo'], 3)
         self.assertEqual(job.kwargs['snapshots']['prechange']['name'], 'Site 1')
         self.assertEqual(job.kwargs['snapshots']['prechange']['tags'], ['Bar', 'Foo'])
+
+    def test_single_delete_rollback_discards_events(self):
+        """
+        Check that deleting an object whose cascading deletion is aborted queues no background task
+        for the dependent objects that were already processed.
+        """
+        device = create_test_device('Device 1')
+        Interface.objects.create(
+            device=device, name='Interface 1', type=InterfaceTypeChoices.TYPE_1GE_FIXED, description='Has one'
+        )
+        Interface.objects.create(device=device, name='Interface 2', type=InterfaceTypeChoices.TYPE_1GE_FIXED)
+
+        event_rule = EventRule.objects.get(name='Event Rule 3')
+        event_rule.object_types.set([ObjectType.objects.get_for_model(Interface)])
+
+        url = reverse('dcim-api:device-detail', kwargs={'pk': device.pk})
+        self.add_permissions('dcim.delete_device')
+
+        # Deleting the Device cascades to both Interfaces. The first satisfies the protection rule
+        # and so is processed (queueing its event); the second does not, aborting the request.
+        protection_rules = {'dcim.interface': [{'description': {'required': True}}]}
+        with override_settings(PROTECTION_RULES=protection_rules):
+            response = self.client.delete(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(Device.objects.filter(pk=device.pk).exists())
+        self.assertEqual(Interface.objects.filter(device=device).count(), 2)
+
+        # No task may be queued for a deletion that was rolled back
+        self.assertEqual(self.queue.count, 0)
 
     def test_bulk_delete_process_eventrule(self):
         """
@@ -345,9 +554,62 @@ class EventRuleTest(APITestCase):
             self.assertEqual(job.kwargs['snapshots']['prechange']['name'], sites[i].name)
             self.assertEqual(job.kwargs['snapshots']['prechange']['tags'], ['Bar', 'Foo'])
 
+    def test_bulk_delete_rollback_discards_events(self):
+        """
+        Check that a bulk delete which is rolled back because one object is protected queues no
+        background tasks for the objects that were provisionally deleted.
+        """
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+        )
+        Site.objects.bulk_create(sites)
+
+        # A Device references the third Site, whose deletion will therefore raise a ProtectedError
+        # and roll the entire batch back.
+        create_test_device('Device 1', site=sites[2])
+
+        data = [{'id': site.pk} for site in sites]
+        url = reverse('dcim-api:site-list')
+        self.add_permissions('dcim.delete_site')
+        response = self.client.delete(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_409_CONFLICT)
+        self.assertEqual(Site.objects.count(), 3)
+
+        # No task may be queued for a deletion that was rolled back
+        self.assertEqual(self.queue.count, 0)
+
+    def test_bulk_delete_abort_discards_events(self):
+        """
+        Check that a bulk delete aborted by an exception (rather than by a per-object error) also
+        queues no background tasks. A protection rule raises AbortRequest from a signal receiver,
+        which propagates out of the per-object loop.
+        """
+        sites = (
+            Site(name='Site 1', slug='site-1', description='Has a description'),
+            Site(name='Site 2', slug='site-2'),
+        )
+        Site.objects.bulk_create(sites)
+
+        data = [{'id': site.pk} for site in sites]
+        url = reverse('dcim-api:site-list')
+        self.add_permissions('dcim.delete_site')
+
+        # Site 2 has no description, so its deletion is blocked once Site 1 has already been deleted
+        protection_rules = {'dcim.site': [{'description': {'required': True}}]}
+        with override_settings(PROTECTION_RULES=protection_rules):
+            response = self.client.delete(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Site.objects.count(), 2)
+
+        # No task may be queued for a deletion that was rolled back
+        self.assertEqual(self.queue.count, 0)
+
     @skipIf('netbox.tests.dummy_plugin' not in settings.PLUGINS, 'dummy_plugin not in settings.PLUGINS')
     def test_send_webhook(self):
         request_id = uuid.uuid4()
+        url_path = reverse('dcim:site_add')
 
         def dummy_send(_, request, **kwargs):
             """
@@ -373,11 +635,15 @@ class EventRuleTest(APITestCase):
             self.assertEqual(body['data']['name'], 'Site 1')
             self.assertEqual(body['data']['foo'], 1)
             self.assertEqual(body['context']['foo'], 123)  # From netbox.tests.dummy_plugin
+            self.assertEqual(body['request']['id'], str(request_id))
+            self.assertEqual(body['request']['method'], 'GET')
+            self.assertEqual(body['request']['path'], url_path)
+            self.assertEqual(body['request']['user'], 'testuser')
 
             return HttpResponse()
 
         # Create a dummy request
-        request = RequestFactory().get(reverse('dcim:site_add'))
+        request = RequestFactory().get(url_path)
         request.id = request_id
         request.user = self.user
 
@@ -520,6 +786,48 @@ class EventRuleTest(APITestCase):
         self.assertEqual(event['data']['name'], 'Site 1')
         self.assertIsNone(event['snapshots']['postchange'])
 
+    @tag('regression')  # #21338
+    def test_cable_creation_event_payload_includes_connected_endpoints(self):
+        """
+        Interface update events queued during cable creation must include the
+        peer interface in connected_endpoints and link_peers.
+        """
+        webhook = Webhook.objects.get(name='Webhook 1')
+        event_rule = EventRule.objects.create(
+            name='Interface Update Rule',
+            event_types=[OBJECT_UPDATED],
+            action_type=EventRuleActionChoices.WEBHOOK,
+            action_object_type=ObjectType.objects.get_for_model(Webhook),
+            action_object_id=webhook.id,
+        )
+        event_rule.object_types.set([ObjectType.objects.get_for_model(Interface)])
+
+        device = create_test_device('Device 1')
+        interface_a = Interface.objects.create(device=device, name='eth0')
+        interface_b = Interface.objects.create(device=device, name='eth1')
+
+        # Create a cable between the two interfaces via the REST API
+        data = {
+            'a_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_a.pk}],
+            'b_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_b.pk}],
+        }
+        url = reverse('dcim-api:cable-list')
+        self.add_permissions('dcim.add_cable')
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+        # One update event was queued for each interface
+        self.assertEqual(self.queue.count, 2)
+        payloads = {job.kwargs['data']['id']: job.kwargs['data'] for job in self.queue.jobs}
+        peers = {interface_a.pk: interface_b.pk, interface_b.pk: interface_a.pk}
+        self.assertEqual(set(payloads), set(peers))
+        for interface_id, payload in payloads.items():
+            peer_id = peers[interface_id]
+            self.assertIsNotNone(payload['connected_endpoints'])
+            self.assertEqual([endpoint['id'] for endpoint in payload['connected_endpoints']], [peer_id])
+            self.assertEqual([peer['id'] for peer in payload['link_peers']], [peer_id])
+            self.assertTrue(payload['connected_endpoints_reachable'])
+
     def test_duplicate_triggers(self):
         """
         Test for erroneous duplicate event triggers resulting from saving an object multiple times
@@ -563,3 +871,320 @@ class EventRuleTest(APITestCase):
         job = self.queue.get_jobs()[0]
         self.assertEqual(job.kwargs['event_type'], OBJECT_DELETED)
         self.queue.empty()
+
+    def test_non_dict_action_data_does_not_crash_flush(self):
+        """
+        Pre-existing non-dict action_data must not cause flush_events() to
+        raise.
+        """
+        # flush_events() logs a warning about the invalid action_data; mute it so the expected
+        # message doesn't clutter the test runner's output.
+        events_logger = logging.getLogger('netbox.events_processor')
+        original_level = events_logger.level
+        events_logger.setLevel(logging.CRITICAL)
+        self.addCleanup(events_logger.setLevel, original_level)
+
+        site_type = ObjectType.objects.get_for_model(Site)
+        webhook = Webhook.objects.get(name='Webhook 1')
+        webhook_type = ObjectType.objects.get_for_model(Webhook)
+
+        bad_rule = EventRule.objects.create(
+            name='Bad action_data rule',
+            event_types=[OBJECT_CREATED],
+            action_type=EventRuleActionChoices.WEBHOOK,
+            action_object_type=webhook_type,
+            action_object_id=webhook.pk,
+            action_data={},
+        )
+        bad_rule.object_types.set([site_type])
+
+        # Simulate a legacy row that predates model validation.
+        EventRule.objects.filter(pk=bad_rule.pk).update(action_data='not a dict')
+
+        url = reverse('dcim-api:site-list')
+        self.add_permissions('dcim.add_site')
+        response = self.client.post(url, {'name': 'Site X', 'slug': 'site-x'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+    @tag('regression')
+    def test_eventrule_script_action_with_object_image_files(self):
+        """
+        Verify that a Script event-rule action can be enqueued and executed cleanly when the
+        triggering object carries uploaded files (e.g. DeviceType images).
+        This is a regression test for issue #22376.
+
+        """
+        # Create a dummy script class and an instance of it
+        class DummyScript(ScriptBase):
+            class Meta:
+                name = "Dummy Script"
+
+            def run(self, data, commit=True):
+                return "finished successfully"
+
+        dummy_script = DummyScript()
+
+        # Create ScriptModule and Script
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='dummy_script.py',
+            )
+        script = Script.objects.create(
+            module=module,
+            name='Dummy Script',
+            is_executable=True,
+        )
+        script_type = ObjectType.objects.get_for_model(Script)
+
+        # Create an event rule that triggers on DeviceType update with Script action
+        devicetype_type = ObjectType.objects.get_for_model(DeviceType)
+        event_rule = EventRule.objects.create(
+            name='Test Script Event Rule with Files',
+            event_types=[OBJECT_UPDATED],
+            action_type=EventRuleActionChoices.SCRIPT,
+            action_object_type=script_type,
+            action_object_id=script.pk,
+        )
+        event_rule.object_types.set([devicetype_type])
+
+        # Create a manufacturer and DeviceType
+        manufacturer = Manufacturer.objects.create(
+            name='Test Manufacturer',
+            slug='test-manufacturer',
+        )
+        devicetype = DeviceType.objects.create(
+            model='Test DeviceType',
+            slug="test-devicetype",
+            manufacturer=manufacturer,
+        )
+
+        # Create an image file
+        image = BytesIO()
+        Image.new('RGB', (1, 1)).save(image, format='PNG')
+        image.name = 'test_image.png'
+        image.seek(0)
+
+        # PATCH the DeviceType via REST API to add the image
+        data = {
+            'front_image': image,
+        }
+        url = reverse('dcim-api:devicetype-detail', kwargs={'pk': devicetype.pk})
+        self.add_permissions('dcim.change_devicetype')
+
+        # Mock the script's python_class to prevent the test from trying to load from disk
+        with patch.object(Script, 'python_class') as mock:
+            mock.return_value = dummy_script
+            # Since in core/models/jobs.py Jobs are enqueued with a transaction.on_commit-handler
+            # we simulate commit by using captureOnCommitCallbacks context manager
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.patch(url, data, format='multipart', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+
+            # Assert that the script job was enqueued cleanly and is waiting for execution
+            self.assertEqual(self.queue.count, 1)
+            script_job = Job.objects.filter(name=dummy_script.name).last()
+            self.assertEqual(script_job.status, "pending")
+
+            # silence rqworker (cleaner output) and trigger job execution
+            logging.getLogger('rq.worker').setLevel(logging.ERROR)
+            self.run_rq_jobs('default')
+
+        # Assert that our script was executed without any errors
+        script_job.refresh_from_db()
+        self.assertEqual(script_job.status, "completed")
+        self.assertEqual(script_job.data.get('output', ''), "finished successfully")
+
+    @tag('regression')  # Issue #22852
+    def test_eventrule_script_action_honors_script_defaults(self):
+        """A script run from an event rule uses the notification policy and job timeout from its Meta class."""
+        class DummyScript(ScriptBase):
+            class Meta:
+                name = 'Dummy Defaults Script'
+                notifications_default = JobNotificationChoices.NOTIFICATION_ON_FAILURE
+                job_timeout = 600
+
+            def run(self, data, commit=True):
+                return 'finished successfully'
+
+        dummy_script = DummyScript()
+
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='dummy_defaults_script.py',
+            )
+        script = Script.objects.create(
+            module=module,
+            name=dummy_script.name,
+            is_executable=True,
+        )
+
+        event_rule = EventRule.objects.create(
+            name='Test Script Defaults Event Rule',
+            event_types=[OBJECT_CREATED],
+            action_type=EventRuleActionChoices.SCRIPT,
+            action_object_type=ObjectType.objects.get_for_model(Script),
+            action_object_id=script.pk,
+        )
+        event_rule.object_types.set([ObjectType.objects.get_for_model(DeviceType)])
+
+        manufacturer = Manufacturer.objects.create(name='Test Manufacturer', slug='test-manufacturer')
+        self.add_permissions('dcim.add_devicetype')
+
+        with patch.object(Script, 'python_class') as mock:
+            mock.return_value = dummy_script
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.client.post(
+                    reverse('dcim-api:devicetype-list'),
+                    {
+                        'manufacturer': manufacturer.pk,
+                        'model': 'Test DeviceType',
+                        'slug': 'test-devicetype',
+                    },
+                    format='json',
+                    **self.header,
+                )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+            self.assertEqual(self.queue.count, 1)
+            self.assertEqual(self.queue.jobs[0].timeout, 600)
+            script_job = Job.objects.get(name=dummy_script.name)
+            self.assertEqual(script_job.notifications, JobNotificationChoices.NOTIFICATION_ON_FAILURE)
+
+            # silence rqworker (cleaner output) and trigger job execution
+            rq_logger = logging.getLogger('rq.worker')
+            self.addCleanup(rq_logger.setLevel, rq_logger.level)
+            rq_logger.setLevel(logging.ERROR)
+            self.run_rq_jobs('default')
+
+        script_job.refresh_from_db()
+        self.assertEqual(script_job.status, "completed")
+        self.assertFalse(
+            Notification.objects.filter(
+                user=self.user,
+                object_type=ObjectType.objects.get_for_model(Job),
+                object_id=script_job.pk,
+            ).exists()
+        )
+
+    @tag('regression')
+    def test_eventrule_webhook_action_with_object_image_files(self):
+        """
+        Verify that a Webhook event-rule action can be enqueued and executed cleanly when
+        the triggering object carries uploaded files (e.g. DeviceType images).
+        This is a regression test for issue #20873.
+        """
+        # Create an event rule that triggers on DeviceType update with Script action
+        webhook = Webhook.objects.get(name='Webhook 1')
+        webhook_type = ObjectType.objects.get_for_model(Webhook)
+        devicetype_type = ObjectType.objects.get_for_model(DeviceType)
+        event_rule = EventRule.objects.create(
+            name='Test Webhook Event Rule with Files',
+            event_types=[OBJECT_UPDATED],
+            action_type=EventRuleActionChoices.WEBHOOK,
+            action_object_type=webhook_type,
+            action_object_id=webhook.pk,
+        )
+        event_rule.object_types.set([devicetype_type])
+
+        # Create a manufacturer and DeviceType
+        manufacturer = Manufacturer.objects.create(
+            name='Test Manufacturer',
+            slug='test-manufacturer',
+        )
+        devicetype = DeviceType.objects.create(
+            model='Test DeviceType',
+            slug="test-devicetype",
+            manufacturer=manufacturer,
+        )
+
+        # Create an image file
+        image = BytesIO()
+        Image.new('RGB', (1, 1)).save(image, format='PNG')
+        image.name = 'test_image.png'
+        image.seek(0)
+
+        # PATCH the DeviceType via REST API to add the image
+        data = {
+            'front_image': image,
+        }
+        url = reverse('dcim-api:devicetype-detail', kwargs={'pk': devicetype.pk})
+        self.add_permissions('dcim.change_devicetype')
+
+        response = self.client.patch(url, data, format='multipart', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # Assert that the webhook job was enqueued cleanly
+        self.assertEqual(self.queue.count, 1)
+        job = self.queue.jobs[0]
+        self.assertEqual(job.kwargs['event_rule'], event_rule)
+        self.assertEqual(job.kwargs['event_type'], OBJECT_UPDATED)
+
+
+class WebhookRenderHeadersTest(TestCase):
+
+    def test_render_headers(self):
+        """Basic header rendering with Jinja2 interpolation."""
+        webhook = Webhook(
+            name='Webhook 1',
+            payload_url='http://localhost:9000/',
+            additional_headers='X-Foo: Bar\nX-Object: {{ data.name }}',
+        )
+        headers = webhook.render_headers({'data': {'name': 'Site 1'}})
+        self.assertEqual(headers, {'X-Foo': 'Bar', 'X-Object': 'Site 1'})
+
+    def test_render_headers_multiline_block(self):
+        """A multi-line Jinja2 block (e.g. a loop generating headers) must render against the full template."""
+        webhook = Webhook(
+            name='Webhook 1',
+            payload_url='http://localhost:9000/',
+            additional_headers=(
+                '{% for k, v in data.headers.items() %}X-{{ k }}: {{ v }}\n'
+                '{% endfor %}'
+            ),
+        )
+        headers = webhook.render_headers({'data': {'headers': {'Foo': '1', 'Bar': '2'}}})
+        self.assertEqual(headers, {'X-Foo': '1', 'X-Bar': '2'})
+
+    def test_render_headers_skips_blank_lines(self):
+        """Blank lines in the rendered output (e.g. from Jinja2 block tags) must be skipped, not raise."""
+        webhook = Webhook(
+            name='Webhook 1',
+            payload_url='http://localhost:9000/',
+            # Block tags on their own lines leave behind blank lines once rendered
+            additional_headers=(
+                '{% for k, v in data.headers.items() %}\n'
+                'X-{{ k }}: {{ v }}\n'
+                '{% endfor %}'
+            ),
+        )
+        headers = webhook.render_headers({'data': {'headers': {'Foo': '1', 'Bar': '2'}}})
+        self.assertEqual(headers, {'X-Foo': '1', 'X-Bar': '2'})
+
+    def test_render_headers_skips_lines_without_separator(self):
+        """A non-blank line lacking a 'Name: Value' separator must be skipped, not raise."""
+        webhook = Webhook(
+            name='Webhook 1',
+            payload_url='http://localhost:9000/',
+            additional_headers='X-Foo: Bar\nthis line has no colon\nX-Baz: Qux',
+        )
+        headers = webhook.render_headers({})
+        self.assertEqual(headers, {'X-Foo': 'Bar', 'X-Baz': 'Qux'})
+
+    def test_render_headers_header_safe_filter_available(self):
+        """
+        The `header_safe` filter must be available when rendering headers, and must strip control characters
+        (including CR/LF) so that untrusted data cannot smuggle additional headers via CR/LF injection.
+        """
+        webhook = Webhook(
+            name='Webhook 1',
+            payload_url='http://localhost:9000/',
+            additional_headers='X-Object: {{ data.name | header_safe }}',
+        )
+        headers = webhook.render_headers({'data': {'name': 'legit\r\nX-Injected: evil\x00'}})
+
+        # The injected newline is stripped, so only a single (sanitized) header is produced
+        self.assertEqual(list(headers.keys()), ['X-Object'])
+        self.assertNotIn('X-Injected', headers)
+        self.assertEqual(headers['X-Object'], 'legitX-Injected: evil')

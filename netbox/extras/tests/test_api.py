@@ -1,28 +1,33 @@
 import datetime
 import hashlib
 import io
+import json
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError
+from django.test import override_settings
 from django.urls import reverse
 from django.utils.timezone import make_aware, now
 from rest_framework import status
 
 from core.choices import ManagedFileRootPathChoices
 from core.events import *
-from core.models import DataFile, DataSource, ObjectType
+from core.models import DataFile, DataSource, Job, ObjectType
 from dcim.models import Device, DeviceRole, DeviceType, Location, Manufacturer, Rack, RackRole, Site
 from extras.choices import *
 from extras.models import *
 from extras.scripts import BooleanVar, IntegerVar, StringVar
 from extras.scripts import Script as PythonClass
 from users.constants import TOKEN_PREFIX
-from users.models import Group, Token, User
-from utilities.testing import APITestCase, APIViewTestCases
+from users.models import Group, ObjectPermission, Token, User
+from utilities.tables import get_table_for_model
+from utilities.testing import APITestCase, APIViewTestCases, disable_warnings
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
 
@@ -32,7 +37,7 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class WebhookTest(APIViewTestCases.APIViewTestCase):
+class WebhookTestCase(APIViewTestCases.APIViewTestCase):
     model = Webhook
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -74,7 +79,7 @@ class WebhookTest(APIViewTestCases.APIViewTestCase):
         Webhook.objects.bulk_create(webhooks)
 
 
-class EventRuleTest(APIViewTestCases.APIViewTestCase):
+class EventRuleTestCase(APIViewTestCases.APIViewTestCase):
     model = EventRule
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -152,7 +157,7 @@ class EventRuleTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class CustomFieldTest(APIViewTestCases.APIViewTestCase):
+class CustomFieldTestCase(APIViewTestCases.APIViewTestCase):
     model = CustomField
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -204,7 +209,7 @@ class CustomFieldTest(APIViewTestCases.APIViewTestCase):
             cf.object_types.add(site_ct)
 
 
-class CustomFieldChoiceSetTest(APIViewTestCases.APIViewTestCase):
+class CustomFieldChoiceSetTestCase(APIViewTestCases.APIViewTestCase):
     model = CustomFieldChoiceSet
     brief_fields = ['choices_count', 'description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -215,6 +220,10 @@ class CustomFieldChoiceSetTest(APIViewTestCases.APIViewTestCase):
                 ['4B', 'Choice 2'],
                 ['4C', 'Choice 3'],
             ],
+            'choice_colors': {
+                '4A': 'red',
+                '4B': 'green',
+            },
         },
         {
             'name': 'Choice Set 5',
@@ -223,6 +232,9 @@ class CustomFieldChoiceSetTest(APIViewTestCases.APIViewTestCase):
                 ['5B', 'Choice 2'],
                 ['5C', 'Choice 3'],
             ],
+            'choice_colors': {
+                '5C': 'blue',
+            },
         },
         {
             'name': 'Choice Set 6',
@@ -243,6 +255,10 @@ class CustomFieldChoiceSetTest(APIViewTestCases.APIViewTestCase):
             ['X2', 'Choice 2'],
             ['X3', 'Choice 3'],
         ],
+        'choice_colors': {
+            'X1': 'red',
+            'X3': 'green',
+        },
         'description': 'New description',
     }
 
@@ -281,8 +297,128 @@ class CustomFieldChoiceSetTest(APIViewTestCases.APIViewTestCase):
         response = self.client.post(self._get_list_url(), data, format='json', **self.header)
         self.assertEqual(response.status_code, 400)
 
+    def test_null_base_choices(self):
+        """
+        A null value for base_choices should be accepted, as returned by the API for a choice set which defines
+        only extra choices.
+        """
+        self.add_permissions('extras.add_customfieldchoiceset', 'extras.change_customfieldchoiceset')
+        data = {
+            'name': 'test',
+            'base_choices': None,
+            'extra_choices': [
+                ['choice1', 'Choice 1'],
+            ],
+        }
 
-class CustomLinkTest(APIViewTestCases.APIViewTestCase):
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertIsNone(response.data['base_choices'])
+        choice_set = CustomFieldChoiceSet.objects.get(pk=response.data['id'])
+        self.assertIsNone(choice_set.base_choices)
+
+        # A choice set with base choices assigned can be reverted to null
+        choice_set.base_choices = CustomFieldChoiceSetBaseChoices.IATA
+        choice_set.save()
+        response = self.client.patch(
+            self._get_detail_url(choice_set), {'base_choices': None}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        choice_set.refresh_from_db()
+        self.assertIsNone(choice_set.base_choices)
+
+    def test_invalid_choice_color(self):
+        self.add_permissions('extras.add_customfieldchoiceset')
+        data = {
+            'name': 'test',
+            'extra_choices': [
+                ['choice1', 'Choice 1'],
+                ['choice2', 'Choice 2'],
+            ],
+            'choice_colors': {
+                'choice1': 'magenta',
+            },
+        }
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_choice_color_reference(self):
+        self.add_permissions('extras.add_customfieldchoiceset')
+        data = {
+            'name': 'test',
+            'extra_choices': [
+                ['choice1', 'Choice 1'],
+                ['choice2', 'Choice 2'],
+            ],
+            'choice_colors': {
+                'choice3': 'red',
+            },
+        }
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+    def test_graphql_filter_extra_choices(self):
+        """Filter choice sets by choice value and by number of choices."""
+        self.add_permissions('extras.view_customfieldchoiceset')
+
+        # '1A' appears here only as a label, so it must not match contains
+        CustomFieldChoiceSet.objects.create(
+            name='Choice Set Labels',
+            extra_choices=[['sel1', 'Selection 1'], ['other', '1A']],
+        )
+
+        def run(lookup):
+            query = '{ custom_field_choice_set_list(filters: {extra_choices: ' + lookup + '}) { name } }'
+            response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            data = response.json()
+            self.assertNotIn('errors', data)
+            return sorted(row['name'] for row in data['data']['custom_field_choice_set_list'])
+
+        # contains matches choice values only, never labels
+        self.assertEqual(run('{contains: "1A"}'), ['Choice Set 1'])
+        self.assertEqual(run('{contains: "sel1"}'), ['Choice Set Labels'])
+        self.assertEqual(run('{contains: "Selection 1"}'), [])
+        # length is the number of [value, label] pairs
+        self.assertEqual(run('{length: 2}'), ['Choice Set Labels'])
+        self.assertEqual(run('{length: 1}'), [])
+
+    def test_graphql_filter_extra_choices_rejects_array_operands(self):
+        """The legacy flat and nested array operand shapes fail schema validation."""
+        self.add_permissions('extras.view_customfieldchoiceset')
+
+        def run_invalid(lookup):
+            query = '{ custom_field_choice_set_list(filters: {extra_choices: ' + lookup + '}) { name } }'
+            response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            self.assertIn('errors', response.json())
+
+        # shapes advertised or attempted before #22324
+        run_invalid('{contains: ["1A"]}')
+        run_invalid('{contains: [["1A", "Choice 1A"]]}')
+
+    def test_graphql_filter_extra_choices_via_relation(self):
+        """The extra_choices lookup composes through the choice_set relation prefix."""
+        self.add_permissions('extras.view_customfield')
+
+        for choice_set in CustomFieldChoiceSet.objects.filter(name__in=['Choice Set 1', 'Choice Set 2']):
+            CustomField.objects.create(
+                name=f'cf_{choice_set.name[-1]}',
+                type=CustomFieldTypeChoices.TYPE_SELECT,
+                choice_set=choice_set,
+            )
+
+        query = '{ custom_field_list(filters: {choice_set: {extra_choices: {contains: "1A"}}}) { name } }'
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = response.json()
+        self.assertNotIn('errors', data)
+        self.assertEqual([row['name'] for row in data['data']['custom_field_list']], ['cf_1'])
+
+
+class CustomLinkTestCase(APIViewTestCases.APIViewTestCase):
     model = CustomLink
     brief_fields = ['display', 'id', 'name', 'url']
     create_data = [
@@ -342,7 +478,24 @@ class CustomLinkTest(APIViewTestCases.APIViewTestCase):
             custom_link.object_types.set([site_type])
 
 
-class SavedFilterTest(APIViewTestCases.APIViewTestCase):
+class SharedObjectAPITestMixin:
+    """
+    Helpers for testing the shared/owner visibility enforced on SavedFilter and TableConfig.
+    """
+    def _grant_view_permission_and_authenticate(self, user, model):
+        """
+        Grant `user` an unconstrained view permission on `model`, create an API token, and return the
+        corresponding authentication header.
+        """
+        obj_perm = ObjectPermission(name=f'{model._meta.model_name} view', actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(model))
+        token = Token.objects.create(user=user)
+        return {'HTTP_AUTHORIZATION': f'Bearer {TOKEN_PREFIX}{token.key}.{token.token}'}
+
+
+class SavedFilterTestCase(SharedObjectAPITestMixin, APIViewTestCases.APIViewTestCase):
     model = SavedFilter
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
     create_data = [
@@ -414,8 +567,177 @@ class SavedFilterTest(APIViewTestCases.APIViewTestCase):
         for i, savedfilter in enumerate(saved_filters):
             savedfilter.object_types.set([site_type])
 
+    def test_private_filter_not_visible_to_other_users(self):
+        """
+        A private (shared=False) SavedFilter owned by another user must not be exposed via the REST API, even to
+        a user holding an unconstrained view permission.
+        """
+        site_type = ObjectType.objects.get_for_model(Site)
+        owner = User.objects.create_user(username='filter-owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private Filter',
+            slug='private-filter',
+            user=owner,
+            shared=False,
+            parameters={'status': ['active']},
+        )
+        private_filter.object_types.set([site_type])
 
-class BookmarkTest(
+        # Grant an unconstrained view permission (the common case)
+        self.add_permissions('extras.view_savedfilter')
+
+        # The private filter must not appear in the list
+        response = self.client.get(self._get_list_url(), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        returned_ids = [obj['id'] for obj in response.data['results']]
+        self.assertNotIn(private_filter.pk, returned_ids)
+
+        # The private filter must not be retrievable directly
+        response = self.client.get(self._get_detail_url(private_filter), **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+        # The private filter must not be exposed via GraphQL either
+        query = '{ saved_filter_list { id } }'
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = json.loads(response.content)
+        returned_ids = [int(obj['id']) for obj in data['data']['saved_filter_list']]
+        self.assertNotIn(private_filter.pk, returned_ids)
+
+        # The owner, however, must still be able to access their own private filter
+        owner_header = self._grant_view_permission_and_authenticate(owner, SavedFilter)
+        response = self.client.get(self._get_detail_url(private_filter), **owner_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **owner_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = json.loads(response.content)
+        returned_ids = [int(obj['id']) for obj in data['data']['saved_filter_list']]
+        self.assertIn(private_filter.pk, returned_ids)
+
+
+class TableConfigTestCase(SharedObjectAPITestMixin, APIViewTestCases.APIViewTestCase):
+    model = TableConfig
+    brief_fields = ['description', 'display', 'id', 'name', 'object_type', 'table', 'url']
+    bulk_update_data = {
+        'description': 'New description',
+        'weight': 999,
+        'enabled': False,
+        'shared': False,
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        site_type = ObjectType.objects.get_for_model(Site)
+        site_table_name = get_table_for_model(Site).__name__
+
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+        )
+        User.objects.bulk_create(users)
+
+        table_configs = (
+            TableConfig(
+                name='Table Config 1',
+                object_type=site_type,
+                table=site_table_name,
+                user=users[0],
+                shared=True,
+                columns=['name', 'status'],
+            ),
+            TableConfig(
+                name='Table Config 2',
+                object_type=site_type,
+                table=site_table_name,
+                user=users[1],
+                shared=True,
+                columns=['name', 'region'],
+            ),
+            TableConfig(
+                name='Table Config 3',
+                object_type=site_type,
+                table=site_table_name,
+                user=users[2],
+                shared=True,
+                columns=['name', 'tenant'],
+            ),
+        )
+        TableConfig.objects.bulk_create(table_configs)
+
+        cls.create_data = [
+            {
+                'object_type': 'dcim.site',
+                'table': site_table_name,
+                'name': 'Table Config 4',
+                'columns': ['name', 'status'],
+                'ordering': ['name'],
+            },
+            {
+                'object_type': 'dcim.site',
+                'table': site_table_name,
+                'name': 'Table Config 5',
+                'columns': ['name', 'region'],
+                'ordering': ['-name'],
+            },
+            {
+                'object_type': 'dcim.site',
+                'table': site_table_name,
+                'name': 'Table Config 6',
+                'columns': ['name', 'tenant'],
+            },
+        ]
+
+    def test_private_table_config_not_visible_to_other_users(self):
+        """
+        A private (shared=False) TableConfig owned by another user must not be exposed via the REST API, even to
+        a user holding an unconstrained view permission.
+        """
+        site_type = ObjectType.objects.get_for_model(Site)
+        site_table_name = get_table_for_model(Site).__name__
+        owner = User.objects.create_user(username='tableconfig-owner')
+        private_config = TableConfig.objects.create(
+            name='Private Table Config',
+            object_type=site_type,
+            table=site_table_name,
+            user=owner,
+            shared=False,
+            columns=['name', 'status'],
+        )
+
+        # Grant an unconstrained view permission (the common case)
+        self.add_permissions('extras.view_tableconfig')
+
+        # The private table config must not appear in the list
+        response = self.client.get(self._get_list_url(), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        returned_ids = [obj['id'] for obj in response.data['results']]
+        self.assertNotIn(private_config.pk, returned_ids)
+
+        # The private table config must not be retrievable directly
+        response = self.client.get(self._get_detail_url(private_config), **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+        # The private table config must not be exposed via GraphQL either
+        query = '{ table_config_list { id } }'
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = json.loads(response.content)
+        returned_ids = [int(obj['id']) for obj in data['data']['table_config_list']]
+        self.assertNotIn(private_config.pk, returned_ids)
+
+        # The owner, however, must still be able to access their own private table config
+        owner_header = self._grant_view_permission_and_authenticate(owner, TableConfig)
+        response = self.client.get(self._get_detail_url(private_config), **owner_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **owner_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = json.loads(response.content)
+        returned_ids = [int(obj['id']) for obj in data['data']['table_config_list']]
+        self.assertIn(private_config.pk, returned_ids)
+
+
+class BookmarkTestCase(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
     APIViewTestCases.CreateObjectViewTestCase,
@@ -467,7 +789,7 @@ class BookmarkTest(
         ]
 
 
-class ExportTemplateTest(APIViewTestCases.APIViewTestCase):
+class ExportTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = ExportTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -517,7 +839,7 @@ class ExportTemplateTest(APIViewTestCases.APIViewTestCase):
             et.object_types.set([device_object_type])
 
 
-class TagTest(APIViewTestCases.APIViewTestCase):
+class TagTestCase(APIViewTestCases.APIViewTestCase):
     model = Tag
     brief_fields = ['color', 'description', 'display', 'id', 'name', 'slug', 'url']
     create_data = [
@@ -550,7 +872,7 @@ class TagTest(APIViewTestCases.APIViewTestCase):
         Tag.objects.bulk_create(tags)
 
 
-class TaggedItemTest(
+class TaggedItemTestCase(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase
 ):
@@ -579,7 +901,7 @@ class TaggedItemTest(
 
 
 # TODO: Standardize to APIViewTestCase (needs create & update tests)
-class ImageAttachmentTest(
+class ImageAttachmentTestCase(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
     APIViewTestCases.DeleteObjectViewTestCase,
@@ -601,7 +923,8 @@ class ImageAttachmentTest(
                 name='Image Attachment 1',
                 image='http://example.com/image1.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=1024
             ),
             ImageAttachment(
                 object_type=ct,
@@ -609,7 +932,8 @@ class ImageAttachmentTest(
                 name='Image Attachment 2',
                 image='http://example.com/image2.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=2048
             ),
             ImageAttachment(
                 object_type=ct,
@@ -617,13 +941,14 @@ class ImageAttachmentTest(
                 name='Image Attachment 3',
                 image='http://example.com/image3.png',
                 image_height=100,
-                image_width=100
+                image_width=100,
+                image_size=4096
             )
         )
         ImageAttachment.objects.bulk_create(image_attachments)
 
 
-class JournalEntryTest(APIViewTestCases.APIViewTestCase):
+class JournalEntryTestCase(APIViewTestCases.APIViewTestCase):
     model = JournalEntry
     brief_fields = ['created', 'display', 'id', 'url']
     bulk_update_data = {
@@ -632,6 +957,12 @@ class JournalEntryTest(APIViewTestCases.APIViewTestCase):
 
     @classmethod
     def setUpTestData(cls):
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+        )
+        User.objects.bulk_create(users)
+
         user = User.objects.first()
         site = Site.objects.create(name='Site 1', slug='site-1')
 
@@ -672,8 +1003,27 @@ class JournalEntryTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    def test_immutable_created_by(self):
+        """
+        Verify that created_by can't be changed for existing objects
+        """
+        entry = JournalEntry.objects.first()
+        created_by_before = entry.created_by_id
+        # select user different from the one currently set
+        change_user = User.objects.exclude(pk=created_by_before).only('id').first()
 
-class ConfigContextProfileTest(APIViewTestCases.APIViewTestCase):
+        url = reverse('extras-api:journalentry-detail', kwargs={'pk': entry.pk})
+        self.add_permissions('extras.change_journalentry')
+        response = self.client.patch(url, {'created_by': change_user.id}, format='json', **self.header)
+
+        self.assertEqual(response.status_code, 200)
+
+        entry.refresh_from_db()
+        created_by_after = entry.created_by_id
+        self.assertEqual(created_by_before, created_by_after)
+
+
+class ConfigContextProfileTestCase(APIViewTestCases.APIViewTestCase):
     model = ConfigContextProfile
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -782,7 +1132,7 @@ class ConfigContextProfileTest(APIViewTestCases.APIViewTestCase):
         self.assertEqual(response.data['data_file']['id'], datafile.pk)
 
 
-class ConfigContextTest(APIViewTestCases.APIViewTestCase):
+class ConfigContextTestCase(APIViewTestCases.APIViewTestCase):
     model = ConfigContext
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -908,7 +1258,7 @@ class ConfigContextTest(APIViewTestCases.APIViewTestCase):
         self.assertEqual(response.data['data_file']['id'], datafile.pk)
 
 
-class ConfigTemplateTest(APIViewTestCases.APIViewTestCase):
+class ConfigTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = ConfigTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -993,7 +1343,7 @@ class ConfigTemplateTest(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
 
-class ScriptTest(APITestCase):
+class ScriptTestCase(APITestCase):
 
     class TestScriptClass(PythonClass):
         class Meta:
@@ -1040,6 +1390,12 @@ class ScriptTest(APITestCase):
         # Monkey-patch the Script model to return our TestScriptClass above
         Script.python_class = self.python_class
 
+        # The script-run endpoint gates on a live RQ worker. Tests run without
+        # one, so bypass the check to exercise validation and the enqueue path.
+        worker_patch = patch('extras.api.views.any_workers_for_queue', return_value=True)
+        worker_patch.start()
+        self.addCleanup(worker_patch.stop)
+
     def test_get_script(self):
         response = self.client.get(self.url, **self.header)
 
@@ -1047,6 +1403,34 @@ class ScriptTest(APITestCase):
         self.assertEqual(response.data['vars']['var1'], 'StringVar')
         self.assertEqual(response.data['vars']['var2'], 'IntegerVar')
         self.assertEqual(response.data['vars']['var3'], 'BooleanVar')
+
+    def test_list_scripts(self):
+        """
+        The list route is served by BaseViewSet, which resolves the QuerySet's prefetches & annotations (and
+        any fields/omit request parameters) from the serializer.
+        """
+        url = reverse('extras-api:script-list')
+
+        response = self.client.get(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['name'], self.TestScriptClass.Meta.name)
+
+        response = self.client.get(f'{url}?fields=id,name', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(sorted(response.data['results'][0]), ['id', 'name'])
+
+    def test_get_script_by_module_and_name(self):
+        """
+        A script may also be identified by its module & name, e.g. /api/extras/scripts/example.MyReport/.
+        """
+        script = Script.objects.first()
+        url = reverse('extras-api:script-detail', kwargs={'pk': f'script.{script.name}'})
+
+        response = self.client.get(url, **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['id'], script.pk)
 
     def test_schedule_script_past_time_rejected(self):
         """
@@ -1118,8 +1502,205 @@ class ScriptTest(APITestCase):
             # Restore the original setting for other tests
             self.TestScriptClass.Meta.scheduling_enabled = original
 
+    def test_run_script_without_permission(self):
+        """
+        A user permitted to view a script but not to run it must not be able to enqueue it. (The script is
+        excluded from the restricted QuerySet, so the request yields a 404.)
+        """
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
 
-class CreatedUpdatedFilterTest(APITestCase):
+        # setUp() grants only extras.view_script
+        with disable_warnings('django.request'):
+            response = self.client.post(self.url, payload, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(Job.objects.exists())
+
+        # Granting the run permission permits the same request
+        self.add_permissions('extras.run_script')
+        response = self.client.post(self.url, payload, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertTrue(Job.objects.exists())
+
+    @override_settings(LOGIN_REQUIRED=False, EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_run_script_anonymous(self):
+        """
+        An unauthenticated user must be told that running a script is not permitted, rather than that the
+        script does not exist.
+        """
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+
+        with disable_warnings('django.request'):
+            response = self.client.post(self.url, payload, format='json')
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(Job.objects.exists())
+
+    def test_run_script_read_only_token(self):
+        """
+        Running a script is a write operation and must be rejected for a read-only token.
+        """
+        self.add_permissions('extras.run_script')
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+
+        # A write-disabled token should be rejected
+        ro_token = Token.objects.create(version=2, user=self.user, write_enabled=False)
+        ro_header = {'HTTP_AUTHORIZATION': f'Bearer {TOKEN_PREFIX}{ro_token.key}.{ro_token.token}'}
+        response = self.client.post(self.url, payload, format='json', **ro_header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
+        # The default (write-enabled) token should succeed
+        response = self.client.post(self.url, payload, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+    def test_run_script_read_only_token_without_permission(self):
+        """
+        A read-only token is rejected before the script is resolved, so an insufficient token is reported as
+        such regardless of the user's permission to run the script.
+        """
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+
+        # setUp() grants only extras.view_script
+        ro_token = Token.objects.create(version=2, user=self.user, write_enabled=False)
+        ro_header = {'HTTP_AUTHORIZATION': f'Bearer {TOKEN_PREFIX}{ro_token.key}.{ro_token.token}'}
+        response = self.client.post(self.url, payload, format='json', **ro_header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
+    def test_run_script_not_executable(self):
+        """
+        A script whose Python class cannot be resolved must be rejected, not raise an exception.
+        """
+        self.add_permissions('extras.run_script')
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+
+        # Simulate a script whose class can no longer be found in its module
+        class_patch = patch.object(Script, 'python_class', None)
+        class_patch.start()
+        self.addCleanup(class_patch.stop)
+
+        response = self.client.post(self.url, payload, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Job.objects.exists())
+
+    def test_run_script_by_module_and_name(self):
+        """
+        A script identified by its module & name (rather than by its PK) must also be runnable.
+        """
+        self.add_permissions('extras.run_script')
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+        script = Script.objects.first()
+        url = reverse('extras-api:script-detail', kwargs={'pk': f'script.{script.name}'})
+
+        response = self.client.post(url, payload, format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['id'], script.pk)
+        self.assertTrue(Job.objects.exists())
+
+    def test_run_script_format_suffix(self):
+        """
+        The format-suffix variants of the detail route (e.g. /1.json) must dispatch to run().
+        """
+        self.add_permissions('extras.run_script')
+        payload = {'data': {'var1': 'hello', 'var2': 1, 'var3': False}, 'commit': True}
+        script = Script.objects.first()
+        lookups = (script.pk, f'script.{script.name}')
+
+        for lookup in lookups:
+            with self.subTest(lookup=lookup):
+                url = reverse('extras-api:script-detail', kwargs={'pk': lookup, 'format': 'json'})
+
+                response = self.client.post(url, payload, format='json', **self.header)
+
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                self.assertEqual(response.data['id'], script.pk)
+
+        self.assertEqual(Job.objects.count(), len(lookups))
+
+    def test_modify_script_methods_disabled(self):
+        """
+        Individual scripts are created, modified, and deleted through their module, so PUT/PATCH/DELETE on
+        the script endpoint are not supported (even for a user holding the corresponding permissions).
+        """
+        self.add_permissions('extras.change_script', 'extras.delete_script')
+        script = Script.objects.first()
+
+        for method in ('put', 'patch', 'delete'):
+            with self.subTest(method=method):
+                with disable_warnings('django.request'):
+                    response = getattr(self.client, method)(self.url, {}, format='json', **self.header)
+                self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+        # The script must remain untouched
+        self.assertTrue(Script.objects.filter(pk=script.pk).exists())
+
+    def test_create_script_disabled(self):
+        """
+        Scripts cannot be created via the API: POST is mapped only on the detail route (to run a script),
+        and must be neither permitted nor advertised on the list route.
+        """
+        self.add_permissions('extras.add_script')
+        list_url = reverse('extras-api:script-list')
+
+        with disable_warnings('django.request'):
+            response = self.client.post(list_url, {}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+        # OPTIONS must not advertise a create action for the list route
+        response = self.client.options(list_url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertNotIn('POST', response.data.get('actions', {}))
+
+    def test_options_detail_route(self):
+        """
+        POST on the detail route runs a script, so its OPTIONS metadata must describe the run input
+        rather than the Script model's own fields.
+        """
+        self.add_permissions('extras.run_script')
+
+        response = self.client.options(self.url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        post_fields = response.data['actions']['POST']
+        self.assertIn('data', post_fields)
+        self.assertIn('commit', post_fields)
+        self.assertNotIn('module', post_fields)
+        self.assertNotIn('name', post_fields)
+
+    def test_options_detail_route_dynamic_fields(self):
+        """
+        The run input serializer does not support the fields/omit query parameters, but their presence must
+        not break the generation of OPTIONS metadata.
+        """
+        self.add_permissions('extras.run_script')
+
+        for query in ('fields=id', 'omit=id'):
+            with self.subTest(query=query):
+                response = self.client.options(f'{self.url}?{query}', **self.header)
+
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                self.assertIn('data', response.data['actions']['POST'])
+
+    def test_unsupported_method(self):
+        """
+        A request using an HTTP method which maps to no action must be rejected with a 405.
+        """
+        with disable_warnings('django.request'):
+            response = self.client.trace(self.url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_get_script_invalid_pk(self):
+        """
+        A PK which cannot be cast to an integer must yield a 404, not a server error. This covers numeric (but
+        non-decimal) characters, as well as a decimal value too long for Python to convert.
+        """
+        for pk in ('½', '1' * 5000):
+            with self.subTest(pk=pk[:10]):
+                url = reverse('extras-api:script-detail', kwargs={'pk': pk})
+
+                with disable_warnings('django.request'):
+                    response = self.client.get(url, **self.header)
+                self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+
+class CreatedUpdatedFilterTestCase(APITestCase):
 
     @classmethod
     def setUpTestData(cls):
@@ -1193,9 +1774,12 @@ class CreatedUpdatedFilterTest(APITestCase):
         self.assertEqual(response.data['results'][0]['id'], rack2.pk)
 
 
-class SubscriptionTest(APIViewTestCases.APIViewTestCase):
+class SubscriptionTestCase(APIViewTestCases.APIViewTestCase):
     model = Subscription
     brief_fields = ['display', 'id', 'object_id', 'object_type', 'url', 'user']
+    graphql_filter = {
+        'id': {'lookup': 'gt', 'value': '0'},
+    }
 
     @classmethod
     def setUpTestData(cls):
@@ -1252,7 +1836,7 @@ class SubscriptionTest(APIViewTestCases.APIViewTestCase):
         }
 
 
-class NotificationGroupTest(APIViewTestCases.APIViewTestCase):
+class NotificationGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = NotificationGroup
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     create_data = [
@@ -1329,11 +1913,14 @@ class NotificationGroupTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class NotificationTest(APIViewTestCases.APIViewTestCase):
+class NotificationTestCase(APIViewTestCases.APIViewTestCase):
     model = Notification
     brief_fields = ['display', 'event_type', 'id', 'object_id', 'object_type', 'read', 'url', 'user']
     bulk_update_data = {
         'read': now(),
+    }
+    graphql_filter = {
+        'event_type': {'lookup': 'exact', 'value': OBJECT_CREATED},
     }
 
     @classmethod
@@ -1393,7 +1980,33 @@ class NotificationTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ScriptModuleTest(APITestCase):
+class _InMemoryScriptStorage:
+    """Stateful stand-in for the scripts storage backend; mirrors its allow_overwrite option."""
+
+    def __init__(self, allow_overwrite=True):
+        self.files = {}
+        self.allow_overwrite = allow_overwrite
+
+    def save(self, name, content):
+        if not self.allow_overwrite and name in self.files:
+            name = f'{name}.1'
+        content.seek(0)
+        self.files[name] = content.read()
+        return name
+
+    def open(self, name, mode='rb'):
+        if name not in self.files:
+            raise FileNotFoundError(name)
+        return io.BytesIO(self.files[name])
+
+    def delete(self, name):
+        self.files.pop(name, None)
+
+    def exists(self, name):
+        return name in self.files
+
+
+class ScriptModuleTestCase(APITestCase):
     """
     Tests for the POST /api/extras/scripts/upload/ endpoint.
 
@@ -1405,6 +2018,18 @@ class ScriptModuleTest(APITestCase):
     def setUp(self):
         super().setUp()
         self.url = reverse('extras-api:scriptmodule-list')  # /api/extras/scripts/upload/
+
+    @contextmanager
+    def _patched_script_storage(self, fake_storage):
+        """Patch both storage entry points (serializer writes, module imports) to the given fake."""
+        with (
+            patch('extras.api.serializers_.scripts.storages') as serializer_storages,
+            patch('extras.models.mixins.storages') as module_storages,
+        ):
+            serializer_storages.create_storage.return_value = fake_storage
+            serializer_storages.backends = {'scripts': {}}
+            module_storages.__getitem__.return_value = fake_storage
+            yield
 
     def test_upload_script_module_without_permission(self):
         script_content = b"from extras.scripts import Script\nclass TestScript(Script):\n    pass\n"
@@ -1450,7 +2075,419 @@ class ScriptModuleTest(APITestCase):
         self.assertTrue(ScriptModule.objects.filter(file_path='test_upload.py').exists())
         self.assertTrue(Script.objects.filter(module__file_path='test_upload.py', name='TestScript').exists())
 
+    def test_upload_faulty_script_module(self):
+        """Uploading a script with an import error should return 400 and not create a DB record."""
+        self.add_permissions('extras.add_scriptmodule', 'core.add_managedfile')
+        # 'extras.script' is invalid; the correct module is 'extras.scripts'
+        script_content = b"from extras.script import Script\nclass TestScript(Script):\n    pass\n"
+        upload_file = SimpleUploadedFile('test_faulty.py', script_content, content_type='text/plain')
+        response = self.client.post(
+            self.url,
+            {'file': upload_file},
+            format='multipart',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(ScriptModule.objects.filter(file_path='test_faulty.py').exists())
+
+    def test_upload_duplicate_script_module_preserves_existing_file(self):
+        """A duplicate-filename upload returns 400 and leaves the existing file unchanged."""
+        self.add_permissions('extras.add_scriptmodule', 'core.add_managedfile')
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = original_content.replace(b"'v1'", b"'v2'")
+
+        fake_storage = _InMemoryScriptStorage()
+
+        with (
+            patch('extras.api.serializers_.scripts.storages') as mock_serializer_storages,
+            patch('extras.models.mixins.storages') as mock_module_storages,
+        ):
+            mock_serializer_storages.create_storage.return_value = fake_storage
+            mock_serializer_storages.backends = {'scripts': {}}
+            mock_module_storages.__getitem__.return_value = fake_storage
+
+            # First upload succeeds and writes the file
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_probe.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            self.assertEqual(fake_storage.files['zz_probe.py'], original_content)
+
+            # Re-uploading the same filename with different content must be rejected
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_probe.py', updated_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('already exists', str(response.data))
+
+            # Existing file must survive intact: neither deleted nor overwritten with v2
+            self.assertTrue(fake_storage.exists('zz_probe.py'))
+            self.assertEqual(fake_storage.files['zz_probe.py'], original_content)
+
+        # Exactly one ScriptModule remains, still pointing at the original file
+        self.assertEqual(ScriptModule.objects.filter(file_path='zz_probe.py').count(), 1)
+
     def test_upload_script_module_without_file_fails(self):
         self.add_permissions('extras.add_scriptmodule', 'core.add_managedfile')
         response = self.client.post(self.url, {}, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_update_script_module(self):
+        """A PATCH with a new file replaces the stored content and re-syncs the module's scripts."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScriptV2(Script):\n    def run(self, data, commit):\n        return 'v2'\n"
+        )
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_update.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            module_id = response.data['id']
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': module_id})
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_update.py', updated_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['id'], module_id)
+        self.assertEqual(response.data['file_path'], 'zz_update.py')
+        self.assertIsNotNone(response.data['last_updated'])
+        self.assertEqual(fake_storage.files['zz_update.py'], updated_content)
+        # Script classes are re-synced from the new content
+        self.assertFalse(Script.objects.filter(module_id=module_id, name='ProbeScript').exists())
+        self.assertTrue(Script.objects.filter(module_id=module_id, name='ProbeScriptV2').exists())
+        self.assertEqual(ScriptModule.objects.filter(file_path='zz_update.py').count(), 1)
+
+    def test_update_script_module_without_file_fails(self):
+        """A PATCH without a file upload is rejected and leaves the stored content unchanged."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        script_content = b"from extras.scripts import Script\nclass TestScript(Script):\n    pass\n"
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_nofile.py', script_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': response.data['id']})
+
+            response = self.client.patch(detail_url, {}, format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', response.data)
+        self.assertEqual(fake_storage.files['zz_nofile.py'], script_content)
+
+    def test_update_script_module_without_permission(self):
+        """A PATCH without change permissions returns 403 and leaves the stored content unchanged."""
+        self.add_permissions('extras.add_scriptmodule', 'core.add_managedfile')
+        script_content = b"from extras.scripts import Script\nclass TestScript(Script):\n    pass\n"
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_forbidden.py', script_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': response.data['id']})
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_forbidden.py', script_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(fake_storage.files['zz_forbidden.py'], script_content)
+
+    def test_update_script_module_by_file_name(self):
+        """A module can be updated by addressing it with its file name instead of its numeric ID."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = original_content.replace(b"'v1'", b"'v2'")
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_by_name.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            module_id = response.data['id']
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': 'zz_by_name.py'})
+
+            response = self.client.put(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_by_name.py', updated_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['id'], module_id)
+        self.assertEqual(fake_storage.files['zz_by_name.py'], updated_content)
+
+    def test_update_script_module_rejects_mismatched_file_name(self):
+        """An update whose uploaded file name differs from the module's file path is rejected."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_mismatch.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': response.data['id']})
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_other.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(fake_storage.files['zz_mismatch.py'], original_content)
+        self.assertNotIn('zz_other.py', fake_storage.files)
+
+    def test_update_script_module_storage_name_mismatch_fails(self):
+        """If the storage backend saves under an alternate name, the update is rejected and rolled back."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = original_content.replace(b"'v1'", b"'v2'")
+        fake_storage = _InMemoryScriptStorage(allow_overwrite=False)
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_suffix.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            module = ScriptModule.objects.get(file_path='zz_suffix.py')
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': module.pk})
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_suffix.py', updated_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        # Original file intact, alternate-name orphan removed
+        self.assertEqual(fake_storage.files['zz_suffix.py'], original_content)
+        self.assertNotIn('zz_suffix.py.1', fake_storage.files)
+        module.refresh_from_db()
+        self.assertEqual(module.file_path, 'zz_suffix.py')
+
+    def test_update_faulty_script_module_preserves_existing_module(self):
+        """An update with invalid script content is rejected before storage or Script rows change."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        # 'extras.script' is invalid; the correct module is 'extras.scripts'
+        faulty_content = b"from extras.script import Script\nclass TestScript(Script):\n    pass\n"
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_faulty_update.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            module_id = response.data['id']
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': module_id})
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_faulty_update.py', faulty_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(fake_storage.files['zz_faulty_update.py'], original_content)
+        self.assertTrue(Script.objects.filter(module_id=module_id, name='ProbeScript').exists())
+
+    def test_update_script_module_not_found(self):
+        """An update addressing a nonexistent module returns 404 for both lookup styles."""
+        self.add_permissions('extras.change_scriptmodule', 'core.change_managedfile')
+        for lookup in ('999999', 'zz_missing.py', '½'):
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': lookup})
+            response = self.client.patch(detail_url, {}, format='json', **self.header)
+            self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+    def test_update_script_module_via_put_without_file_fails(self):
+        """A PUT without a file upload is rejected by the field-level required check."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        script_content = b"from extras.scripts import Script\nclass TestScript(Script):\n    pass\n"
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_put_nofile.py', script_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': response.data['id']})
+
+            response = self.client.put(detail_url, {}, format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('file', response.data)
+        self.assertEqual(fake_storage.files['zz_put_nofile.py'], script_content)
+
+    def test_update_script_module_rolls_back_scripts_on_save_failure(self):
+        """A failed Script sync during an update rolls back all Script row changes."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScriptV2(Script):\n    def run(self, data, commit):\n        return 'v2'\n"
+        )
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_rollback.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            module_id = response.data['id']
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': module_id})
+
+            # Fail the sync mid-way: the old Script row is already deleted when create() raises
+            with patch(
+                'extras.models.scripts.Script.objects.create',
+                side_effect=IntegrityError('Simulated database error'),
+            ):
+                with self.assertRaises(IntegrityError):
+                    self.client.patch(
+                        detail_url,
+                        {'file': SimpleUploadedFile('zz_rollback.py', updated_content, content_type='text/plain')},
+                        format='multipart',
+                        **self.header,
+                    )
+
+        # DB is all-or-nothing; storage keeps the new content and a retried update re-syncs the rows
+        self.assertTrue(Script.objects.filter(module_id=module_id, name='ProbeScript').exists())
+        self.assertFalse(Script.objects.filter(module_id=module_id, name='ProbeScriptV2').exists())
+        self.assertEqual(fake_storage.files['zz_rollback.py'], updated_content)
+
+    def test_update_script_module_with_missing_stored_file(self):
+        """An update succeeds when the stored file is missing, re-creating it from the upload."""
+        self.add_permissions(
+            'extras.add_scriptmodule', 'core.add_managedfile',
+            'extras.change_scriptmodule', 'core.change_managedfile',
+        )
+        original_content = (
+            b"from extras.scripts import Script\n\n\n"
+            b"class ProbeScript(Script):\n    def run(self, data, commit):\n        return 'v1'\n"
+        )
+        updated_content = original_content.replace(b"'v1'", b"'v2'")
+        fake_storage = _InMemoryScriptStorage()
+
+        with self._patched_script_storage(fake_storage):
+            response = self.client.post(
+                self.url,
+                {'file': SimpleUploadedFile('zz_lost_file.py', original_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+            self.assertHttpStatus(response, status.HTTP_201_CREATED)
+            detail_url = reverse('extras-api:scriptmodule-detail', kwargs={'pk': response.data['id']})
+
+            # Simulate a file removed from storage outside NetBox
+            del fake_storage.files['zz_lost_file.py']
+
+            response = self.client.patch(
+                detail_url,
+                {'file': SimpleUploadedFile('zz_lost_file.py', updated_content, content_type='text/plain')},
+                format='multipart',
+                **self.header,
+            )
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(fake_storage.files['zz_lost_file.py'], updated_content)

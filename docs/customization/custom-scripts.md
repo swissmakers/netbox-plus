@@ -23,6 +23,9 @@ Custom scripts are Python code which exists outside the NetBox code base, so the
 
 ## Writing Custom Scripts
 
+!!! warning "Choose a unique file name"
+    A script file's name (without the `.py` extension) becomes its Python module name when the script is loaded. A script file must not share its name with a NetBox application (e.g. `circuits.py` or `dcim.py`) or any other installed Python module: the script will shadow that module in Python's import system and can break unrelated functionality. Choose a unique, descriptive file name, such as `circuit_maintenance.py`.
+
 All custom scripts must inherit from the `extras.scripts.Script` base class. This class provides the functionality necessary to generate forms and log activity.
 
 ```python
@@ -105,7 +108,7 @@ class MyScript(Script):
 
 ### `commit_default`
 
-The checkbox to commit database changes when executing a script is checked by default. Set `commit_default` to False under the script's Meta class to leave this option unchecked by default.
+The checkbox to commit database changes when executing a script is checked by default. Set `commit_default` to False under the script's Meta class to leave this option unchecked by default. This setting controls only the initial state of the execution form.
 
 ```python
 commit_default = False
@@ -115,9 +118,25 @@ commit_default = False
 
 By default, a script can be scheduled for execution at a later time. Setting `scheduling_enabled` to False disables this ability: Only immediate execution will be possible. (This also disables the ability to set a recurring execution interval.)
 
+### `notifications_default`
+
+By default, a notification is generated for the user associated with the script's job each time the script finishes running. This attribute sets the initial value for the notifications field when running a script. Valid values are `always` (default), `on_failure`, and `never`.
+
+Scripts run from an event rule or the `runscript` management command use this value as their notification policy. For an event rule, the notification goes to the user associated with the triggering event, if there is one.
+
+```python
+notifications_default = 'on_failure'
+```
+
+| Value | Behavior |
+|-------|----------|
+| `always` | Notify on every completion (default) |
+| `on_failure` | Notify only when the job fails or errors |
+| `never` | Never send a notification |
+
 ### `job_timeout`
 
-Set the maximum allowed runtime for the script. If not set, `RQ_DEFAULT_TIMEOUT` will be used.
+Set the maximum allowed runtime for the script. If not set, `RQ_DEFAULT_TIMEOUT` will be used. Scripts run from an event rule use this value as their execution timeout.
 
 ## Accessing Request Data
 
@@ -205,6 +224,38 @@ class DeviceConnectionsReport(Script):
             else:
                 self.log_success("Passed", device)
 ```
+
+## Model Validation
+
+!!! warning "Validate objects before saving"
+    Direct ORM writes bypass validation normally performed by NetBox's UI and REST API.
+
+Custom scripts can create and update NetBox objects directly through Django's ORM. When doing so, instantiate the model, call `full_clean()`, and then call `save()`:
+
+```python
+obj = SomeModel(
+    field_a=value_a,
+    field_b=value_b,
+)
+
+obj.full_clean()
+obj.save()
+```
+
+Avoid using `Model.objects.create()` unless you intentionally want to skip model validation:
+
+```python
+SomeModel.objects.create(
+    field_a=value_a,
+    field_b=value_b,
+)
+```
+
+Django does not call `full_clean()` automatically when saving a model instance. Skipping validation can allow invalid or inconsistent data to be written to the database, which may later result in UI, API, or script errors.
+
+Bulk and direct queryset operations such as `bulk_create()`, `bulk_update()`, and `QuerySet.update()` should be used with the same care. These operations can bypass model validation and other model-specific save behavior.
+
+When editing an existing object, also see the change logging guidance below.
 
 ## Change Logging
 
@@ -311,6 +362,7 @@ A particular object within NetBox. Each ObjectVar must specify a particular mode
 * `context` - A custom dictionary mapping template context variables to fields, used when rendering `<option>` elements within the dropdown menu (optional; see below)
 * `null_option` - A label representing a "null" or empty choice (optional)
 * `selector` - A boolean that, when True, includes an advanced object selection widget to assist the user in identifying the desired object (optional; False by default)
+* `quick_add` - A boolean that, when True, includes a quick add widget, to create a new related object for assignment. (optional; False by default)
 
 To limit the selections available within the list, additional query parameters can be passed as the `query_params` dictionary. For example, to show only devices with an "active" status:
 
@@ -390,10 +442,22 @@ Script modules can be uploaded to NetBox via the REST API by sending a `multipar
 
 ```no-highlight
 curl -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Accept: application/json; indent=4" \
 -F "file=@/path/to/myscript.py" \
 http://netbox/api/extras/scripts/upload/
+```
+
+### Updating an Uploaded Script
+
+An existing script module can be replaced in place by sending a `multipart/form-data` PUT or PATCH request to the module's detail URL. The module may be identified by its numeric ID or by its file name. The uploaded file name must match the existing module's file path, and the caller must have the `extras.change_scriptmodule` and `core.change_managedfile` permissions. The module's scripts are re-synchronized from the new content.
+
+```no-highlight
+curl -X PUT \
+-H "Authorization: Bearer $TOKEN" \
+-H "Accept: application/json; indent=4" \
+-F "file=@/path/to/myscript.py" \
+http://netbox/api/extras/scripts/upload/myscript.py/
 ```
 
 ## Running Custom Scripts
@@ -468,7 +532,7 @@ To run a script via the REST API, issue a POST request to the script's endpoint 
 
 ```no-highlight
 curl -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 -H "Accept: application/json; indent=4" \
 http://netbox/api/extras/scripts/example.MyReport/ \

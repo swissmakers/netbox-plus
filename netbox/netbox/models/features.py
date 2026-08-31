@@ -5,26 +5,26 @@ from functools import cached_property
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import ValidationError
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from taggit.managers import TaggableManager
 
 from core.choices import JobStatusChoices, ObjectChangeActionChoices
 from core.models import ObjectType
 from extras.choices import *
 from extras.constants import CUSTOMFIELD_EMPTY_VALUES
-from extras.managers import NetBoxTaggableManager
+from extras.managers import NetBoxTaggableManager, NetBoxTaggableManagerField
 from extras.utils import is_taggable
 from netbox.config import get_config
-from netbox.constants import CORE_APPS
+from netbox.constants import CORE_APPS, JOB_DELETE_BATCH_SIZE
 from netbox.models.deletion import DeleteMixin
 from netbox.plugins import PluginConfig
 from netbox.registry import registry
 from netbox.signals import post_clean
 from netbox.utils import register_model_feature
 from utilities.json import CustomFieldJSONEncoder
+from utilities.permissions import ModelAction, register_model_actions
 from utilities.serialization import serialize_object
 
 __all__ = (
@@ -43,6 +43,7 @@ __all__ = (
     'NotificationsMixin',
     'SyncedDataMixin',
     'TagsMixin',
+    'batch_delete_jobs',
     'get_model_features',
     'has_feature',
     'model_is_public',
@@ -449,9 +450,39 @@ class NotificationsMixin(models.Model):
         abstract = True
 
 
+def batch_delete_jobs(job_queryset):
+    """
+    Delete the Jobs in `job_queryset` in JOB_DELETE_BATCH_SIZE chunks. Job cannot be fast-deleted
+    (a global pre_delete receiver forces per-instance signals), so a single delete would build one
+    huge collection of Job instances and run one very long DELETE; batching bounds the per-cycle
+    work. Callers are responsible for wrapping this in a transaction. As with the prior cascade
+    behavior, this bulk delete does not invoke Job.delete() and therefore does not cancel the
+    backing RQ job. See #22812.
+    """
+    from core.models import Job
+
+    # Route writes to the same database the queryset reads from. In JobsMixin.delete the queryset
+    # is bound to the instance's DB while Job.objects would otherwise use the router default; if
+    # those diverge the deleted rows never leave the read side and the loop below never terminates.
+    jobs = Job.objects.using(job_queryset.db)
+
+    job_pks = job_queryset.order_by('pk').values_list('pk', flat=True)
+    # Re-slice the queryset each iteration: it re-queries after each batch delete, so the
+    # remaining set shrinks and the loop terminates (do not hoist this into a cursor).
+    while pks := list(job_pks[:JOB_DELETE_BATCH_SIZE]):
+        # only('pk'): the batch still can't fast-delete, so each Job in the batch is instantiated;
+        # loading just the PK avoids pulling the large data/log_entries payloads into memory.
+        jobs.filter(pk__in=pks).only('pk').delete()
+
+
 class JobsMixin(models.Model):
     """
     Enables support for job results.
+
+    Note: for the job-batching in delete() to run, JobsMixin must precede DeleteMixin in a
+    model's MRO. DeleteMixin.delete() drives its own collector and does not call super(), so a
+    model declared as e.g. `class Foo(NetBoxModel, JobsMixin)` would reach DeleteMixin first and
+    bypass the batching. Core models that combine both (e.g. DataSource) list JobsMixin first.
     """
     jobs = GenericRelation(
         to='core.Job',
@@ -462,6 +493,16 @@ class JobsMixin(models.Model):
 
     class Meta:
         abstract = True
+
+    def delete(self, using=None, *args, **kwargs):
+        # Delete associated jobs in batches so the cascade never has to load thousands of Job
+        # rows into memory at once. Wrapped in a transaction so that a failure in the parent
+        # delete rolls the job deletions back as well. See #22812.
+        using = using or router.db_for_write(self.__class__, instance=self)
+        with transaction.atomic(using=using):
+            batch_delete_jobs(self.jobs.using(using))
+            return super().delete(using, *args, **kwargs)
+    delete.alters_data = True
 
     def get_latest_jobs(self):
         """
@@ -488,12 +529,15 @@ class JournalingMixin(models.Model):
 class TagsMixin(models.Model):
     """
     Enables support for tag assignment. Assigned tags can be managed via the `tags` attribute,
-    which is a `NetBoxTaggableManager` instance.
+    which is a `NetBoxTaggableManager` instance. The field is a `NetBoxTaggableManagerField`,
+    which performs `%(app_label)s` / `%(class)s` interpolation on `related_name` to avoid
+    reverse-accessor collisions between same-named models in different apps (e.g. plugins).
     """
-    tags = TaggableManager(
+    tags = NetBoxTaggableManagerField(
         through='extras.TaggedItem',
         ordering=('weight', 'name'),
         manager=NetBoxTaggableManager,
+        related_name='%(app_label)s_%(class)s_tagged+',
     )
 
     class Meta:
@@ -722,10 +766,10 @@ def register_models(*models):
     for model in models:
         app_label, model_name = model._meta.label_lower.split('.')
 
-        # TODO: Remove in NetBox v4.5
-        # Register public models
+        # TODO: Remove in NetBox v4.7
+        # Register public models (access the underlying dict directly to avoid triggering the deprecation warning)
         if not getattr(model, '_netbox_private', False):
-            registry['models'][app_label].add(model_name)
+            dict.__getitem__(registry, 'models')[app_label].add(model_name)
 
         # Register applicable feature views for the model
         if issubclass(model, ContactsMixin):
@@ -752,3 +796,12 @@ def register_models(*models):
             register_model_view(model, 'sync', kwargs={'model': model})(
                 'netbox.views.generic.ObjectSyncDataView'
             )
+
+        # Auto-register custom permission actions declared in Meta.permissions
+        if meta_permissions := getattr(model._meta, 'permissions', None):
+            actions = [
+                ModelAction(codename, help_text=_(name))
+                for codename, name in meta_permissions
+            ]
+            if actions:
+                register_model_actions(model, actions)

@@ -8,7 +8,7 @@ from utilities.data import deepmerge
 from utilities.testing import APITestCase, APIViewTestCases, create_test_user
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
 
@@ -17,7 +17,7 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class UserTest(APIViewTestCases.APIViewTestCase):
+class UserTestCase(APIViewTestCases.APIViewTestCase):
     model = User
     brief_fields = ['display', 'id', 'url', 'username']
     validation_excluded_fields = ['password']
@@ -39,25 +39,25 @@ class UserTest(APIViewTestCases.APIViewTestCase):
         permissions[2].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'rack'))
 
         users = (
-            User(username='User1', password='FooBarFooBar1'),
-            User(username='User2', password='FooBarFooBar2'),
-            User(username='User3', password='FooBarFooBar3'),
+            User(username='user1', password='FooBarFooBar1'),
+            User(username='user2', password='FooBarFooBar2'),
+            User(username='user3', password='FooBarFooBar3'),
         )
         User.objects.bulk_create(users)
 
         cls.create_data = [
             {
-                'username': 'User4',
+                'username': 'user4',
                 'password': 'FooBarFooBar4',
                 'permissions': [permissions[0].pk],
             },
             {
-                'username': 'User5',
+                'username': 'user5',
                 'password': 'FooBarFooBar5',
                 'permissions': [permissions[1].pk],
             },
             {
-                'username': 'User6',
+                'username': 'user6',
                 'password': 'FooBarFooBar6',
                 'permissions': [permissions[2].pk],
             },
@@ -137,7 +137,7 @@ class UserTest(APIViewTestCases.APIViewTestCase):
         self.assertEqual(response.status_code, 400)
 
 
-class GroupTest(APIViewTestCases.APIViewTestCase):
+class GroupTestCase(APIViewTestCases.APIViewTestCase):
     model = Group
     brief_fields = ['description', 'display', 'id', 'name', 'url']
 
@@ -189,7 +189,7 @@ class GroupTest(APIViewTestCases.APIViewTestCase):
         return
 
 
-class TokenTest(
+class TokenTestCase(
     # No GraphQL support for Token
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
@@ -310,6 +310,156 @@ class TokenTest(
         response = self.client.post(url, data, format='json', **self.header)
         self.assertEqual(response.status_code, 201)
 
+    def test_grant_token_constrained_permission_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not be
+        bypassed. has_perm('users.grant_token', obj=None) short-circuits to True without
+        evaluating constraints; the fix uses user_may_grant_token() which applies them.
+        """
+        # Clear the unconstrained grant_token added by setUp.
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+
+        superuser = User.objects.create_user(username='sec_superuser', is_superuser=True)
+        regular = User.objects.create_user(username='sec_regular')
+
+        # Add a *constrained* grant_token permission: only tokens for non-superusers.
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='constrained_grant_token',
+            constraints={'user__is_superuser': False},
+            actions=['grant'],
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        url = reverse('users-api:token-list')
+
+        # Attempt to create a token for the superuser — must be denied (constraint violation).
+        response = self.client.post(url, {'user': superuser.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 403,
+            "Constrained grant_token must deny token creation for users that violate the constraint",
+        )
+
+        # Attempt to create a token for the regular user — must succeed.
+        response = self.client.post(url, {'user': regular.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 201,
+            "Constrained grant_token must allow token creation for users that satisfy the constraint",
+        )
+
+    def test_grant_token_superuser_always_allowed(self):
+        """
+        Superusers must be able to create tokens for any user without an explicit
+        grant_token ObjectPermission. Regression guard: _user_may_grant_token() must
+        mirror ObjectPermissionMixin.has_perm's superuser bypass.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        self.user.is_superuser = True
+        self.user.save()
+        try:
+            other = User.objects.create_user(username='superuser_grant_target')
+            url = reverse('users-api:token-list')
+            response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+            self.assertEqual(response.status_code, 201, "Superuser must be able to grant tokens for any user")
+        finally:
+            self.user.is_superuser = False
+            self.user.save()
+
+    def test_grant_token_self_only_constraint(self):
+        """
+        A {"user": "$user"} constraint means "only grant tokens for yourself".
+        Since creating a token for oneself bypasses the grant_token check entirely,
+        this constraint effectively blocks all cross-user grants for the holder.
+        Exercises the $user placeholder substitution path.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(name='self_only_grant', constraints={'user': '$user'}, actions=['grant'])
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        other = User.objects.create_user(username='self_only_target')
+        url = reverse('users-api:token-list')
+        response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+        self.assertEqual(response.status_code, 403, "Self-only constraint must deny cross-user token grants")
+
+    def test_grant_token_non_user_field_constraint_fails_closed(self):
+        """
+        A constraint referencing a non-user Token field (e.g. {"write_enabled": True})
+        cannot be evaluated for an unsaved token; _user_may_grant_token() must fail
+        closed and deny rather than bypass the constraint.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='non_user_field_grant', constraints={'write_enabled': True}, actions=['grant']
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        other = User.objects.create_user(username='non_user_field_target')
+        url = reverse('users-api:token-list')
+        response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 403,
+            "Non-user Token field constraints must fail closed for new (unsaved) tokens",
+        )
+
+    def test_create_token_returns_plaintext(self):
+        """
+        Creating a Token via the REST API must return the usable plaintext value in the response.
+        For v2 tokens this value cannot be recovered later because the database stores only an
+        HMAC digest.
+        """
+        self.add_permissions('users.add_token')
+        user = User.objects.create_user(username='token_plaintext_user')
+        url = reverse('users-api:token-list')
+
+        response = self.client.post(url, {'user': user.pk}, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNotNone(response.data['token'])
+        self.assertEqual(len(response.data['token']), TOKEN_DEFAULT_LENGTH)
+
+        # The returned plaintext must authenticate against the stored token
+        token = Token.objects.get(pk=response.data['id'])
+        self.assertTrue(token.validate(response.data['token']))
+
+    def test_bulk_create_tokens_returns_plaintexts(self):
+        """
+        Bulk-creating Tokens via the REST API must return the plaintext value for each created
+        Token in the response.
+        """
+        self.add_permissions('users.add_token')
+        users = [
+            User.objects.create_user(username='token_bulk_user1'),
+            User.objects.create_user(username='token_bulk_user2'),
+        ]
+        data = [{'user': u.pk} for u in users]
+        url = reverse('users-api:token-list')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data), len(data))
+
+        plaintexts = set()
+        for obj in response.data:
+            self.assertIsNotNone(obj['token'])
+            self.assertEqual(len(obj['token']), TOKEN_DEFAULT_LENGTH)
+            plaintexts.add(obj['token'])
+            token = Token.objects.get(pk=obj['id'])
+            self.assertTrue(token.validate(obj['token']))
+
+        # Each token should be unique
+        self.assertEqual(len(plaintexts), len(data))
+
     def test_reassign_token(self):
         """
         Check that a Token cannot be reassigned to another User.
@@ -330,7 +480,7 @@ class TokenTest(
         self.assertEqual(token1.user, user1, "Token's user should not have changed")
 
 
-class ObjectPermissionTest(
+class ObjectPermissionTestCase(
     # No GraphQL support for ObjectPermission
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
@@ -403,7 +553,7 @@ class ObjectPermissionTest(
         }
 
 
-class UserConfigTest(APITestCase):
+class UserConfigTestCase(APITestCase):
 
     def test_get(self):
         """
@@ -456,7 +606,7 @@ class UserConfigTest(APITestCase):
         self.assertDictEqual(userconfig.data, new_data)
 
 
-class OwnerGroupTest(APIViewTestCases.APIViewTestCase):
+class OwnerGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = OwnerGroup
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -488,7 +638,7 @@ class OwnerGroupTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class OwnerTest(APIViewTestCases.APIViewTestCase):
+class OwnerTestCase(APIViewTestCases.APIViewTestCase):
     model = Owner
     brief_fields = ['description', 'display', 'id', 'name', 'url']
 

@@ -8,13 +8,22 @@
 sudo apt install -y redis-server
 ```
 
-Before continuing, verify that your installed version of Redis is at least v4.0:
+Before continuing, verify that your installed version of Redis is at least v6.0:
+
+!!! warning "Redis v5.x is deprecated"
+    Support for Redis versions older than 6.0 is deprecated and will be removed in NetBox v4.7.
 
 ```no-highlight
 redis-server -v
 ```
 
 You may wish to modify the Redis configuration at `/etc/redis.conf` or `/etc/redis/redis.conf`, however in most cases the default configuration is sufficient.
+
+!!! danger "Restrict access to Redis"
+    NetBox's background workers execute jobs read from Redis, so anyone able to write to the `tasks` database can run
+    arbitrary code on a worker. Treat Redis as trusted infrastructure: keep it bound to `localhost` (the default) or a
+    private network, and enable authentication if it is reachable by any other host. See
+    [Redis configuration](../configuration/required-parameters.md#redis) for details.
 
 ## Verify Service Status
 

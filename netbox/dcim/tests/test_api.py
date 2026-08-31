@@ -1,27 +1,40 @@
 import json
 
-from django.test import override_settings, tag
+from django.conf import settings
+from django.db import connection
+from django.test import tag
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils.translation import gettext as _
 from rest_framework import status
 
+from core.models import ObjectType
 from dcim.choices import *
 from dcim.constants import *
+from dcim.graphql.types import _CABLE_TERMINATION_MODELS
 from dcim.models import *
-from extras.models import ConfigTemplate
+from extras.models import ConfigTemplate, Tag
 from ipam.choices import VLANQinQRoleChoices
-from ipam.models import ASN, RIR, VLAN, VRF
+from ipam.models import ASN, RIR, VLAN, VRF, IPAddress
 from netbox.api.serializers import GenericObjectSerializer
 from tenancy.models import Tenant
 from users.constants import TOKEN_PREFIX
-from users.models import Token, User
-from utilities.testing import APITestCase, APIViewTestCases, create_test_device, disable_logging
+from users.models import ObjectPermission, Token, User
+from utilities.testing import (
+    APITestCase,
+    APIViewTestCases,
+    GraphQLFilterTest,
+    GraphQLQueryTest,
+    create_test_device,
+    create_test_nat_ip_pair,
+    disable_logging,
+)
 from virtualization.models import Cluster, ClusterType
 from wireless.choices import WirelessChannelChoices
 from wireless.models import WirelessLAN
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
 
@@ -68,7 +81,7 @@ class Mixins:
             self.assertEqual(segment1[2][0]['name'], peer_obj.name)
 
 
-class RegionTest(APIViewTestCases.APIViewTestCase):
+class RegionTestCase(APIViewTestCases.APIViewTestCase):
     model = Region
     brief_fields = ['_depth', 'description', 'display', 'id', 'name', 'site_count', 'slug', 'url']
     create_data = [
@@ -99,7 +112,7 @@ class RegionTest(APIViewTestCases.APIViewTestCase):
         Region.objects.create(name='Region 3', slug='region-3')
 
 
-class SiteGroupTest(APIViewTestCases.APIViewTestCase):
+class SiteGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = SiteGroup
     brief_fields = ['_depth', 'description', 'display', 'id', 'name', 'site_count', 'slug', 'url']
     create_data = [
@@ -132,12 +145,25 @@ class SiteGroupTest(APIViewTestCases.APIViewTestCase):
         SiteGroup.objects.create(name='Site Group 3', slug='site-group-3', comments='Hi!')
 
 
-class SiteTest(APIViewTestCases.APIViewTestCase):
+class SiteTestCase(APIViewTestCases.APIViewTestCase):
     model = Site
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
     bulk_update_data = {
         'status': 'planned',
     }
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='tenant__name__exact',
+            filters='tenant: {name: {exact: "Tenant 1"}}',
+            expected=lambda qs: qs.filter(tenant__name='Tenant 1'),
+            permissions=('tenancy.view_tenant',),
+        ),
+    )
+
+    def assert_nested_locations_active(self, data):
+        site_data = data.get('site') or {}
+        location_names = sorted(location['name'] for location in site_data.get('locations', []))
+        self.assertEqual(location_names, ['Site1 Active A', 'Site1 Active B'])
 
     @classmethod
     def setUpTestData(cls):
@@ -152,15 +178,32 @@ class SiteTest(APIViewTestCases.APIViewTestCase):
             SiteGroup.objects.create(name='Site Group 2', slug='site-group-2'),
         )
 
+        tenant = Tenant.objects.create(name='Tenant 1', slug='tenant-1')
+
+        # Site 1's tenant activates the dynamic tenant prefetch (+1 in api_list_objects baseline).
         sites = (
-            Site(region=regions[0], group=groups[0], name='Site 1', slug='site-1'),
+            Site(region=regions[0], group=groups[0], tenant=tenant, name='Site 1', slug='site-1'),
             Site(region=regions[0], group=groups[0], name='Site 2', slug='site-2'),
             Site(region=regions[0], group=groups[0], name='Site 3', slug='site-3'),
         )
         Site.objects.bulk_create(sites)
 
+        nested_site = Site.objects.get(slug='site-1')
+        cls.nested_site_pk = nested_site.pk
+        Location.objects.create(
+            site=nested_site, name='Site1 Active A', slug='site1-active-a',
+            status=LocationStatusChoices.STATUS_ACTIVE,
+        )
+        Location.objects.create(
+            site=nested_site, name='Site1 Active B', slug='site1-active-b',
+            status=LocationStatusChoices.STATUS_ACTIVE,
+        )
+        Location.objects.create(
+            site=nested_site, name='Site1 Planned', slug='site1-planned',
+            status=LocationStatusChoices.STATUS_PLANNED,
+        )
+
         rir = RIR.objects.create(name='RFC 6996', is_private=True)
-        tenant = Tenant.objects.create(name='Tenant 1', slug='tenant-1')
 
         asns = [
             ASN(asn=65000 + i, rir=rir) for i in range(8)
@@ -195,14 +238,253 @@ class SiteTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+        cls.graphql_query_tests = (
+            GraphQLQueryTest(
+                name='nested_locations_by_status',
+                query=(
+                    '{ site(id: ' + str(cls.nested_site_pk) + ') { '
+                    'locations(filters: {status: {exact: STATUS_ACTIVE}}) { name } '
+                    '} }'
+                ),
+                assert_result=cls.assert_nested_locations_active,
+                permissions=('dcim.view_location',),
+            ),
+        )
 
-class LocationTest(APIViewTestCases.APIViewTestCase):
+    def test_add_tags(self):
+        """
+        Add tags to an existing object via the add_tags field.
+        """
+        site = Site.objects.first()
+        tags = Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+            Tag(name='Charlie', slug='charlie'),
+        ))
+        site.tags.set([tags[0], tags[1]])
+
+        # Grant change permission
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'add_tags': [{'name': 'Charlie'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # Verify all three tags are now assigned
+        tag_names = sorted(site.tags.values_list('name', flat=True))
+        self.assertEqual(tag_names, ['Alpha', 'Bravo', 'Charlie'])
+
+        # Verify add_tags and remove_tags are not in the response
+        self.assertNotIn('add_tags', response.data)
+        self.assertNotIn('remove_tags', response.data)
+        self.assertIn('tags', response.data)
+
+    def test_remove_tags(self):
+        """
+        Remove tags from an existing object via the remove_tags field.
+        """
+        site = Site.objects.first()
+        tags = Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+            Tag(name='Charlie', slug='charlie'),
+        ))
+        site.tags.set(tags)
+
+        # Grant change permission
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'remove_tags': [{'name': 'Charlie'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # Verify only Alpha and Bravo remain
+        tag_names = sorted(site.tags.values_list('name', flat=True))
+        self.assertEqual(tag_names, ['Alpha', 'Bravo'])
+
+    def test_remove_tags_not_assigned(self):
+        """
+        Removing a tag that is not assigned should not raise an error.
+        """
+        site = Site.objects.first()
+        tags = Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+            Tag(name='Charlie', slug='charlie'),
+        ))
+        site.tags.set([tags[0], tags[1]])
+
+        # Grant change permission
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'remove_tags': [{'name': 'Charlie'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # Tags should be unchanged
+        tag_names = sorted(site.tags.values_list('name', flat=True))
+        self.assertEqual(tag_names, ['Alpha', 'Bravo'])
+
+    def test_add_and_remove_tags(self):
+        """
+        Add and remove tags in the same request.
+        """
+        site = Site.objects.first()
+        tags = Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+            Tag(name='Charlie', slug='charlie'),
+        ))
+        site.tags.set([tags[0], tags[1]])
+
+        # Grant change permission
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'add_tags': [{'name': 'Charlie'}],
+            'remove_tags': [{'name': 'Alpha'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # Verify Bravo and Charlie remain
+        tag_names = sorted(site.tags.values_list('name', flat=True))
+        self.assertEqual(tag_names, ['Bravo', 'Charlie'])
+
+    def test_tags_with_add_tags_error(self):
+        """
+        Specifying tags together with add_tags or remove_tags should raise a validation error.
+        """
+        site = Site.objects.first()
+        Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+        ))
+
+        # Grant change permission
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'tags': [{'name': 'Alpha'}],
+            'add_tags': [{'name': 'Bravo'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_with_add_tags(self):
+        """
+        Create a new object using add_tags.
+        """
+        Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+        ))
+
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        data = {
+            'name': 'Site 10',
+            'slug': 'site-10',
+            'add_tags': [{'name': 'Alpha'}, {'name': 'Bravo'}],
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+        site = Site.objects.get(pk=response.data['id'])
+        tag_names = sorted(site.tags.values_list('name', flat=True))
+        self.assertEqual(tag_names, ['Alpha', 'Bravo'])
+
+    def test_create_with_remove_tags_error(self):
+        """
+        Using remove_tags when creating a new object should raise a validation error.
+        """
+        Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+        ))
+
+        obj_perm = ObjectPermission(name='Test permission', actions=['add'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        data = {
+            'name': 'Site 10',
+            'slug': 'site-10',
+            'remove_tags': [{'name': 'Alpha'}],
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_add_and_remove_same_tag_error(self):
+        """
+        Including the same tag in both add_tags and remove_tags should raise a validation error.
+        """
+        site = Site.objects.first()
+        Tag.objects.bulk_create((
+            Tag(name='Alpha', slug='alpha'),
+            Tag(name='Bravo', slug='bravo'),
+        ))
+
+        obj_perm = ObjectPermission(name='Test permission', actions=['change'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        url = self._get_detail_url(site)
+        data = {
+            'add_tags': [{'name': 'Alpha'}, {'name': 'Bravo'}],
+            'remove_tags': [{'name': 'Alpha'}],
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+
+class LocationTestCase(APIViewTestCases.APIViewTestCase):
     model = Location
     brief_fields = ['_depth', 'description', 'display', 'id', 'name', 'rack_count', 'slug', 'url']
     bulk_update_data = {
         'description': 'New description',
     }
     user_permissions = ('dcim.view_site',)
+    graphql_filter_tests = (
+        GraphQLFilterTest(
+            name='status__in_list',
+            filters='status: {in_list: [STATUS_PLANNED, STATUS_STAGING]}',
+            expected=lambda qs: qs.filter(status__in=[
+                LocationStatusChoices.STATUS_PLANNED,
+                LocationStatusChoices.STATUS_STAGING,
+            ]),
+        ),
+    )
 
     @classmethod
     def setUpTestData(cls):
@@ -252,6 +534,20 @@ class LocationTest(APIViewTestCases.APIViewTestCase):
             parent=parent_locations[0],
             status=LocationStatusChoices.STATUS_ACTIVE,
         )
+        Location.objects.create(
+            site=sites[0],
+            name='GraphQL Planned Location',
+            slug='graphql-planned-location',
+            parent=parent_locations[0],
+            status=LocationStatusChoices.STATUS_PLANNED,
+        )
+        Location.objects.create(
+            site=sites[0],
+            name='GraphQL Staging Location',
+            slug='graphql-staging-location',
+            parent=parent_locations[0],
+            status=LocationStatusChoices.STATUS_STAGING,
+        )
 
         cls.create_data = [
             {
@@ -280,7 +576,39 @@ class LocationTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class RackRoleTest(APIViewTestCases.APIViewTestCase):
+class RackGroupTestCase(APIViewTestCases.APIViewTestCase):
+    model = RackGroup
+    brief_fields = ['description', 'display', 'id', 'name', 'rack_count', 'slug', 'url']
+    create_data = [
+        {
+            'name': 'Rack Group 4',
+            'slug': 'rack-group-4',
+        },
+        {
+            'name': 'Rack Group 5',
+            'slug': 'rack-group-5',
+        },
+        {
+            'name': 'Rack Group 6',
+            'slug': 'rack-group-6',
+        },
+    ]
+    bulk_update_data = {
+        'description': 'New description',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+
+        rack_groups = (
+            RackGroup(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup(name='Rack Group 2', slug='rack-group-2'),
+            RackGroup(name='Rack Group 3', slug='rack-group-3'),
+        )
+        RackGroup.objects.bulk_create(rack_groups)
+
+
+class RackRoleTestCase(APIViewTestCases.APIViewTestCase):
     model = RackRole
     brief_fields = ['description', 'display', 'id', 'name', 'rack_count', 'slug', 'url']
     create_data = [
@@ -315,7 +643,7 @@ class RackRoleTest(APIViewTestCases.APIViewTestCase):
         RackRole.objects.bulk_create(rack_roles)
 
 
-class RackTypeTest(APIViewTestCases.APIViewTestCase):
+class RackTypeTestCase(APIViewTestCases.APIViewTestCase):
     model = RackType
     brief_fields = ['description', 'display', 'id', 'manufacturer', 'model', 'rack_count', 'slug', 'url']
     bulk_update_data = {
@@ -375,7 +703,7 @@ class RackTypeTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class RackTest(APIViewTestCases.APIViewTestCase):
+class RackTestCase(APIViewTestCases.APIViewTestCase):
     model = Rack
     brief_fields = ['description', 'device_count', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -397,6 +725,12 @@ class RackTest(APIViewTestCases.APIViewTestCase):
             Location.objects.create(site=sites[1], name='Location 2', slug='location-2'),
         )
 
+        rack_groups = (
+            RackGroup(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup(name='Rack Group 2', slug='rack-group-2'),
+        )
+        RackGroup.objects.bulk_create(rack_groups)
+
         rack_roles = (
             RackRole(name='Rack Role 1', slug='rack-role-1', color='ff0000'),
             RackRole(name='Rack Role 2', slug='rack-role-2', color='00ff00'),
@@ -404,9 +738,9 @@ class RackTest(APIViewTestCases.APIViewTestCase):
         RackRole.objects.bulk_create(rack_roles)
 
         racks = (
-            Rack(site=sites[0], location=locations[0], role=rack_roles[0], name='Rack 1'),
-            Rack(site=sites[0], location=locations[0], role=rack_roles[0], name='Rack 2'),
-            Rack(site=sites[0], location=locations[0], role=rack_roles[0], name='Rack 3'),
+            Rack(site=sites[0], location=locations[0], group=rack_groups[0], role=rack_roles[0], name='Rack 1'),
+            Rack(site=sites[0], location=locations[0], group=rack_groups[0], role=rack_roles[0], name='Rack 2'),
+            Rack(site=sites[0], location=locations[0], group=rack_groups[0], role=rack_roles[0], name='Rack 3'),
         )
         Rack.objects.bulk_create(racks)
 
@@ -415,18 +749,21 @@ class RackTest(APIViewTestCases.APIViewTestCase):
                 'name': 'Test Rack 4',
                 'site': sites[1].pk,
                 'location': locations[1].pk,
+                'group': rack_groups[1].pk,
                 'role': rack_roles[1].pk,
             },
             {
                 'name': 'Test Rack 5',
                 'site': sites[1].pk,
                 'location': locations[1].pk,
+                'group': rack_groups[1].pk,
                 'role': rack_roles[1].pk,
             },
             {
                 'name': 'Test Rack 6',
                 'site': sites[1].pk,
                 'location': locations[1].pk,
+                'group': rack_groups[1].pk,
                 'role': rack_roles[1].pk,
             },
         ]
@@ -451,6 +788,34 @@ class RackTest(APIViewTestCases.APIViewTestCase):
         response = self.client.get(f'{url}?q=U10', **self.header)
         self.assertEqual(response.data['count'], 2)
 
+    def test_get_rack_elevation_description_is_occupying_device_name(self):
+        """
+        Verify occupied rack units include the occupying device in their description.
+        """
+        rack = Rack.objects.first()
+        self.add_permissions('dcim.view_rack', 'dcim.view_device')
+        url = reverse('dcim-api:rack-elevation', kwargs={'pk': rack.pk})
+
+        device = create_test_device(
+            name='Device A',
+            site=rack.site,
+            rack=rack,
+            position=40,
+            face=DeviceFaceChoices.FACE_FRONT,
+        )
+
+        # Retrieve all units
+        response = self.client.get(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        occupied_unit = next(unit for unit in response.data['results'] if unit['name'] == 'U40')
+        self.assertEqual(occupied_unit['device']['id'], device.pk)
+        self.assertEqual(occupied_unit['description'], f'{device}')
+
+        unoccupied_unit = next(unit for unit in response.data['results'] if unit['name'] == 'U39')
+        self.assertEqual(unoccupied_unit['device'], None)
+        self.assertEqual(unoccupied_unit['description'], None)
+
     def test_get_rack_elevation_svg(self):
         """
         GET a single rack elevation in SVG format.
@@ -464,7 +829,7 @@ class RackTest(APIViewTestCases.APIViewTestCase):
         self.assertEqual(response.get('Content-Type'), 'image/svg+xml')
 
 
-class RackReservationTest(APIViewTestCases.APIViewTestCase):
+class RackReservationTestCase(APIViewTestCases.APIViewTestCase):
     model = RackReservation
     brief_fields = ['description', 'display', 'id', 'status', 'units', 'url', 'user']
     bulk_update_data = {
@@ -529,8 +894,17 @@ class RackReservationTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    def test_unit_count(self):
+        """unit_count should reflect the number of units in the reservation."""
+        url = reverse('dcim-api:rackreservation-list')
+        self.add_permissions('dcim.view_rackreservation')
+        response = self.client.get(url, **self.header)
+        self.assertHttpStatus(response, 200)
+        for result in response.data['results']:
+            self.assertEqual(result['unit_count'], len(result['units']))
 
-class ManufacturerTest(APIViewTestCases.APIViewTestCase):
+
+class ManufacturerTestCase(APIViewTestCases.APIViewTestCase):
     model = Manufacturer
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
     create_data = [
@@ -562,7 +936,7 @@ class ManufacturerTest(APIViewTestCases.APIViewTestCase):
         Manufacturer.objects.bulk_create(manufacturers)
 
 
-class DeviceTypeTest(APIViewTestCases.APIViewTestCase):
+class DeviceTypeTestCase(APIViewTestCases.APIViewTestCase):
     model = DeviceType
     brief_fields = ['description', 'device_count', 'display', 'id', 'manufacturer', 'model', 'slug', 'url']
     bulk_update_data = {
@@ -608,7 +982,7 @@ class DeviceTypeTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ModuleTypeTest(APIViewTestCases.APIViewTestCase):
+class ModuleTypeTestCase(APIViewTestCases.APIViewTestCase):
     model = ModuleType
     brief_fields = ['description', 'display', 'id', 'manufacturer', 'model', 'module_count', 'profile', 'url']
     bulk_update_data = {
@@ -648,7 +1022,7 @@ class ModuleTypeTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ModuleTypeProfileTest(APIViewTestCases.APIViewTestCase):
+class ModuleTypeProfileTestCase(APIViewTestCases.APIViewTestCase):
     model = ModuleTypeProfile
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     SCHEMAS = [
@@ -712,7 +1086,7 @@ class ModuleTypeProfileTest(APIViewTestCases.APIViewTestCase):
         ModuleTypeProfile.objects.bulk_create(module_type_profiles)
 
 
-class ConsolePortTemplateTest(APIViewTestCases.APIViewTestCase):
+class ConsolePortTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = ConsolePortTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -756,7 +1130,7 @@ class ConsolePortTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ConsoleServerPortTemplateTest(APIViewTestCases.APIViewTestCase):
+class ConsoleServerPortTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = ConsoleServerPortTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -800,7 +1174,7 @@ class ConsoleServerPortTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class PowerPortTemplateTest(APIViewTestCases.APIViewTestCase):
+class PowerPortTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = PowerPortTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -844,7 +1218,7 @@ class PowerPortTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class PowerOutletTemplateTest(APIViewTestCases.APIViewTestCase):
+class PowerOutletTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = PowerOutletTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -902,7 +1276,7 @@ class PowerOutletTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class InterfaceTemplateTest(APIViewTestCases.APIViewTestCase):
+class InterfaceTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = InterfaceTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -950,7 +1324,7 @@ class InterfaceTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class FrontPortTemplateTest(APIViewTestCases.APIViewTestCase):
+class FrontPortTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = FrontPortTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1067,7 +1441,7 @@ class FrontPortTemplateTest(APIViewTestCases.APIViewTestCase):
         )
 
 
-class RearPortTemplateTest(APIViewTestCases.APIViewTestCase):
+class RearPortTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = RearPortTemplate
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1183,9 +1557,9 @@ class RearPortTemplateTest(APIViewTestCases.APIViewTestCase):
         )
 
 
-class ModuleBayTemplateTest(APIViewTestCases.APIViewTestCase):
+class ModuleBayTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = ModuleBayTemplate
-    brief_fields = ['description', 'display', 'id', 'name', 'url']
+    brief_fields = ['description', 'display', 'enabled', 'id', 'name', 'url']
     bulk_update_data = {
         'description': 'New description',
     }
@@ -1202,9 +1576,9 @@ class ModuleBayTemplateTest(APIViewTestCases.APIViewTestCase):
         )
 
         module_bay_templates = (
-            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 1'),
-            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 2'),
-            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 3'),
+            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 1', enabled=True),
+            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 2', enabled=False),
+            ModuleBayTemplate(device_type=devicetype, name='Module Bay Template 3', enabled=True),
         )
         ModuleBayTemplate.objects.bulk_create(module_bay_templates)
 
@@ -1212,6 +1586,7 @@ class ModuleBayTemplateTest(APIViewTestCases.APIViewTestCase):
             {
                 'device_type': devicetype.pk,
                 'name': 'Module Bay Template 4',
+                'enabled': False,
             },
             {
                 'device_type': devicetype.pk,
@@ -1224,9 +1599,9 @@ class ModuleBayTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class DeviceBayTemplateTest(APIViewTestCases.APIViewTestCase):
+class DeviceBayTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = DeviceBayTemplate
-    brief_fields = ['description', 'display', 'id', 'name', 'url']
+    brief_fields = ['description', 'display', 'enabled', 'id', 'name', 'url']
     bulk_update_data = {
         'description': 'New description',
     }
@@ -1243,9 +1618,9 @@ class DeviceBayTemplateTest(APIViewTestCases.APIViewTestCase):
         )
 
         device_bay_templates = (
-            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 1'),
-            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 2'),
-            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 3'),
+            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 1', enabled=True),
+            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 2', enabled=False),
+            DeviceBayTemplate(device_type=devicetype, name='Device Bay Template 3', enabled=True),
         )
         DeviceBayTemplate.objects.bulk_create(device_bay_templates)
 
@@ -1253,6 +1628,7 @@ class DeviceBayTemplateTest(APIViewTestCases.APIViewTestCase):
             {
                 'device_type': devicetype.pk,
                 'name': 'Device Bay Template 4',
+                'enabled': False,
             },
             {
                 'device_type': devicetype.pk,
@@ -1265,7 +1641,7 @@ class DeviceBayTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class InventoryItemTemplateTest(APIViewTestCases.APIViewTestCase):
+class InventoryItemTemplateTestCase(APIViewTestCases.APIViewTestCase):
     model = InventoryItemTemplate
     brief_fields = ['_depth', 'description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1325,7 +1701,7 @@ class InventoryItemTemplateTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class DeviceRoleTest(APIViewTestCases.APIViewTestCase):
+class DeviceRoleTestCase(APIViewTestCases.APIViewTestCase):
     model = DeviceRole
     brief_fields = [
         '_depth', 'description', 'device_count', 'display', 'id', 'name', 'slug', 'url', 'virtualmachine_count'
@@ -1359,7 +1735,7 @@ class DeviceRoleTest(APIViewTestCases.APIViewTestCase):
         DeviceRole.objects.create(name='Device Role 3', slug='device-role-3', color='0000ff')
 
 
-class PlatformTest(APIViewTestCases.APIViewTestCase):
+class PlatformTestCase(APIViewTestCases.APIViewTestCase):
     model = Platform
     brief_fields = [
         '_depth', 'description', 'device_count', 'display', 'id', 'name', 'slug', 'url', 'virtualmachine_count',
@@ -1394,7 +1770,7 @@ class PlatformTest(APIViewTestCases.APIViewTestCase):
             platform.save()
 
 
-class DeviceTest(APIViewTestCases.APIViewTestCase):
+class DeviceTestCase(APIViewTestCases.APIViewTestCase):
     model = Device
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1633,23 +2009,192 @@ class DeviceTest(APIViewTestCases.APIViewTestCase):
         response = self.client.post(url, {}, format='json', HTTP_AUTHORIZATION=token_header)
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
+    def test_list_object_includes_nat_inside_on_primary_ip(self):
+        device = create_test_device('natted-device')
+        interface = Interface.objects.create(device=device, name='eth0', type='other')
 
-class ModuleTest(APIViewTestCases.APIViewTestCase):
+        real_ip, nat_ip = create_test_nat_ip_pair(
+            real_address='10.0.0.10/32',
+            nat_address='198.51.100.10/32',
+            inside_interface=interface,
+        )
+
+        device.primary_ip4 = nat_ip
+        device.save()
+
+        self.add_permissions('dcim.view_device', 'ipam.view_ipaddress')
+        response = self.client.get(f'{self._get_list_url()}?id={device.pk}', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        result = response.data['results'][0]
+        for field in ('primary_ip', 'primary_ip4'):
+            self.assertEqual(result[field]['address'], str(nat_ip.address))
+            self.assertEqual(result[field]['nat_inside']['address'], str(real_ip.address))
+            self.assertEqual(result[field]['nat_outside'], [])
+
+    def test_get_object_includes_nat_outside_on_primary_ip(self):
+        device = create_test_device('real-ip-device')
+        interface = Interface.objects.create(device=device, name='eth0', type='other')
+
+        real_ip, nat_ip = create_test_nat_ip_pair(
+            real_address='10.0.0.11/32',
+            nat_address='198.51.100.11/32',
+            inside_interface=interface,
+        )
+
+        device.primary_ip4 = real_ip
+        device.save()
+
+        self.add_permissions('dcim.view_device', 'ipam.view_ipaddress')
+        response = self.client.get(
+            f'{self._get_detail_url(device)}?exclude=config_context',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        for field in ('primary_ip', 'primary_ip4'):
+            self.assertEqual(response.data[field]['address'], str(real_ip.address))
+            self.assertIsNone(response.data[field]['nat_inside'])
+            self.assertCountEqual(
+                [ip['address'] for ip in response.data[field]['nat_outside']],
+                [str(nat_ip.address)],
+            )
+
+    def test_get_object_includes_nat_on_oob_ip(self):
+        device = create_test_device('oob-nat-device')
+        interface = Interface.objects.create(device=device, name='oob0', type='other')
+
+        real_ip, nat_ip = create_test_nat_ip_pair(
+            real_address='10.0.0.12/32',
+            nat_address='198.51.100.12/32',
+            inside_interface=interface,
+        )
+
+        device.oob_ip = nat_ip
+        device.save()
+
+        self.add_permissions('dcim.view_device', 'ipam.view_ipaddress')
+        response = self.client.get(
+            f'{self._get_detail_url(device)}?exclude=config_context',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['oob_ip']['address'], str(nat_ip.address))
+        self.assertEqual(response.data['oob_ip']['nat_inside']['address'], str(real_ip.address))
+        self.assertEqual(response.data['oob_ip']['nat_outside'], [])
+
+    def test_get_object_includes_dns_name_on_primary_ip(self):
+        device = create_test_device('dns-device')
+        interfaces = (
+            Interface.objects.create(device=device, name='eth0', type='other'),
+            Interface.objects.create(device=device, name='eth1', type='other'),
+        )
+
+        ip4 = IPAddress(address='192.0.2.10/32', dns_name='device4.example.com')
+        ip4.assigned_object = interfaces[0]
+        ip4.save()
+        ip6 = IPAddress(address='2001:db8::10/128', dns_name='device6.example.com')
+        ip6.assigned_object = interfaces[1]
+        ip6.save()
+
+        device.primary_ip4 = ip4
+        device.primary_ip6 = ip6
+        device.save()
+
+        self.add_permissions('dcim.view_device', 'ipam.view_ipaddress')
+        response = self.client.get(
+            f'{self._get_detail_url(device)}?exclude=config_context',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['primary_ip4']['dns_name'], 'device4.example.com')
+        self.assertEqual(response.data['primary_ip6']['dns_name'], 'device6.example.com')
+        self.assertIn(
+            response.data['primary_ip']['dns_name'],
+            ('device4.example.com', 'device6.example.com'),
+        )
+
+    def test_get_object_includes_dns_name_on_oob_ip(self):
+        device = create_test_device('dns-oob-device')
+        interface = Interface.objects.create(device=device, name='oob0', type='other')
+
+        ip = IPAddress(address='192.0.2.20/32', dns_name='oob.example.com')
+        ip.assigned_object = interface
+        ip.save()
+
+        device.oob_ip = ip
+        device.save()
+
+        self.add_permissions('dcim.view_device', 'ipam.view_ipaddress')
+        response = self.client.get(
+            f'{self._get_detail_url(device)}?exclude=config_context',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['oob_ip']['dns_name'], 'oob.example.com')
+
+    def test_render_config_with_config_template_id(self):
+        default_template = ConfigTemplate.objects.create(
+            name='Default Template',
+            template_code='Default config for {{ device.name }}'
+        )
+        override_template = ConfigTemplate.objects.create(
+            name='Override Template',
+            template_code='Override config for {{ device.name }}'
+        )
+
+        device = Device.objects.first()
+        device.config_template = default_template
+        device.save()
+
+        self.add_permissions('dcim.render_config_device', 'dcim.view_device', 'extras.view_configtemplate')
+        url = reverse('dcim-api:device-render-config', kwargs={'pk': device.pk})
+
+        # Render with override template
+        response = self.client.post(url, {'config_template_id': override_template.pk}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['content'], f'Override config for {device.name}')
+
+        # Render with nonexistent config_template_id
+        response = self.client.post(url, {'config_template_id': 999999}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+        # Render with non-integer config_template_id
+        response = self.client.post(url, {'config_template_id': 'abc'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+        # Without view_configtemplate permission, override template should not be accessible
+        self.remove_permissions('extras.view_configtemplate')
+        response = self.client.post(url, {'config_template_id': override_template.pk}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+
+class ModuleTestCase(APIViewTestCases.APIViewTestCase):
     model = Module
     brief_fields = ['description', 'device', 'display', 'id', 'module_bay', 'module_type', 'url']
     bulk_update_data = {
         'serial': '1234ABCD',
     }
-    user_permissions = ('dcim.view_modulebay', 'dcim.view_moduletype', 'dcim.view_device')
+    user_permissions = (
+        'dcim.view_modulebay', 'dcim.view_moduletype', 'dcim.view_moduletypeprofile', 'dcim.view_device'
+    )
 
     @classmethod
     def setUpTestData(cls):
         manufacturer = Manufacturer.objects.create(name='Generic', slug='generic')
+        profiles = (
+            ModuleTypeProfile(name='Test CPU'),
+            ModuleTypeProfile(name='Test Hard disk'),
+        )
+        ModuleTypeProfile.objects.bulk_create(profiles)
         device = create_test_device('Test Device 1')
 
         module_types = (
-            ModuleType(manufacturer=manufacturer, model='Module Type 1'),
-            ModuleType(manufacturer=manufacturer, model='Module Type 2'),
+            ModuleType(manufacturer=manufacturer, model='Module Type 1', profile=profiles[0]),
+            ModuleType(manufacturer=manufacturer, model='Module Type 2', profile=profiles[1]),
             ModuleType(manufacturer=manufacturer, model='Module Type 3'),
         )
         ModuleType.objects.bulk_create(module_types)
@@ -1699,8 +2244,270 @@ class ModuleTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    def test_replicate_components(self):
+        """
+        Installing a module with replicate_components=True (the default) should create
+        components from the module type's templates on the parent device.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Replication Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Replication Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='Replication Bay')
 
-class ConsolePortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'replicate_components': True,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertTrue(device.interfaces.filter(name='eth0').exists())
+
+    def test_no_replicate_components(self):
+        """
+        Installing a module with replicate_components=False should NOT create components
+        from the module type's templates.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for No Replication Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='No Replication Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='No Replication Bay')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'replicate_components': False,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertFalse(device.interfaces.filter(name='eth0').exists())
+
+    def test_adopt_components(self):
+        """
+        Installing a module with adopt_components=True should assign existing unattached
+        device components to the new module.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Adopt Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Adopt Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='Adopt Bay')
+        existing_iface = Interface.objects.create(device=device, name='eth0', type='1000base-t')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'adopt_components': True,
+            'replicate_components': False,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        existing_iface.refresh_from_db()
+        self.assertIsNotNone(existing_iface.module)
+
+    def test_replicate_components_conflict(self):
+        """
+        Installing a module with replicate_components=True when a component with the same name
+        already exists should return a validation error.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Conflict Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Conflict Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='Conflict Bay')
+        Interface.objects.create(device=device, name='eth0', type='1000base-t')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'replicate_components': True,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_adopt_components_already_owned(self):
+        """
+        Installing a module with adopt_components=True when an existing component already
+        belongs to another module should return a validation error.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Adopt Owned Test')
+        owner_module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Owner Module Type')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Adopt Owned Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        owner_bay = ModuleBay.objects.create(device=device, name='Owner Bay')
+        target_bay = ModuleBay.objects.create(device=device, name='Adopt Owned Bay')
+
+        # Install a module that owns the interface
+        owner_module = Module.objects.create(device=device, module_bay=owner_bay, module_type=owner_module_type)
+        Interface.objects.create(device=device, name='eth0', type='1000base-t', module=owner_module)
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': target_bay.pk,
+            'module_type': module_type.pk,
+            'adopt_components': True,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_patch_ignores_replicate_and_adopt(self):
+        """
+        PATCH requests that include replicate_components or adopt_components should not
+        trigger component replication or adoption (these fields are create-only).
+        """
+        self.add_permissions('dcim.change_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for PATCH Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='PATCH Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='PATCH Bay')
+        # Create the module without replication so we can verify PATCH doesn't trigger it
+        module = Module(device=device, module_bay=module_bay, module_type=module_type)
+        module._disable_replication = True
+        module.save()
+
+        url = reverse('dcim-api:module-detail', kwargs={'pk': module.pk})
+        data = {
+            'replicate_components': True,
+            'adopt_components': True,
+            'serial': 'PATCHED',
+        }
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['serial'], 'PATCHED')
+        # No interfaces should have been created by the PATCH
+        self.assertFalse(device.interfaces.exists())
+
+    def test_adopt_and_replicate_components(self):
+        """
+        Installing a module with both adopt_components=True and replicate_components=True
+        should adopt existing unowned components and create new components for templates
+        that have no matching existing component.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Adopt+Replicate Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Adopt+Replicate Test Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth1', type='1000base-t')
+        module_bay = ModuleBay.objects.create(device=device, name='Adopt+Replicate Bay')
+        # eth0 already exists (unowned); eth1 does not
+        existing_iface = Interface.objects.create(device=device, name='eth0', type='1000base-t')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'adopt_components': True,
+            'replicate_components': True,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        # eth0 should have been adopted (now owned by the new module)
+        existing_iface.refresh_from_db()
+        self.assertIsNotNone(existing_iface.module)
+        # eth1 should have been created
+        self.assertTrue(device.interfaces.filter(name='eth1').exists())
+
+    def test_module_token_no_position(self):
+        """
+        Installing a module whose type has a template with a MODULE_TOKEN placeholder into a
+        module bay with no position defined should return a validation error.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Token No-Position Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Token No-Position Module Type')
+        # Template name contains the MODULE_TOKEN placeholder
+        InterfaceTemplate.objects.create(
+            module_type=module_type, name=f'{MODULE_TOKEN}-eth0', type='1000base-t'
+        )
+        # Module bay has no position
+        module_bay = ModuleBay.objects.create(device=device, name='No-Position Bay')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_module_token_depth_mismatch(self):
+        """
+        Installing a module whose template name has more MODULE_TOKEN placeholders than the
+        depth of the module bay tree should return a validation error.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Token Depth Mismatch Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Token Depth Mismatch Module Type')
+        # Template name has two placeholders but the bay is at depth 1
+        InterfaceTemplate.objects.create(
+            module_type=module_type, name=f'{MODULE_TOKEN}-{MODULE_TOKEN}-eth0', type='1000base-t'
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Depth 1 Bay', position='1')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_list_objects_by_profile_id(self):
+        profiles = ModuleTypeProfile.objects.filter(name__startswith='Test').order_by('name')
+        self.add_permissions('dcim.view_module')
+        response = self.client.get(self._get_list_url(), {'profile_id': [profiles[0].pk]}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+
+        response = self.client.get(self._get_list_url(), {'profile_id': [profiles[1].pk]}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+
+        response = self.client.get(
+            self._get_list_url(),
+            {'profile_id': [settings.FILTERS_NULL_CHOICE_VALUE]},
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+
+    def test_list_objects_by_profile(self):
+        profiles = ModuleTypeProfile.objects.filter(name__startswith='Test').order_by('name')
+        self.add_permissions('dcim.view_module')
+        response = self.client.get(self._get_list_url(), {'profile': [profiles[0].name]}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+
+        response = self.client.get(self._get_list_url(), {'profile': [profiles[1].name]}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+
+
+class ConsolePortTestCase(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
     model = ConsolePort
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1743,7 +2550,7 @@ class ConsolePortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCa
         ]
 
 
-class ConsoleServerPortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
+class ConsoleServerPortTestCase(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
     model = ConsoleServerPort
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1786,7 +2593,7 @@ class ConsoleServerPortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIView
         ]
 
 
-class PowerPortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
+class PowerPortTestCase(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
     model = PowerPort
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1826,7 +2633,7 @@ class PowerPortTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase
         ]
 
 
-class PowerOutletTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
+class PowerOutletTestCase(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
     model = PowerOutlet
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1875,7 +2682,7 @@ class PowerOutletTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCa
         ]
 
 
-class InterfaceTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
+class InterfaceTestCase(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase):
     model = Interface
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -1904,6 +2711,8 @@ class InterfaceTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase
             VirtualDeviceContext(name='VDC 2', identifier=2, device=device)
         )
         VirtualDeviceContext.objects.bulk_create(vdcs)
+        for interface in interfaces:
+            interface.vdcs.set(vdcs)
 
         vlans = (
             VLAN(name='VLAN 1', vid=1),
@@ -2084,7 +2893,7 @@ class InterfaceTest(Mixins.ComponentTraceMixin, APIViewTestCases.APIViewTestCase
         self._perform_interface_test_with_invalid_data(InterfaceModeChoices.MODE_TAGGED_ALL, invalid_data)
 
 
-class FrontPortTest(APIViewTestCases.APIViewTestCase):
+class FrontPortTestCase(APIViewTestCases.APIViewTestCase):
     model = FrontPort
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -2203,7 +3012,7 @@ class FrontPortTest(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
 
-class RearPortTest(APIViewTestCases.APIViewTestCase):
+class RearPortTestCase(APIViewTestCases.APIViewTestCase):
     model = RearPort
     brief_fields = ['_occupied', 'cable', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -2319,9 +3128,9 @@ class RearPortTest(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
 
-class ModuleBayTest(APIViewTestCases.APIViewTestCase):
+class ModuleBayTestCase(APIViewTestCases.APIViewTestCase):
     model = ModuleBay
-    brief_fields = ['description', 'display', 'id', 'installed_module', 'name', 'url']
+    brief_fields = ['_occupied', 'description', 'display', 'enabled', 'id', 'installed_module', 'name', 'url']
     bulk_update_data = {
         'description': 'New description',
     }
@@ -2337,9 +3146,9 @@ class ModuleBayTest(APIViewTestCases.APIViewTestCase):
         device = Device.objects.create(device_type=device_type, role=role, name='Device 1', site=site)
 
         module_bays = (
-            ModuleBay(device=device, name='Device Bay 1'),
-            ModuleBay(device=device, name='Device Bay 2'),
-            ModuleBay(device=device, name='Device Bay 3'),
+            ModuleBay(device=device, name='Device Bay 1', enabled=True),
+            ModuleBay(device=device, name='Device Bay 2', enabled=False),
+            ModuleBay(device=device, name='Device Bay 3', enabled=True),
         )
         for module_bay in module_bays:
             module_bay.save()
@@ -2348,6 +3157,7 @@ class ModuleBayTest(APIViewTestCases.APIViewTestCase):
             {
                 'device': device.pk,
                 'name': 'Device Bay 4',
+                'enabled': False,
             },
             {
                 'device': device.pk,
@@ -2360,9 +3170,9 @@ class ModuleBayTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class DeviceBayTest(APIViewTestCases.APIViewTestCase):
+class DeviceBayTestCase(APIViewTestCases.APIViewTestCase):
     model = DeviceBay
-    brief_fields = ['description', 'device', 'display', 'id', 'name', 'url']
+    brief_fields = ['_occupied', 'description', 'device', 'display', 'enabled', 'id', 'name', 'url']
     bulk_update_data = {
         'description': 'New description',
     }
@@ -2399,9 +3209,9 @@ class DeviceBayTest(APIViewTestCases.APIViewTestCase):
         Device.objects.bulk_create(devices)
 
         device_bays = (
-            DeviceBay(device=devices[0], name='Device Bay 1'),
-            DeviceBay(device=devices[0], name='Device Bay 2'),
-            DeviceBay(device=devices[0], name='Device Bay 3'),
+            DeviceBay(device=devices[0], name='Device Bay 1', enabled=True),
+            DeviceBay(device=devices[0], name='Device Bay 2', enabled=False),
+            DeviceBay(device=devices[0], name='Device Bay 3', enabled=True),
         )
         DeviceBay.objects.bulk_create(device_bays)
 
@@ -2424,7 +3234,7 @@ class DeviceBayTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class InventoryItemTest(APIViewTestCases.APIViewTestCase):
+class InventoryItemTestCase(APIViewTestCases.APIViewTestCase):
     model = InventoryItem
     brief_fields = ['_depth', 'description', 'device', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -2491,7 +3301,7 @@ class InventoryItemTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class InventoryItemRoleTest(APIViewTestCases.APIViewTestCase):
+class InventoryItemRoleTestCase(APIViewTestCases.APIViewTestCase):
     model = InventoryItemRole
     brief_fields = ['description', 'display', 'id', 'inventoryitem_count', 'name', 'slug', 'url']
     create_data = [
@@ -2526,7 +3336,61 @@ class InventoryItemRoleTest(APIViewTestCases.APIViewTestCase):
         InventoryItemRole.objects.bulk_create(roles)
 
 
-class CableTest(APIViewTestCases.APIViewTestCase):
+class CableBundleTestCase(APIViewTestCases.APIViewTestCase):
+    model = CableBundle
+    brief_fields = ['description', 'display', 'id', 'name', 'url']
+    create_data = [
+        {'name': 'Cable Bundle 4'},
+        {'name': 'Cable Bundle 5'},
+        {'name': 'Cable Bundle 6'},
+    ]
+    bulk_update_data = {
+        'description': 'New description',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        cable_bundles = (
+            CableBundle(name='Cable Bundle 1'),
+            CableBundle(name='Cable Bundle 2'),
+            CableBundle(name='Cable Bundle 3'),
+        )
+        CableBundle.objects.bulk_create(cable_bundles)
+
+    def test_cable_count(self):
+        """cable_count annotation is returned correctly in the API response."""
+        self.add_permissions('dcim.view_cablebundle')
+        bundle = CableBundle.objects.first()
+
+        site = Site.objects.create(name='CB Test Site', slug='cb-test-site')
+        manufacturer = Manufacturer.objects.create(name='CB Manufacturer', slug='cb-manufacturer')
+        device_type = DeviceType.objects.create(
+            manufacturer=manufacturer, model='CB Device Type', slug='cb-device-type'
+        )
+        role = DeviceRole.objects.create(name='CB Role', slug='cb-role', color='ff0000')
+        devices = (
+            Device(device_type=device_type, role=role, name='CB Device 1', site=site),
+            Device(device_type=device_type, role=role, name='CB Device 2', site=site),
+        )
+        Device.objects.bulk_create(devices)
+        interfaces = (
+            Interface(device=devices[0], name='eth0', type=InterfaceTypeChoices.TYPE_1GE_FIXED),
+            Interface(device=devices[0], name='eth1', type=InterfaceTypeChoices.TYPE_1GE_FIXED),
+            Interface(device=devices[1], name='eth0', type=InterfaceTypeChoices.TYPE_1GE_FIXED),
+            Interface(device=devices[1], name='eth1', type=InterfaceTypeChoices.TYPE_1GE_FIXED),
+        )
+        Interface.objects.bulk_create(interfaces)
+        for a, b in [(interfaces[0], interfaces[2]), (interfaces[1], interfaces[3])]:
+            cable = Cable(a_terminations=[a], b_terminations=[b], bundle=bundle)
+            cable.save()
+
+        url = reverse('dcim-api:cablebundle-detail', kwargs={'pk': bundle.pk})
+        response = self.client.get(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['cable_count'], 2)
+
+
+class CableTestCase(APIViewTestCases.APIViewTestCase):
     model = Cable
     brief_fields = ['description', 'display', 'id', 'label', 'url']
     bulk_update_data = {
@@ -2734,8 +3598,117 @@ class CableTest(APIViewTestCases.APIViewTestCase):
 
                 self.assertSetEqual(set(ids), expected)
 
+    def test_graphql_cable_terminations_query_count(self):
+        """
+        Resolving CableType.a_terminations and CableType.b_terminations must take a constant number
+        of queries, regardless of how many cables (and hence terminations) are returned.
 
-class CableTerminationTest(
+        Also exercises selecting both cable ends in a single query: each end must be prefetched
+        under its own attribute, as two prefetches of the same relation cannot be merged.
+        """
+        self.add_permissions(
+            'dcim.view_cable',
+            'dcim.view_device',
+            'dcim.view_devicerole',
+            'dcim.view_devicetype',
+            'dcim.view_interface',
+            'dcim.view_platform',
+        )
+
+        # Reuse existing fixtures from setUpTestData()
+        site = Site.objects.get(slug='site-1')
+        devicetype = DeviceType.objects.get(slug='device-type-1')
+        role = DeviceRole.objects.get(slug='device-role-1')
+
+        # Create an isolated topology of cables between two devices
+        devices = (
+            Device(device_type=devicetype, role=role, name='GQL Count Device A', site=site),
+            Device(device_type=devicetype, role=role, name='GQL Count Device B', site=site),
+        )
+        Device.objects.bulk_create(devices)
+
+        interfaces = []
+        for device in devices:
+            for i in range(0, 8):
+                interfaces.append(
+                    Interface(device=device, type=InterfaceTypeChoices.TYPE_1GE_FIXED, name=f'gql{i}')
+                )
+        Interface.objects.bulk_create(interfaces)
+
+        expected_terminations = {}
+        for i in range(0, 8):
+            cable = Cable(
+                a_terminations=[interfaces[i]],
+                b_terminations=[interfaces[i + 8]],
+                label=f'GQL Count Cable {i}',
+            )
+            cable.save()
+            expected_terminations[str(cable.pk)] = (interfaces[i].pk, interfaces[i + 8].pk)
+
+        url = reverse('graphql')
+        termination_fields = """
+            ... on InterfaceType {
+              id
+              name
+              device { id name platform { id } role { id } device_type { id } }
+            }
+        """
+
+        def build_query(limit):
+            return f"""{{
+              cable_list(
+                filters: {{ label: {{ contains: "GQL Count Cable " }} }},
+                pagination: {{ limit: {limit} }}
+              ) {{
+                id
+                a_terminations {{ {termination_fields} }}
+                b_terminations {{ {termination_fields} }}
+              }}
+            }}"""
+
+        # Warm per-process caches (e.g. ContentType) so they are not counted below
+        self.client.post(url, data={'query': build_query(1)}, format='json', **self.header)
+
+        query_counts = {}
+        for limit in (2, 8):
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.post(
+                    url, data={'query': build_query(limit)}, format='json', **self.header
+                )
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            data = response.json()
+            self.assertNotIn('errors', data)
+
+            rows = data['data']['cable_list']
+            self.assertEqual(len(rows), limit)
+
+            # Both ends must resolve to the expected interfaces
+            for row in rows:
+                interface_a, interface_b = expected_terminations[row['id']]
+                self.assertEqual([t['id'] for t in row['a_terminations']], [str(interface_a)])
+                self.assertEqual([t['id'] for t in row['b_terminations']], [str(interface_b)])
+
+            query_counts[limit] = len(queries.captured_queries)
+
+        self.assertEqual(
+            query_counts[2],
+            query_counts[8],
+            f"Query count scales with the number of cables returned: {query_counts}"
+        )
+
+    def test_graphql_cable_termination_models(self):
+        """
+        The GraphQL prefetch hint for a cable termination enumerates the terminating models
+        explicitly; a model missing from that list silently falls back to an unoptimized query
+        rather than raising, so guard against drift from CABLE_TERMINATION_MODELS.
+        """
+        self.assertSetEqual(
+            {(model._meta.app_label, model._meta.model_name) for model in _CABLE_TERMINATION_MODELS},
+            {(ot.app_label, ot.model) for ot in ObjectType.objects.filter(CABLE_TERMINATION_MODELS)},
+        )
+
+
+class CableTerminationTestCase(
     APIViewTestCases.GetObjectViewTestCase,
     APIViewTestCases.ListObjectsViewTestCase,
 ):
@@ -2764,7 +3737,7 @@ class CableTerminationTest(
             cable.save()
 
 
-class ConnectedDeviceTest(APITestCase):
+class ConnectedDeviceTestCase(APITestCase):
 
     @classmethod
     def setUpTestData(cls):
@@ -2787,8 +3760,8 @@ class ConnectedDeviceTest(APITestCase):
         cable = Cable(a_terminations=[interfaces[0]], b_terminations=[interfaces[1]])
         cable.save()
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_get_connected_device(self):
+        self.add_permissions('dcim.view_device', 'dcim.view_interface')
         url = reverse('dcim-api:connected-device-list')
 
         url_params = '?peer_device=TestDevice1&peer_interface=eth0'
@@ -2801,7 +3774,7 @@ class ConnectedDeviceTest(APITestCase):
         self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
 
 
-class VirtualChassisTest(APIViewTestCases.APIViewTestCase):
+class VirtualChassisTestCase(APIViewTestCases.APIViewTestCase):
     model = VirtualChassis
     brief_fields = ['description', 'display', 'id', 'master', 'member_count', 'name', 'url']
 
@@ -2882,7 +3855,7 @@ class VirtualChassisTest(APIViewTestCases.APIViewTestCase):
         }
 
 
-class PowerPanelTest(APIViewTestCases.APIViewTestCase):
+class PowerPanelTestCase(APIViewTestCases.APIViewTestCase):
     model = PowerPanel
     brief_fields = ['description', 'display', 'id', 'name', 'powerfeed_count', 'url']
     user_permissions = ('dcim.view_site', )
@@ -2932,7 +3905,7 @@ class PowerPanelTest(APIViewTestCases.APIViewTestCase):
         }
 
 
-class PowerFeedTest(APIViewTestCases.APIViewTestCase):
+class PowerFeedTestCase(APIViewTestCases.APIViewTestCase):
     model = PowerFeed
     brief_fields = ['_occupied', 'cable', 'description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -2988,7 +3961,7 @@ class PowerFeedTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class VirtualDeviceContextTest(APIViewTestCases.APIViewTestCase):
+class VirtualDeviceContextTestCase(APIViewTestCases.APIViewTestCase):
     model = VirtualDeviceContext
     brief_fields = ['description', 'device', 'display', 'id', 'identifier', 'name', 'url']
     bulk_update_data = {
@@ -3041,8 +4014,77 @@ class VirtualDeviceContextTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    def test_get_object_includes_nat_on_primary_ip(self):
+        device = create_test_device('vdc-nat-device')
+        interfaces = (
+            Interface.objects.create(device=device, name='eth0', type='other'),
+            Interface.objects.create(device=device, name='eth1', type='other'),
+        )
 
-class MACAddressTest(APIViewTestCases.APIViewTestCase):
+        real_ip4, nat_ip4 = create_test_nat_ip_pair(
+            real_address='10.0.2.10/32',
+            nat_address='198.51.100.30/32',
+            inside_interface=interfaces[0],
+        )
+        real_ip6, nat_ip6 = create_test_nat_ip_pair(
+            real_address='2001:db8:2::10/128',
+            nat_address='2001:db8:2::20/128',
+            inside_interface=interfaces[1],
+        )
+
+        vdc = VirtualDeviceContext.objects.create(
+            name='VDC NAT', identifier=98, device=device, status='active'
+        )
+        vdc.primary_ip4 = nat_ip4
+        vdc.primary_ip6 = real_ip6
+        vdc.save()
+
+        self.add_permissions('dcim.view_virtualdevicecontext', 'ipam.view_ipaddress')
+        response = self.client.get(self._get_detail_url(vdc), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['primary_ip4']['nat_inside']['address'], str(real_ip4.address))
+        self.assertEqual(response.data['primary_ip4']['nat_outside'], [])
+        self.assertIsNone(response.data['primary_ip6']['nat_inside'])
+        self.assertCountEqual(
+            [ip['address'] for ip in response.data['primary_ip6']['nat_outside']],
+            [str(nat_ip6.address)],
+        )
+
+    def test_get_object_includes_dns_name_on_primary_ip(self):
+        device = create_test_device('vdc-dns-device')
+        interfaces = (
+            Interface.objects.create(device=device, name='eth0', type='other'),
+            Interface.objects.create(device=device, name='eth1', type='other'),
+        )
+
+        ip4 = IPAddress(address='192.0.2.30/32', dns_name='vdc4.example.com')
+        ip4.assigned_object = interfaces[0]
+        ip4.save()
+        ip6 = IPAddress(address='2001:db8::30/128', dns_name='vdc6.example.com')
+        ip6.assigned_object = interfaces[1]
+        ip6.save()
+
+        vdc = VirtualDeviceContext.objects.create(
+            name='VDC DNS', identifier=99, device=device, status='active'
+        )
+        vdc.primary_ip4 = ip4
+        vdc.primary_ip6 = ip6
+        vdc.save()
+
+        self.add_permissions('dcim.view_virtualdevicecontext', 'ipam.view_ipaddress')
+        response = self.client.get(self._get_detail_url(vdc), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['primary_ip4']['dns_name'], 'vdc4.example.com')
+        self.assertEqual(response.data['primary_ip6']['dns_name'], 'vdc6.example.com')
+        self.assertIn(
+            response.data['primary_ip']['dns_name'],
+            ('vdc4.example.com', 'vdc6.example.com'),
+        )
+
+
+class MACAddressTestCase(APIViewTestCases.APIViewTestCase):
     model = MACAddress
     brief_fields = ['description', 'display', 'id', 'mac_address', 'url']
     bulk_update_data = {

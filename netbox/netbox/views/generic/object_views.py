@@ -4,7 +4,6 @@ from collections import defaultdict
 from django.contrib import messages
 from django.db import router, transaction
 from django.db.models import ProtectedError, RestrictedError
-from django.db.models.deletion import Collector
 from django.http import HttpResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
@@ -13,6 +12,7 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import gettext as _
 
 from core.signals import clear_events
+from netbox.models.deletion import ConfirmCollector, CountOnly
 from netbox.object_actions import BulkDelete, BulkEdit, CloneObject, DeleteObject, EditObject
 from utilities.error_handlers import handle_protectederror
 from utilities.exceptions import AbortRequest, PermissionsViolation
@@ -22,7 +22,7 @@ from utilities.permissions import get_permission_for_model
 from utilities.querydict import normalize_querydict, prepare_cloned_fields
 from utilities.request import safe_for_redirect
 from utilities.tables import get_table_configs
-from utilities.views import GetReturnURLMixin, get_action_url
+from utilities.views import GetReturnURLMixin, get_action_url, get_default_template
 
 from .base import BaseObjectView
 from .mixins import ActionsMixin, TableMixin
@@ -98,12 +98,14 @@ class ObjectChildrenView(ObjectView, ActionsMixin, TableMixin):
         table: The django-tables2 Table class used to render the child objects list
         filterset: A django-filter FilterSet that is applied to the queryset
         filterset_form: The form class used to render filter options
+        filterset_instance: The bound FilterSet built for the current request (set during get())
         actions: An iterable of ObjectAction subclasses (see ActionsMixin)
     """
     child_model = None
     table = None
     filterset = None
     filterset_form = None
+    filterset_instance = None
     actions = (CloneObject, EditObject, DeleteObject, BulkEdit, BulkDelete)
     template_name = 'generic/object_children.html'
 
@@ -142,7 +144,10 @@ class ObjectChildrenView(ObjectView, ActionsMixin, TableMixin):
         child_objects = self.get_children(request, instance)
 
         if self.filterset:
-            child_objects = self.filterset(request.GET, child_objects, request=request).qs
+            # Retain the bound FilterSet so that prep_table_data() and get_extra_context() can
+            # inspect the request's validated filter data without rebuilding it.
+            self.filterset_instance = self.filterset(request.GET, child_objects, request=request)
+            child_objects = self.filterset_instance.qs
 
         # Determine the available actions
         actions = self.get_permitted_actions(request.user, model=self.child_model)
@@ -163,7 +168,7 @@ class ObjectChildrenView(ObjectView, ActionsMixin, TableMixin):
             'object': instance,
             'model': self.child_model,
             'child_model': self.child_model,
-            'base_template': f'{instance._meta.app_label}/{instance._meta.model_name}.html',
+            'base_template': get_default_template(instance),
             'table': table,
             'table_config': f'{table.name}_config',
             'table_configs': get_table_configs(table, request.user),
@@ -380,14 +385,19 @@ class ObjectDeleteView(GetReturnURLMixin, BaseObjectView):
 
     def _get_dependent_objects(self, obj):
         """
-        Returns a dictionary mapping of dependent objects (organized by model) which will be deleted as a result of
-        deleting the requested object.
+        Returns a dictionary mapping each dependent model to the objects (of that model) which will
+        be deleted as a result of deleting the requested object.
+
+        Values are normally a list of instances. For high-cardinality relations that we do not
+        materialize to avoid excessive memory use (currently a JobsMixin object's jobs, see
+        #22812), the value is a `CountOnly` — a lenient empty iterable whose `len()` is the true
+        row count, so it renders as a non-expandable row alongside the itemized relations.
 
         Args:
             obj: The object to return dependent objects for
         """
         using = router.db_for_write(obj._meta.model)
-        collector = Collector(using=using)
+        collector = ConfirmCollector(using=using)
         collector.collect([obj])
 
         # Compile a mapping of models to instances
@@ -401,7 +411,13 @@ class ObjectDeleteView(GetReturnURLMixin, BaseObjectView):
                 continue
             dependent_objects[model].append(instances)
 
-        return dict(dependent_objects)
+        # Add count-only entries for relations the collector enumerated by count rather than by
+        # instance (e.g. jobs), so they render as non-expandable rows in the same mapping.
+        dependent_objects = dict(dependent_objects)
+        for model, count in collector.generic_relation_counts.items():
+            dependent_objects[model] = CountOnly(count)
+
+        return dependent_objects
 
     def _handle_protected_objects(self, obj, protected_objects, request, exc):
         """
@@ -479,13 +495,16 @@ class ObjectDeleteView(GetReturnURLMixin, BaseObjectView):
 
             # Delete the object
             try:
-                obj.delete()
+                with transaction.atomic(using=router.db_for_write(self.queryset.model)):
+                    obj.delete()
             except (ProtectedError, RestrictedError) as e:
                 logger.info(f"Caught {type(e)} while attempting to delete objects")
+                clear_events.send(sender=self)
                 handle_protectederror([obj], request, e)
                 return redirect(obj.get_absolute_url())
             except AbortRequest as e:
                 logger.debug(e.message)
+                clear_events.send(sender=self)
                 messages.error(request, mark_safe(e.message))
                 return redirect(obj.get_absolute_url())
 
@@ -603,10 +622,16 @@ class ComponentCreateView(GetReturnURLMixin, BaseObjectView):
                         ))
 
                         # Redirect user on success
-                        if '_addanother' in request.POST and safe_for_redirect(request.get_full_path()):
-                            return redirect(request.get_full_path())
+                        if '_addanother' in request.POST:
+                            redirect_url = request.path
+                            params = prepare_cloned_fields(new_objs[-1])
+                            if 'return_url' in request.GET:
+                                params['return_url'] = request.GET.get('return_url')
+                            if params:
+                                redirect_url += f"?{params.urlencode()}"
+                            if safe_for_redirect(redirect_url):
+                                return redirect(redirect_url)
                         return redirect(self.get_return_url(request))
-
                 except (AbortRequest, PermissionsViolation) as e:
                     logger.debug(e.message)
                     form.add_error(None, e.message)

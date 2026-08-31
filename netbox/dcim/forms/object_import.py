@@ -150,8 +150,24 @@ class PortTemplateMappingImportForm(forms.ModelForm):
     class Meta:
         model = PortTemplateMapping
         fields = [
-            'front_port', 'front_port_position', 'rear_port', 'rear_port_position',
+            'device_type', 'module_type', 'front_port', 'front_port_position', 'rear_port', 'rear_port_position',
         ]
+
+    def clean_device_type(self):
+        if device_type := self.cleaned_data['device_type']:
+            front_port = self.fields['front_port']
+            rear_port = self.fields['rear_port']
+            front_port.queryset = front_port.queryset.filter(device_type=device_type)
+            rear_port.queryset = rear_port.queryset.filter(device_type=device_type)
+        return device_type
+
+    def clean_module_type(self):
+        if module_type := self.cleaned_data['module_type']:
+            front_port = self.fields['front_port']
+            rear_port = self.fields['rear_port']
+            front_port.queryset = front_port.queryset.filter(module_type=module_type)
+            rear_port.queryset = rear_port.queryset.filter(module_type=module_type)
+        return module_type
 
 
 class ModuleBayTemplateImportForm(forms.ModelForm):

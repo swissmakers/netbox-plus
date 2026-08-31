@@ -1,13 +1,22 @@
+from unittest.mock import patch
+
+from django.db.utils import ConnectionDoesNotExist
 from django.test import override_settings
 from django.urls import reverse
 
 from dcim.models import *
-from utilities.counters import connect_counters
+from utilities.counters import (
+    connect_counters,
+    post_delete_receiver,
+    post_save_receiver,
+    pre_delete_receiver,
+    update_counter,
+)
 from utilities.testing.base import TestCase
 from utilities.testing.utils import create_test_device
 
 
-class CountersTest(TestCase):
+class CountersTestCase(TestCase):
     """
     Validate the operation of the CounterCacheField (tracking counters).
     """
@@ -65,6 +74,63 @@ class CountersTest(TestCase):
         self.assertEqual(device1.interface_count, 1)
         self.assertEqual(device2.interface_count, 1)
 
+    def test_counter_skipped_when_parent_deleted(self):
+        """
+        Deleting a parent object should not issue a counter update for each cascaded child on that
+        same parent (the row is being removed, so the UPDATE is a no-op). Counters on surviving
+        related objects must still be updated.
+        """
+        device1 = Device.objects.get(name='Device 1')
+        device_type = device1.device_type
+        self.assertEqual(device_type.device_count, 2)
+
+        # The Device must have tracked children for the suppression to be meaningful; otherwise the
+        # assertions below would pass trivially with nothing to suppress
+        self.assertEqual(device1.interfaces.count(), 2)
+
+        # Wrap update_counter so the real counter logic still runs while we record each call
+        with patch('utilities.counters.update_counter', wraps=update_counter) as mock_update:
+            device1.delete()
+
+        # The Device's own interface counter must not be updated per cascaded Interface, since the
+        # Device is itself being deleted
+        counter_names = [call.args[2] for call in mock_update.call_args_list]
+        self.assertNotIn('interface_count', counter_names)
+
+        # The counter on the surviving parent (DeviceType) must still be decremented
+        self.assertIn('device_count', counter_names)
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.device_count, 1)
+
+        # Exactly one update should fire (DeviceType.device_count). Without the optimization the two
+        # cascaded Interfaces on Device 1 would each have triggered an interface_count update.
+        self.assertEqual(mock_update.call_count, 1)
+
+    def test_counter_skipped_when_parent_deleted_via_queryset(self):
+        """
+        A bulk QuerySet delete (e.g. Device.objects.filter(...).delete(), as used by scripts,
+        plugins, and programmatic callers) sets `origin` to the QuerySet rather than a single
+        object. Counter updates for children whose parent belongs to that QuerySet must be
+        suppressed, while counters on surviving related objects are still updated.
+        """
+        device1 = Device.objects.get(name='Device 1')
+        device_type = device1.device_type
+        self.assertEqual(device_type.device_count, 2)
+
+        # The Device must have tracked children for the suppression to be meaningful
+        self.assertEqual(device1.interfaces.count(), 2)
+
+        # Wrap update_counter so the real counter logic still runs while we record each call
+        with patch('utilities.counters.update_counter', wraps=update_counter) as mock_update:
+            Device.objects.filter(name='Device 1').delete()
+
+        # The deleted Device's interface_count must not be decremented per cascaded Interface, and
+        # the only update should be the surviving DeviceType's device_count
+        counter_names = [call.args[2] for call in mock_update.call_args_list]
+        self.assertEqual(counter_names, ['device_count'])
+        device_type.refresh_from_db()
+        self.assertEqual(device_type.device_count, 1)
+
     def test_interface_count_move(self):
         """
         When a tracked object (Interface) is moved, the tracking counter should be updated.
@@ -82,7 +148,6 @@ class CountersTest(TestCase):
         self.assertEqual(device1.interface_count, 1)
         self.assertEqual(device2.interface_count, 3)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_mptt_child_delete(self):
         device1 = Device.objects.first()
         inventory_item1 = InventoryItem.objects.create(device=device1, name='Inventory Item 1')
@@ -91,7 +156,7 @@ class CountersTest(TestCase):
         self.assertEqual(device1.inventory_item_count, 2)
 
         # Setup bulk_delete for the inventory items
-        self.add_permissions('dcim.delete_inventoryitem')
+        self.add_permissions('dcim.view_inventoryitem', 'dcim.delete_inventoryitem')
         pk_list = device1.inventoryitems.values_list('pk', flat=True)
         data = {
             'pk': pk_list,
@@ -135,3 +200,92 @@ class CountersTest(TestCase):
         vc.refresh_from_db()
         self.assertEqual(device1.device_type.device_count, 2, 'device_count should decrement exactly once')
         self.assertEqual(vc.member_count, 0, 'member_count should decrement exactly once')
+
+
+class UnpinnedQuery(Exception):
+    """Raised when a query which should have been pinned to a connection is routed instead."""
+
+
+class PinnedConnectionRouter:
+    """
+    Fails any read or write of the given models which is not pinned to an explicit database alias.
+    Django consults DATABASE_ROUTERS only for queries which name no connection, so a signal handler
+    which threads through the alias supplied by the signal never reaches this router. Each test
+    leaves out the model being written, as Django routes that write itself.
+    """
+    def __init__(self, *models):
+        self.models = models
+
+    def _check(self, model, **hints):
+        if model in self.models:
+            raise UnpinnedQuery(f"{model.__name__} query was routed rather than pinned to a connection")
+
+    db_for_read = _check
+    db_for_write = _check
+
+
+class CounterConnectionTestCase(TestCase):
+    """
+    Validate that the counter cache handlers issue their queries against the connection the
+    triggering object was written to, rather than letting DATABASE_ROUTERS select one. A routed
+    query updates a counter in a different database than the one holding the change which triggered
+    it, leaving the cached count silently wrong.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.device = create_test_device('Device 1')
+
+    def test_create_pins_counter_increment(self):
+        with override_settings(DATABASE_ROUTERS=[PinnedConnectionRouter(Device)]):
+            Interface.objects.create(device=self.device, name='Interface 1')
+
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.interface_count, 1)
+
+    def test_move_pins_both_counter_updates(self):
+        other = create_test_device('Device 2')
+        interface = Interface.objects.create(device=self.device, name='Interface 1')
+
+        interface = Interface.objects.get(pk=interface.pk)
+        interface.device = other
+        with override_settings(DATABASE_ROUTERS=[PinnedConnectionRouter(Device)]):
+            interface.save()
+
+        self.device.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(self.device.interface_count, 0)
+        self.assertEqual(other.interface_count, 1)
+
+    def test_receivers_use_the_alias_supplied_by_the_signal(self):
+        """
+        The tests above prove the queries name *an* alias, but with one configured database that
+        alias is always 'default' — they would pass just as well against a hardcoded
+        .using('default'). Invoking each receiver with an alias that does not exist distinguishes
+        "threaded through from the signal" from "happens to be the default".
+        """
+        interface = Interface.objects.create(device=self.device, name='Interface 1')
+        interface = Interface.objects.get(pk=interface.pk)
+
+        with self.assertRaises(ConnectionDoesNotExist):
+            post_save_receiver(Interface, interface, created=True, using='nonexistent')
+
+        # origin=None: the parent is not itself being deleted, so the existence guard runs
+        with self.assertRaises(ConnectionDoesNotExist):
+            pre_delete_receiver(Interface, interface, origin=None, using='nonexistent')
+
+        with self.assertRaises(ConnectionDoesNotExist):
+            post_delete_receiver(Interface, interface, origin=None, using='nonexistent')
+
+    def test_delete_pins_counter_decrement(self):
+        interface = Interface.objects.create(device=self.device, name='Interface 1')
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.interface_count, 1)
+
+        # The delete itself is pinned, as Django routes an unpinned one; that leaves
+        # pre_delete_receiver's existence guard as the only Interface query in scope, and that read
+        # decides whether the decrement below happens at all.
+        with override_settings(DATABASE_ROUTERS=[PinnedConnectionRouter(Device, Interface)]):
+            Interface.objects.using('default').filter(pk=interface.pk).delete()
+
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.interface_count, 0)

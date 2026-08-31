@@ -4,21 +4,23 @@ import re
 from datetime import date, datetime
 
 import django_filters
+import jsonschema
 from django import forms
 from django.conf import settings
-from django.contrib.postgres.fields import ArrayField
 from django.core.validators import RegexValidator, ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F, Func, Value
-from django.db.models.expressions import RawSQL
 from django.urls import reverse
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
+from jsonschema.exceptions import ValidationError as JSONValidationError
 
 from core.models import ObjectType
 from extras.choices import *
+from extras.constants import CUSTOMFIELD_DATA_BATCH_SIZE
 from extras.data import CHOICE_SETS
+from extras.fields import ChoiceSetField
 from netbox.context import query_cache
 from netbox.models import ChangeLoggedModel
 from netbox.models.features import CloningMixin, ExportTemplatesMixin
@@ -40,6 +42,7 @@ from utilities.forms.fields import (
 )
 from utilities.forms.utils import add_blank_choice
 from utilities.forms.widgets import APISelect, APISelectMultiple, DatePicker, DateTimePicker
+from utilities.jsonschema import validate_schema
 from utilities.querysets import RestrictedQuerySet
 from utilities.templatetags.builtins.filters import render_markdown
 from utilities.validators import validate_regex
@@ -67,10 +70,12 @@ class CustomFieldManager(models.Manager.from_queryset(RestrictedQuerySet)):
         """
         Return all CustomFields assigned to the given model.
         """
-        # Check the request cache before hitting the database
+        # Check the request cache before hitting the database. Test the cached value against None
+        # rather than for truthiness: a model with no custom fields caches an empty QuerySet, which
+        # would otherwise be treated as a miss and re-queried on every call.
         cache = query_cache.get()
         if cache is not None:
-            if custom_fields := cache['custom_fields'].get(model._meta.model):
+            if (custom_fields := cache['custom_fields'].get(model._meta.model)) is not None:
                 return custom_fields
 
         content_type = ObjectType.objects.get_for_model(model._meta.concrete_model)
@@ -222,6 +227,13 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             'example, <code>^[A-Z]{3}$</code> will limit values to exactly three uppercase letters.'
         )
     )
+    validation_schema = models.JSONField(
+        blank=True,
+        null=True,
+        validators=[validate_schema],
+        verbose_name=_('validation schema'),
+        help_text=_('A JSON schema definition for validating the custom field value')
+    )
     choice_set = models.ForeignKey(
         to='CustomFieldChoiceSet',
         on_delete=models.PROTECT,
@@ -259,11 +271,14 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
     clone_fields = (
         'object_types', 'type', 'related_object_type', 'group_name', 'description', 'required', 'unique',
         'search_weight', 'filter_logic', 'default', 'weight', 'validation_minimum', 'validation_maximum',
-        'validation_regex', 'choice_set', 'ui_visible', 'ui_editable', 'is_cloneable',
+        'validation_regex', 'validation_schema', 'choice_set', 'ui_visible', 'ui_editable', 'is_cloneable',
     )
 
     class Meta:
         ordering = ['group_name', 'weight', 'name']
+        indexes = (
+            models.Index(fields=('group_name', 'weight', 'name')),  # Default ordering
+        )
         verbose_name = _('custom field')
         verbose_name_plural = _('custom fields')
 
@@ -304,34 +319,85 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             self._choice_map = dict(self.choices)
         return self._choice_map.get(value, value)
 
+    def get_choice_color(self, value):
+        if self.choice_set:
+            return self.choice_set.get_choice_color(value)
+        return None
+
+    @staticmethod
+    def _update_object_data(model, filters=None, **update_kwargs):
+        """
+        Apply an UPDATE to the custom_field_data of every instance of the given model in batches,
+        bounding the number of rows touched by each statement. A single unbounded UPDATE across
+        millions of rows can exceed the database statement timeout, because JSONB updates rewrite
+        each affected row in full. Batches are selected via keyset pagination on the primary key.
+
+        The batched updates are wrapped in a transaction so that the operation remains atomic, as
+        it was when performed by a single UPDATE. This guards against partially-applied data (e.g.
+        a renamed field landing on only some objects) should the loop be interrupted when not
+        already running inside a request's transaction. Batching avoids the statement timeout
+        regardless, as that limit applies per statement rather than per transaction.
+
+        :param filters: Optional dict of ORM filters restricting which rows are updated. Callers
+            which need only to touch rows already holding a given key should pass
+            `{'custom_field_data__has_key': ...}`; because keys are materialized only when a value
+            is actually set (see populate_initial_data()), this typically excludes the bulk of the
+            table.
+        """
+        filters = filters or {}
+        queryset = model.objects.filter(**filters)
+        with transaction.atomic():
+            last_pk = 0
+            while True:
+                pks = list(
+                    queryset.filter(pk__gt=last_pk).order_by('pk')
+                    .values_list('pk', flat=True)[:CUSTOMFIELD_DATA_BATCH_SIZE]
+                )
+                if not pks:
+                    break
+                queryset.filter(pk__in=pks).update(**update_kwargs)
+                last_pk = pks[-1]
+
     def populate_initial_data(self, content_types):
         """
         Populate initial custom field data upon either a) the creation of a new CustomField, or
         b) the assignment of an existing CustomField to new object types.
+
+        Only a non-null default is written. A field with no default has no value to record, and an
+        absent key is equivalent to a null one everywhere the data is read (see CustomFieldsMixin),
+        so materializing a JSON null on every object would be a very expensive no-op: on a large
+        table it can outlast the request. Objects without the key simply report no value until one
+        is assigned.
         """
         if self.default is None:
-            # We have to convert None to a JSON null for jsonb_set()
-            value = RawSQL("'null'::jsonb", [])
-        else:
-            value = Value(self.default, models.JSONField())
+            return
+        value = Value(self.default, models.JSONField())
         for ct in content_types:
-            ct.model_class().objects.update(
-                custom_field_data=Func(
-                    F('custom_field_data'),
-                    Value([self.name]),
-                    value,
-                    function='jsonb_set'
+            if model := ct.model_class():
+                self._update_object_data(
+                    model,
+                    custom_field_data=Func(
+                        F('custom_field_data'),
+                        Value([self.name]),
+                        value,
+                        function='jsonb_set'
+                    )
                 )
-            )
 
     def remove_stale_data(self, content_types):
         """
         Delete custom field data which is no longer relevant (either because the CustomField is
         no longer assigned to a model, or because it has been deleted).
+
+        Only objects which actually hold a value for the field are rewritten. Because keys are
+        materialized only when a value is set (see populate_initial_data()), this typically
+        excludes the bulk of the table.
         """
         for ct in content_types:
             if model := ct.model_class():
-                model.objects.update(
+                self._update_object_data(
+                    model,
+                    filters={'custom_field_data__has_key': self.name},
                     custom_field_data=F('custom_field_data') - self.name
                 )
 
@@ -341,17 +407,21 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         one, copying the value of the old key.
         """
         for ct in self.object_types.all():
-            ct.model_class().objects.update(
-                custom_field_data=Func(
-                    F('custom_field_data') - old_name,
-                    Value([new_name]),
-                    Func(
-                        F('custom_field_data'),
-                        function='jsonb_extract_path_text',
-                        template=f"to_jsonb(%(expressions)s -> '{old_name}')"
-                    ),
-                    function='jsonb_set')
-            )
+            if model := ct.model_class():
+                self._update_object_data(
+                    model,
+                    filters={'custom_field_data__has_key': old_name},
+                    custom_field_data=Func(
+                        F('custom_field_data') - old_name,
+                        Value([new_name]),
+                        Func(
+                            F('custom_field_data'),
+                            Value(old_name),
+                            function='jsonb_extract_path',
+                            output_field=models.JSONField()
+                        ),
+                        function='jsonb_set')
+                )
 
     def clean(self):
         super().clean()
@@ -387,6 +457,12 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         if self.validation_regex and self.type not in regex_types:
             raise ValidationError({
                 'validation_regex': _("Regular expression validation is supported only for text and URL fields")
+            })
+
+        # Schema validation can be set only for JSON fields
+        if self.validation_schema and self.type != CustomFieldTypeChoices.TYPE_JSON:
+            raise ValidationError({
+                'validation_schema': _("JSON schema validation is supported only for JSON fields")
             })
 
         # Uniqueness can not be enforced for boolean fields
@@ -437,6 +513,8 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         """
         if value is None:
             return value
+        if self.type == CustomFieldTypeChoices.TYPE_DECIMAL:
+            return float(value)
         if self.type == CustomFieldTypeChoices.TYPE_DATE and type(value) is date:
             return value.isoformat()
         if self.type == CustomFieldTypeChoices.TYPE_DATETIME and type(value) is datetime:
@@ -582,7 +660,12 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         # Object
         elif self.type == CustomFieldTypeChoices.TYPE_OBJECT:
             model = self.related_object_type.model_class()
-            field_class = CSVModelChoiceField if for_csv_import else DynamicModelChoiceField
+            if for_csv_import:
+                field_class = CSVModelChoiceField
+            elif for_filterset_form:
+                field_class = DynamicModelMultipleChoiceField
+            else:
+                field_class = DynamicModelChoiceField
             kwargs = {
                 'queryset': model.objects.all(),
                 'required': required,
@@ -640,6 +723,9 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
 
         :param lookup_expr: Custom lookup expression (optional)
         """
+        # Imported locally as extras.filters imports extras.models
+        from extras.filters import missing_key_aware_filter_factory
+
         kwargs = {
             'field_name': f'custom_field_data__{self.name}'
         }
@@ -704,6 +790,11 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         # Unsupported custom field type
         else:
             return None
+
+        # A negated lookup must match objects which carry no key for this field at all; see
+        # MissingKeyAwareFilterMixin. BooleanFilter is never negated, so it is left alone.
+        if not issubclass(filter_class, django_filters.BooleanFilter):
+            filter_class = missing_key_aware_filter_factory(filter_class)
 
         filter_instance = filter_class(**kwargs)
         filter_instance.custom_field = self
@@ -815,6 +906,16 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
                     if type(id) is not int:
                         raise ValidationError(_("Found invalid object ID: {id}").format(id=id))
 
+            # Validate JSON against schema (if defined)
+            elif self.type == CustomFieldTypeChoices.TYPE_JSON:
+                if self.validation_schema:
+                    try:
+                        jsonschema.validate(value, schema=self.validation_schema)
+                    except JSONValidationError as e:
+                        raise ValidationError(
+                            _("Value does not conform to the assigned schema: {error}").format(error=e.message)
+                        )
+
         elif self.required:
             raise ValidationError(_("Required field cannot be empty."))
 
@@ -838,20 +939,20 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         null=True,
         help_text=_('Base set of predefined choices (optional)')
     )
-    extra_choices = ArrayField(
-        ArrayField(
-            base_field=models.CharField(max_length=100),
-            size=2
-        ),
+    extra_choices = ChoiceSetField(
         blank=True,
         null=True
+    )
+    choice_colors = models.JSONField(
+        default=dict,
+        blank=True,
     )
     order_alphabetically = models.BooleanField(
         default=False,
         help_text=_('Choices are automatically ordered alphabetically')
     )
 
-    clone_fields = ('extra_choices', 'order_alphabetically')
+    clone_fields = ('extra_choices', 'choice_colors', 'order_alphabetically')
 
     class Meta:
         ordering = ('name',)
@@ -886,6 +987,24 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         return self._choices
 
     @property
+    def colors(self):
+        """
+        Return merged color mappings from the selected base choice set (if it defines colors)
+        and any custom color overrides defined on this choice set.
+        """
+        if not hasattr(self, '_colors'):
+            self._colors = {}
+            if self.base_choices:
+                base_choice_set = CHOICE_SETS.get(self.base_choices)
+                self._colors.update(getattr(base_choice_set, 'colors', {}))
+            if self.choice_colors:
+                self._colors.update(self.choice_colors)
+        return self._colors
+
+    def get_choice_color(self, value):
+        return self.colors.get(value)
+
+    @property
     def choices_count(self):
         return len(self.choices)
 
@@ -900,25 +1019,56 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         if not self.base_choices and not self.extra_choices:
             raise ValidationError(_("Must define base or extra choices."))
 
-        # Check for duplicate values in extra_choices
-        choice_values = [c[0] for c in self.extra_choices] if self.extra_choices else []
-        if len(set(choice_values)) != len(choice_values):
-            # At least one duplicate value is present. Find the first one and raise an error.
-            _seen = []
-            for value in choice_values:
-                if value in _seen:
+        if self.choice_colors is None:
+            self.choice_colors = {}
+        elif not isinstance(self.choice_colors, dict):
+            raise ValidationError({
+                'choice_colors': _('Color mappings must be defined as a JSON object.')
+            })
+
+        valid_choice_values = set()
+        extra_choice_values = set()
+
+        if self.base_choices:
+            valid_choice_values.update(value for value, _ in CHOICE_SETS.get(self.base_choices))
+
+        if self.extra_choices:
+            for value, _label in self.extra_choices:
+                if value in extra_choice_values:
                     raise ValidationError(_("Duplicate value '{value}' found in extra choices.").format(value=value))
-                _seen.append(value)
+                extra_choice_values.add(value)
+            valid_choice_values.update(extra_choice_values)
+
+        invalid_choice_values = set()
+        invalid_colors = set()
+        valid_colors = set(CustomFieldChoiceColorChoices.values())
+
+        for value, color in self.choice_colors.items():
+            if value not in valid_choice_values:
+                invalid_choice_values.add(value)
+            if color not in valid_colors:
+                invalid_colors.add(color)
+
+        if invalid_choice_values:
+            raise ValidationError({
+                'choice_colors': _(
+                    'Color mappings must reference an existing choice value. Invalid value(s): {values}.'
+                ).format(values=', '.join(sorted(invalid_choice_values)))
+            })
+
+        if invalid_colors:
+            raise ValidationError({
+                'choice_colors': _(
+                    'Invalid color value(s): {colors}. Use a supported named color.'
+                ).format(colors=', '.join(sorted(invalid_colors)))
+            })
 
         # Check whether any choices have been removed. If so, check whether any of the removed
         # choices are still set in custom field data for any object.
         original_choices = set([
             c[0] for c in self._original_extra_choices
         ]) if self._original_extra_choices else set()
-        current_choices = set([
-            c[0] for c in self.extra_choices
-        ]) if self.extra_choices else set()
-        if removed_choices := original_choices - current_choices:
+        if removed_choices := original_choices - valid_choice_values:
             for custom_field in self.choices_for.all():
                 for object_type in custom_field.object_types.all():
                     model = object_type.model_class()
@@ -939,7 +1089,7 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
     def save(self, *args, **kwargs):
 
         # Sort choices if alphabetical ordering is enforced
-        if self.order_alphabetically:
+        if self.order_alphabetically and self.extra_choices:
             self.extra_choices = sorted(self.extra_choices, key=lambda x: x[0])
 
         return super().save(*args, **kwargs)

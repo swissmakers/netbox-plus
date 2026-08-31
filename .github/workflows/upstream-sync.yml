@@ -2,7 +2,7 @@ name: upstream-sync
 
 on:
   schedule:
-    - cron: "17 3 * * *"        # taeglich 03:17 UTC
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_ref:
@@ -95,6 +95,8 @@ jobs:
         if: steps.up.outputs.needed == 'true'
         run: |
           set -e
+          BASE=$(git rev-parse HEAD)
+
           # -X ours: bei kollidierenden Hunks gewinnt netbox-plus.
           # Nicht-kollidierende Upstream-Aenderungen derselben Datei kommen trotzdem rein.
           git merge --no-edit -X ours "${{ steps.up.outputs.sha }}" || true
@@ -111,6 +113,17 @@ jobs:
             done
           fi
 
+          # .github bleibt immer exakt auf unserem Stand.
+          # Grund: der Actions-Token darf keine Workflow-Dateien pushen
+          # ("refusing to allow a GitHub App to ... without workflows permission"),
+          # und Upstream-Workflows wollen wir ohnehin nicht uebernehmen.
+          # rm -rf vorher, damit auch von Upstream NEU hinzugefuegte Dateien verschwinden.
+          rm -rf .github
+          git checkout "$BASE" -- .github 2>/dev/null || true
+          if [ -d .github ]; then
+            git add -A -- .github
+          fi
+
           if ! git diff --cached --quiet || [ -f .git/MERGE_HEAD ]; then
             git commit --no-edit || true
           fi
@@ -120,7 +133,18 @@ jobs:
 
       - name: Push
         if: steps.up.outputs.needed == 'true' && github.event.inputs.dry_run != 'true'
-        run: git push origin "HEAD:$TARGET_BRANCH"
+        run: |
+          set -e
+          # Vorab pruefen: enthaelt der Merge Workflow-Aenderungen, wird der Push
+          # vom Server abgelehnt. Lieber hier klar scheitern als am remote.
+          git fetch --no-tags origin "$TARGET_BRANCH"
+          WF_CHANGED=$(git diff --name-only FETCH_HEAD..HEAD -- .github/workflows || true)
+          if [ -n "$WF_CHANGED" ]; then
+            echo "Workflow-Aenderungen im Merge - Push wuerde abgelehnt werden:" >&2
+            echo "$WF_CHANGED" >&2
+            exit 1
+          fi
+          git push origin "HEAD:$TARGET_BRANCH"
 
       - name: Issue zur Nachkontrolle
         if: steps.up.outputs.needed == 'true' && steps.probe.outputs.conflicts != ''

@@ -1375,6 +1375,41 @@ class RackTestCase(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual(response.get('Content-Type'), 'image/svg+xml')
 
+    def test_get_rack_elevation_svg_highlight(self):
+        """
+        Highlighting devices in an SVG rack elevation supports only exact matches on permitted fields.
+        """
+        rack = Rack.objects.first()
+        tenant = Tenant.objects.create(name='Tenant 1', slug='tenant-1', description='SECRET')
+        device1 = create_test_device('Device 1', site=rack.site, rack=rack, position=1, face='front', tenant=tenant)
+        create_test_device('Device 2', site=rack.site, rack=rack, position=10, face='front')
+        self.add_permissions('dcim.view_rack', 'dcim.view_device')
+        url = reverse('dcim-api:rack-elevation', kwargs={'pk': rack.pk})
+
+        def is_highlighted(*params):
+            query = '&'.join(f'highlight={p}' for p in params)
+            response = self.client.get(f'{url}?render=svg&{query}', **self.header)
+            self.assertHttpStatus(response, status.HTTP_200_OK)
+            return 'slot shaded' in response.content.decode()
+
+        # Supported attributes
+        self.assertTrue(is_highlighted(f'id:{device1.pk}'))
+        self.assertTrue(is_highlighted('name:Device 1'))
+        self.assertFalse(is_highlighted('name:Nonexistent'))
+
+        # Related fields and lookup expressions must be ignored
+        self.assertFalse(is_highlighted('tenant__description__startswith:S'))
+        self.assertFalse(is_highlighted('tenant__description:SECRET'))
+        self.assertFalse(is_highlighted('name__startswith:Device 1'))
+        self.assertFalse(is_highlighted(f'tenant_id:{tenant.pk}'))
+
+        # Malformed and invalid values must be ignored
+        self.assertFalse(is_highlighted('id'))
+        self.assertFalse(is_highlighted('id:foo'))
+        self.assertFalse(is_highlighted('name:%00'))
+        self.assertTrue(is_highlighted('id:foo', 'name:Device 1'))
+        self.assertTrue(is_highlighted('name:%00', 'name:Device 1'))
+
 
 class RackReservationTestCase(APIViewTestCases.APIViewTestCase):
     model = RackReservation
@@ -2811,6 +2846,28 @@ class DeviceTestCase(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
 
         self.assertEqual(response.data['oob_ip']['dns_name'], 'oob.example.com')
+
+    @tag('regression')  # Issue #23274
+    def test_create_rejects_ips_of_other_devices(self):
+        """Creating a device with a primary or OOB IP on another device's interface returns HTTP 400."""
+        device = create_test_device('ip-owner-device')
+        interface = Interface.objects.create(device=device, name='eth0', type='other')
+        ip4 = IPAddress.objects.create(address='192.0.2.1/24', assigned_object=interface)
+        ip6 = IPAddress.objects.create(address='2001:db8::1/64', assigned_object=interface)
+
+        self.add_permissions('dcim.add_device')
+        for field, ip in (('primary_ip4', ip4), ('primary_ip6', ip6), ('oob_ip', ip4)):
+            with self.subTest(field=field):
+                data = {
+                    'device_type': device.device_type.pk,
+                    'role': device.role.pk,
+                    'site': device.site.pk,
+                    'name': f'new-device-{field}',
+                    field: ip.pk,
+                }
+                response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+                self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(field, response.data)
 
     def test_render_config_with_config_template_id(self):
         default_template = ConfigTemplate.objects.create(
@@ -4860,6 +4917,29 @@ class CableTestCase(APIViewTestCases.APIViewTestCase):
                 # No profile (legacy behavior)
             },
         ]
+
+    def test_repeated_put_does_not_accumulate_paths(self):
+        """
+        Repeating an identical PUT must leave the cable with the two paths its terminations trace.
+        """
+        self.add_permissions('dcim.change_cable')
+        cable = Cable.objects.get(label='Cable 1')
+        interface_a = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_A)
+        interface_b = Interface.objects.get(cable=cable, cable_end=CableEndChoices.SIDE_B)
+        data = {
+            'status': cable.status,
+            'a_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_a.pk}],
+            'b_terminations': [{'object_type': 'dcim.interface', 'object_id': interface_b.pk}],
+        }
+
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                response = self.client.put(self._get_detail_url(cable), data, format='json', **self.header)
+
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                for interface in (interface_a, interface_b):
+                    self.assertTrue(Interface.objects.get(pk=interface.pk)._path.is_complete)
+                self.assertEqual(CablePath.objects.filter(_nodes__contains=cable).count(), 2)
 
     def test_graphql_cable_termination_cached_filters(self):
         """

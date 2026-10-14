@@ -1,5 +1,6 @@
 import json
 import re
+from types import SimpleNamespace
 from unittest import mock, skipIf
 
 import strawberry
@@ -11,11 +12,13 @@ from django.db import connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from strawberry.extensions import QueryDepthLimiter
 from strawberry.schema.config import StrawberryConfig
+from strawberry_django.optimizer import DjangoOptimizerExtension
 
-from core.models import ObjectType
+from core.models import DataFile, DataSource, ObjectType
 from dcim.choices import LocationStatusChoices
 from dcim.models import (
     Device,
@@ -23,7 +26,9 @@ from dcim.models import (
     DeviceType,
     Interface,
     Location,
+    MACAddress,
     Manufacturer,
+    Platform,
     Rack,
     RackReservation,
     Site,
@@ -35,6 +40,7 @@ from ipam.models import RIR, Aggregate, IPAddress, Prefix
 from netbox.graphql.pagination import apply_distinct_window_pagination
 from netbox.graphql.scalars import BigInt, BigIntScalar
 from netbox.graphql.schema import Query, get_schema_extensions, schema
+from netbox.graphql.types import PrimaryObjectType
 from netbox.graphql.utils import register_model_graphql_type, splice_extension_bases, validate_extension_final_names
 from netbox.registry import registry
 from netbox.tests.dummy_plugin.models import DummySiteAttachment
@@ -754,6 +760,102 @@ class GraphQLAPITestCase(APITestCase):
             site_queries,
             2,
             msg=f'Expected optimized site join, got {site_queries} site queries for 5 IP addresses',
+        )
+
+    def test_graphql_plugin_display_does_not_inherit_other_model_columns(self):
+        """Types decorated directly by plugins must not inherit another model's display hints."""
+        platform = Platform.objects.create(name='Display Platform', slug='display-platform')
+
+        @strawberry_django.type(Platform, fields=['name'])
+        class PluginPlatformType(PrimaryObjectType):
+            pass
+
+        @strawberry.type
+        class PluginQuery:
+            platforms: list[PluginPlatformType] = strawberry_django.field()
+
+        plugin_schema = strawberry.Schema(query=PluginQuery, extensions=[DjangoOptimizerExtension])
+        self.user.is_superuser = True
+        result = plugin_schema.execute_sync(
+            '{ platforms { name display } }',
+            context_value=SimpleNamespace(request=SimpleNamespace(user=self.user)),
+        )
+        self.assertIsNone(result.errors)
+        self.assertEqual(result.data['platforms'], [{'name': platform.name, 'display': str(platform)}])
+
+    @override_settings(LOGIN_REQUIRED=True)
+    def test_graphql_datafile_display_does_not_load_binary_data(self):
+        """Rendering a file path must not select the file's binary contents."""
+        self.add_permissions('core.view_datafile')
+        source = DataSource.objects.create(name='Display Source', type='local', source_url='file:///tmp/display/')
+        datafile = DataFile.objects.create(
+            source=source, path='display.txt', last_updated=timezone.now(),
+            size=7, hash='0' * 64, data=b'content',
+        )
+        with CaptureQueriesContext(connection) as context:
+            response = self.client.post(
+                reverse('graphql'), data={'query': '{ data_file_list { display } }'}, format='json', **self.header,
+            )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = response.json()
+        self.assertNotIn('errors', data)
+        self.assertEqual(data['data']['data_file_list'], [{'display': datafile.path}])
+        file_queries = [q['sql'] for q in context.captured_queries if 'FROM "core_datafile"' in q['sql']]
+        self.assertTrue(file_queries)
+        for sql in file_queries:
+            self.assertNotIn('"core_datafile"."data"', sql)
+
+    @override_settings(LOGIN_REQUIRED=True)
+    def test_graphql_nested_display_is_batched(self):
+        """
+        Selecting `display` on a nested object must not reload each row to read deferred columns (no N+1).
+        """
+        self.add_permissions('dcim.view_device', 'dcim.view_interface', 'dcim.view_macaddress')
+
+        site = Site.objects.first()
+        manufacturer = Manufacturer.objects.create(name='Display Manufacturer', slug='display-manufacturer')
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model='Display Model', slug='display-model')
+        device_role = DeviceRole.objects.create(name='Display Role', slug='display-role')
+        devices = Device.objects.bulk_create([
+            Device(name=f'Display Device {index}', device_type=device_type, role=device_role, site=site)
+            for index in range(5)
+        ])
+        for index, device in enumerate(devices):
+            interface = Interface.objects.create(name='eth0', device=device, type='1000baset')
+            mac = MACAddress.objects.create(mac_address=f'00:00:00:00:00:{index:02x}', assigned_object=interface)
+            interface.primary_mac_address = mac
+            interface.save()
+
+        query = """
+        {
+            device_list(filters: {role: {slug: {exact: "display-role"}}}) {
+                name
+                interfaces {
+                    name
+                    primary_mac_address {
+                        display
+                    }
+                }
+            }
+        }
+        """
+        url = reverse('graphql')
+
+        with CaptureQueriesContext(connection) as context:
+            response = self.client.post(url, data={'query': query}, format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = json.loads(response.content)
+        self.assertNotIn('errors', data)
+        self.assertEqual(len(data['data']['device_list']), len(devices))
+        for device_data in data['data']['device_list']:
+            self.assertTrue(device_data['interfaces'][0]['primary_mac_address']['display'])
+
+        mac_queries = count_primary_table_queries(context.captured_queries, 'dcim_macaddress')
+        self.assertLessEqual(
+            mac_queries,
+            2,
+            msg=f'Expected batched MAC address lookup, got {mac_queries} MAC address queries for 5 devices',
         )
 
     def test_offset_pagination(self):

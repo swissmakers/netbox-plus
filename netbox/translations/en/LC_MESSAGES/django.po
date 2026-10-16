@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PACKAGE VERSION\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-14 05:02+0000\n"
+"POT-Creation-Date: 2026-10-16 05:02+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -1962,31 +1962,31 @@ msgstr ""
 msgid "This user does not have permission to synchronize this data source."
 msgstr ""
 
-#: netbox/core/apps.py:47
+#: netbox/core/apps.py:53
 msgid "Object created"
 msgstr ""
 
-#: netbox/core/apps.py:48
+#: netbox/core/apps.py:54
 msgid "Object updated"
 msgstr ""
 
-#: netbox/core/apps.py:49
+#: netbox/core/apps.py:55
 msgid "Object deleted"
 msgstr ""
 
-#: netbox/core/apps.py:50
+#: netbox/core/apps.py:56
 msgid "Job started"
 msgstr ""
 
-#: netbox/core/apps.py:51
+#: netbox/core/apps.py:57
 msgid "Job completed"
 msgstr ""
 
-#: netbox/core/apps.py:52
+#: netbox/core/apps.py:58
 msgid "Job failed"
 msgstr ""
 
-#: netbox/core/apps.py:53
+#: netbox/core/apps.py:59
 msgid "Job errored"
 msgstr ""
 
@@ -2851,12 +2851,12 @@ msgstr ""
 msgid "Jobs cannot be assigned to this object type ({type})."
 msgstr ""
 
-#: netbox/core/models/jobs.py:240
+#: netbox/core/models/jobs.py:253
 #, python-brace-format
 msgid "Invalid status for job termination. Choices are: {choices}"
 msgstr ""
 
-#: netbox/core/models/jobs.py:306
+#: netbox/core/models/jobs.py:319
 msgid ""
 "enqueue() cannot be called with values for both schedule_at and immediate."
 msgstr ""
@@ -12427,11 +12427,11 @@ msgstr ""
 msgid "Error deleting widget: "
 msgstr ""
 
-#: netbox/extras/views.py:1747
+#: netbox/extras/views.py:1754
 msgid "Unable to run script: RQ worker process not running."
 msgstr ""
 
-#: netbox/extras/views.py:1766
+#: netbox/extras/views.py:1773
 #, python-brace-format
 msgid "Unable to run script: {error}"
 msgstr ""

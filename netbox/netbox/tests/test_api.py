@@ -23,7 +23,7 @@ from ipam.models import VRF, RouteTarget
 from netbox.api.exceptions import QuerySetNotOrdered, SerializerNotFound
 from netbox.api.fields import ContentTypeField, IntegerRangeSerializer, RelatedObjectCountField
 from netbox.api.pagination import NetBoxPagination
-from netbox.api.serializers import ValidatedModelSerializer
+from netbox.api.serializers import ValidatedModelSerializer, WritableNestedSerializer
 from users.constants import TOKEN_PREFIX
 from users.models import Token, User
 from utilities.api import get_serializer_for_model
@@ -437,7 +437,7 @@ class ValidatedModelSerializerTestCase(TestCase):
         self.assertEqual(opted_in.validated_data['template_code'], '{{ synced }}')
 
     def test_nested_serializer_skips_model_validation(self):
-        """A serializer representing a nested object returns its input untouched."""
+        """A serializer representing a nested object resolves its input without calling validate()."""
 
         class OptedInSerializer(ValidatedModelSerializer):
             class Meta:
@@ -446,10 +446,34 @@ class ValidatedModelSerializerTestCase(TestCase):
                 brief_fields = ('name',)
                 model_clean_fields = ('template_code',)
 
+        export_template = ExportTemplate.objects.create(name='Export Template 1', template_code='{# untouched #}')
         serializer = OptedInSerializer(nested=True)
-        data = {'template_code': '{# untouched #}'}
 
-        self.assertEqual(serializer.validate(data), data)
+        with patch.object(OptedInSerializer, 'validate') as validate:
+            self.assertEqual(serializer.run_validation(export_template.pk), export_template)
+        validate.assert_not_called()
+
+
+class WritableNestedSerializerTestCase(TestCase):
+
+    def test_skips_validation(self):
+        """A WritableNestedSerializer resolves its input without running validators or validate()."""
+
+        class NestedExportTemplateSerializer(WritableNestedSerializer):
+            class Meta:
+                model = ExportTemplate
+                fields = ['id', 'name']
+
+        export_template = ExportTemplate.objects.create(name='Export Template 1', template_code='{# untouched #}')
+        serializer = NestedExportTemplateSerializer()
+
+        with (
+            patch.object(NestedExportTemplateSerializer, 'run_validators') as run_validators,
+            patch.object(NestedExportTemplateSerializer, 'validate') as validate,
+        ):
+            self.assertEqual(serializer.run_validation(export_template.pk), export_template)
+        run_validators.assert_not_called()
+        validate.assert_not_called()
 
 
 ROUTED_ALIAS = 'routed'

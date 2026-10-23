@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PACKAGE VERSION\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-22 05:01+0000\n"
+"POT-Creation-Date: 2026-10-23 05:01+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -3194,22 +3194,22 @@ msgstr ""
 msgid "Plugin {name} not found"
 msgstr ""
 
-#: netbox/dcim/api/serializers_/device_components.py:385
+#: netbox/dcim/api/serializers_/device_components.py:381
 #: netbox/dcim/forms/common.py:62
-#: netbox/virtualization/api/serializers_/virtualmachines.py:164
+#: netbox/virtualization/api/serializers_/virtualmachines.py:161
 msgid "Enter a valid MAC address (e.g. 00:11:22:33:44:55)."
 msgstr ""
 
-#: netbox/dcim/api/serializers_/device_components.py:412
+#: netbox/dcim/api/serializers_/device_components.py:408
 msgid "Interface mode does not support q-in-q service vlan"
 msgstr ""
 
-#: netbox/dcim/api/serializers_/device_components.py:419
+#: netbox/dcim/api/serializers_/device_components.py:415
 msgid "Interface mode does not support untagged vlan"
 msgstr ""
 
-#: netbox/dcim/api/serializers_/device_components.py:424
-#: netbox/dcim/api/serializers_/device_components.py:429
+#: netbox/dcim/api/serializers_/device_components.py:420
+#: netbox/dcim/api/serializers_/device_components.py:425
 msgid "Interface mode does not support tagged vlans"
 msgstr ""
 
@@ -3239,25 +3239,25 @@ msgstr ""
 msgid "Adopt already existing components"
 msgstr ""
 
-#: netbox/dcim/api/serializers_/devices.py:232
+#: netbox/dcim/api/serializers_/devices.py:227
 #: netbox/dcim/models/modules.py:486 netbox/dcim/models/modules.py:686
 msgid ""
 "Changing a module's type while moving it is not supported. Change the module "
 "type and move the module as separate operations."
 msgstr ""
 
-#: netbox/dcim/api/serializers_/devices.py:286 netbox/dcim/forms/common.py:159
+#: netbox/dcim/api/serializers_/devices.py:281 netbox/dcim/forms/common.py:159
 msgid ""
 "Cannot install module with placeholder values in a module bay with no "
 "position defined."
 msgstr ""
 
-#: netbox/dcim/api/serializers_/devices.py:297 netbox/dcim/forms/common.py:171
+#: netbox/dcim/api/serializers_/devices.py:292 netbox/dcim/forms/common.py:171
 #, python-brace-format
 msgid "Cannot adopt {model} {name} as it already belongs to a module"
 msgstr ""
 
-#: netbox/dcim/api/serializers_/devices.py:305 netbox/dcim/forms/common.py:180
+#: netbox/dcim/api/serializers_/devices.py:300 netbox/dcim/forms/common.py:180
 #, python-brace-format
 msgid "A {model} named {name} already exists"
 msgstr ""
@@ -10470,7 +10470,7 @@ msgstr ""
 
 #: netbox/extras/forms/bulk_edit.py:170 netbox/extras/forms/bulk_edit.py:400
 #: netbox/extras/forms/filtersets.py:223 netbox/extras/forms/filtersets.py:569
-#: netbox/extras/models/mixins.py:110 netbox/extras/ui/panels.py:241
+#: netbox/extras/models/mixins.py:111 netbox/extras/ui/panels.py:241
 #: netbox/extras/ui/panels.py:479
 msgid "MIME type"
 msgstr ""
@@ -11595,67 +11595,73 @@ msgstr ""
 msgid "dashboards"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:95
+#: netbox/extras/models/mixins.py:96
 msgid "template code"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:96
+#: netbox/extras/models/mixins.py:97
 msgid "Jinja template code."
 msgstr ""
 
-#: netbox/extras/models/mixins.py:99
+#: netbox/extras/models/mixins.py:100
 msgid "environment parameters"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:104
+#: netbox/extras/models/mixins.py:105
 #, python-brace-format
 msgid ""
 "Any <a href=\"{url}\">additional parameters</a> to pass when constructing "
 "the Jinja environment"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:111
+#: netbox/extras/models/mixins.py:112
 #, python-brace-format
 msgid "Defaults to <code>{default}</code>"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:116
+#: netbox/extras/models/mixins.py:117
 msgid "Filename to give to the rendered export file"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:119
+#: netbox/extras/models/mixins.py:120
 msgid "file extension"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:122
+#: netbox/extras/models/mixins.py:123
 msgid "Extension to append to the rendered filename"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:125
+#: netbox/extras/models/mixins.py:126
 msgid "as attachment"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:127
+#: netbox/extras/models/mixins.py:128
 msgid "Download file as attachment"
 msgstr ""
 
-#: netbox/extras/models/mixins.py:167
+#: netbox/extras/models/mixins.py:168
 #, python-brace-format
 msgid ""
 "The \"{key}\" parameter is deprecated and may not be set on new or modified "
 "templates."
 msgstr ""
 
-#: netbox/extras/models/mixins.py:173
+#: netbox/extras/models/mixins.py:174
 #, python-brace-format
 msgid "\"{key}\" is not a permitted Jinja2 environment parameter."
 msgstr ""
 
-#: netbox/extras/models/mixins.py:181
+#: netbox/extras/models/mixins.py:182
 #, python-brace-format
 msgid ""
 "Invalid value \"{value}\" for parameter \"{key}\". Allowed values are: "
 "{allowed}"
+msgstr ""
+
+#: netbox/extras/models/mixins.py:245
+msgid ""
+"The template differs from the saved template. Reload the template and try "
+"again."
 msgstr ""
 
 #: netbox/extras/models/models.py:75
@@ -15762,7 +15768,7 @@ msgstr ""
 
 #: netbox/netbox/views/generic/bulk_views.py:1025
 #: netbox/netbox/views/generic/bulk_views.py:1301
-#: netbox/netbox/views/generic/bulk_views.py:1349
+#: netbox/netbox/views/generic/bulk_views.py:1350
 #, python-brace-format
 msgid "No {object_type} were selected."
 msgstr ""
@@ -15790,16 +15796,16 @@ msgstr ""
 msgid "Deletion failed due to the presence of one or more dependent objects."
 msgstr ""
 
-#: netbox/netbox/views/generic/bulk_views.py:1362
+#: netbox/netbox/views/generic/bulk_views.py:1367
 #, python-brace-format
 msgid "Bulk add {count} {object_type}"
 msgstr ""
 
-#: netbox/netbox/views/generic/bulk_views.py:1415
+#: netbox/netbox/views/generic/bulk_views.py:1420
 msgid "An integrity error occurred while creating components"
 msgstr ""
 
-#: netbox/netbox/views/generic/bulk_views.py:1427
+#: netbox/netbox/views/generic/bulk_views.py:1432
 #, python-brace-format
 msgid "Added {count} {component} to {parent_count} {parent}."
 msgstr ""

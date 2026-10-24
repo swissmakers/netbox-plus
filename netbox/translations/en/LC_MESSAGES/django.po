@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PACKAGE VERSION\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-23 05:01+0000\n"
+"POT-Creation-Date: 2026-10-24 05:01+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -2584,7 +2584,7 @@ msgstr ""
 msgid "Change logging is not supported for this object type ({type})."
 msgstr ""
 
-#: netbox/core/models/config.py:22 netbox/core/models/data.py:292
+#: netbox/core/models/config.py:22 netbox/core/models/data.py:306
 #: netbox/core/models/files.py:30 netbox/core/models/jobs.py:60
 #: netbox/extras/models/models.py:1032 netbox/extras/models/notifications.py:40
 #: netbox/extras/models/notifications.py:197
@@ -2705,59 +2705,59 @@ msgstr ""
 msgid "URLs for local sources must start with {scheme} (or specify no scheme)"
 msgstr ""
 
-#: netbox/core/models/data.py:187
+#: netbox/core/models/data.py:189
 msgid "Cannot initiate sync; syncing already in progress."
 msgstr ""
 
-#: netbox/core/models/data.py:200
+#: netbox/core/models/data.py:202
 msgid ""
 "There was an error initializing the backend. A dependency needs to be "
 "installed: "
 msgstr ""
 
-#: netbox/core/models/data.py:296 netbox/core/models/files.py:34
+#: netbox/core/models/data.py:310 netbox/core/models/files.py:34
 #: netbox/netbox/models/features.py:69
 msgid "last updated"
 msgstr ""
 
-#: netbox/core/models/data.py:306 netbox/dcim/models/cables.py:869
+#: netbox/core/models/data.py:320 netbox/dcim/models/cables.py:869
 msgid "path"
 msgstr ""
 
-#: netbox/core/models/data.py:309
+#: netbox/core/models/data.py:323
 msgid "File path relative to the data source's root"
 msgstr ""
 
-#: netbox/core/models/data.py:313 netbox/ipam/models/ip.py:661
+#: netbox/core/models/data.py:327 netbox/ipam/models/ip.py:661
 #: netbox/virtualization/models/virtualmachines.py:570
 msgid "size"
 msgstr ""
 
-#: netbox/core/models/data.py:316
+#: netbox/core/models/data.py:330
 msgid "hash"
 msgstr ""
 
-#: netbox/core/models/data.py:320
+#: netbox/core/models/data.py:334
 msgid "Length must be 64 hexadecimal characters."
 msgstr ""
 
-#: netbox/core/models/data.py:322
+#: netbox/core/models/data.py:336
 msgid "SHA256 hash of the file data"
 msgstr ""
 
-#: netbox/core/models/data.py:336
+#: netbox/core/models/data.py:350
 msgid "data file"
 msgstr ""
 
-#: netbox/core/models/data.py:337
+#: netbox/core/models/data.py:351
 msgid "data files"
 msgstr ""
 
-#: netbox/core/models/data.py:413
+#: netbox/core/models/data.py:427
 msgid "auto sync record"
 msgstr ""
 
-#: netbox/core/models/data.py:414
+#: netbox/core/models/data.py:428
 msgid "auto sync records"
 msgstr ""
 

@@ -4,12 +4,13 @@ from pathlib import Path
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db.models.signals import pre_delete
 from django.http import HttpResponse
 from django.test import Client, TransactionTestCase, override_settings, tag
 from django.urls import reverse
 from django.utils import timezone
 
-from core.models import DataFile, DataSource
+from core.models import DataFile, DataSource, ObjectChange
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusChoices
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site, VirtualChassis
 from extras.events import enqueue_event
@@ -22,6 +23,7 @@ from netbox.choices import CSVDelimiterChoices, ImportFormatChoices, ImportMetho
 from netbox.constants import EMPTY_TABLE_TEXT
 from netbox.search.backends import search_backend
 from users.models import User
+from utilities.exceptions import AbortRequest
 from utilities.testing import TestCase
 from utilities.views import get_action_url
 

@@ -1425,6 +1425,18 @@ class RackTestCase(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    def test_ordering_by_count_without_field(self):
+        """Ordering by a count left out of the response still sorts by it."""
+        self.add_permissions('dcim.view_rack')
+        rack = Rack.objects.get(name='Rack 3')
+        create_test_device('Device 1', site=rack.site, rack=rack)
+        response = self.client.get(
+            f'{self._get_list_url()}?ordering=-device_count,name&fields=id,name', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([row['name'] for row in response.data['results']], ['Rack 3', 'Rack 1', 'Rack 2'])
+        self.assertNotIn('device_count', response.data['results'][0])
+
     def test_get_rack_elevation(self):
         """
         GET a single rack elevation.
@@ -3644,6 +3656,90 @@ class ModuleTestCase(APIViewTestCases.APIViewTestCase):
         existing_iface.refresh_from_db()
         self.assertIsNotNone(existing_iface.module)
 
+    def test_adopt_components_changelog(self):
+        """
+        Adopted components should be change-logged with prechange data and have last_updated bumped.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Adopt Changelog Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Adopt Changelog Module Type')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        ModuleBayTemplate.objects.create(module_type=module_type, name='Sub Bay')
+        module_bay = ModuleBay.objects.create(device=device, name='Adopt Changelog Bay')
+        # Adopted bays are also re-parented under the module's bay
+        expected_diffs = [
+            (Interface.objects.create(device=device, name='eth0', type='1000base-t'), {'module': None}),
+            (ModuleBay.objects.create(device=device, name='Sub Bay'), {'module': None, 'parent': None}),
+        ]
+        original_last_updated = {component.pk: component.last_updated for component, _ in expected_diffs}
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+            'adopt_components': True,
+            'replicate_components': False,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        module_pk = response.data['id']
+
+        for component, expected_pre in expected_diffs:
+            component.refresh_from_db()
+            self.assertEqual(component.module_id, module_pk)
+            self.assertGreater(component.last_updated, original_last_updated[component.pk])
+            objectchange = ObjectChange.objects.get(
+                changed_object_type=ObjectType.objects.get_for_model(component),
+                changed_object_id=component.pk,
+                action=ObjectChangeActionChoices.ACTION_UPDATE,
+            )
+            self.assertIsNotNone(objectchange.prechange_data)
+            self.assertIsNone(objectchange.prechange_data['module'])
+            self.assertEqual(objectchange.postchange_data['module'], module_pk)
+            self.assertEqual(objectchange.diff()['pre'], expected_pre)
+            # Trigger-maintained ltree columns must reflect the post-adoption location
+            if isinstance(component, ModuleBay):
+                self.assertEqual(objectchange.postchange_data['path'], str(component.path))
+                self.assertEqual(objectchange.postchange_data['sort_path'], component.sort_path)
+
+    def test_install_module_interface_parent_bridge_changelog(self):
+        """
+        Interface parent/bridge assignments made during module installation must record prechange data.
+        """
+        self.add_permissions('dcim.add_module')
+        manufacturer = Manufacturer.objects.get(name='Generic')
+        device = create_test_device('Device for Interface Parent Changelog Test')
+        module_type = ModuleType.objects.create(manufacturer=manufacturer, model='Parent Changelog Module Type')
+        eth0 = InterfaceTemplate.objects.create(module_type=module_type, name='eth0', type='1000base-t')
+        InterfaceTemplate.objects.create(module_type=module_type, name='eth0.100', type='virtual', parent=eth0)
+        InterfaceTemplate.objects.create(module_type=module_type, name='br0', type='bridge')
+        InterfaceTemplate.objects.create(
+            module_type=module_type, name='eth1', type='1000base-t', bridge=InterfaceTemplate.objects.get(name='br0')
+        )
+        module_bay = ModuleBay.objects.create(device=device, name='Parent Changelog Bay')
+
+        url = reverse('dcim-api:module-list')
+        data = {
+            'device': device.pk,
+            'module_bay': module_bay.pk,
+            'module_type': module_type.pk,
+        }
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+        for name, field in (('eth0.100', 'parent'), ('eth1', 'bridge')):
+            interface = Interface.objects.get(device=device, name=name)
+            objectchange = ObjectChange.objects.get(
+                changed_object_type=ObjectType.objects.get_for_model(Interface),
+                changed_object_id=interface.pk,
+                action=ObjectChangeActionChoices.ACTION_UPDATE,
+            )
+            self.assertIsNotNone(objectchange.prechange_data)
+            self.assertIsNone(objectchange.prechange_data[field])
+            self.assertEqual(objectchange.postchange_data[field], getattr(interface, f'{field}_id'))
+
     def test_replicate_components_conflict(self):
         """
         Installing a module with replicate_components=True when a component with the same name
@@ -4335,6 +4431,45 @@ class InterfaceTestCase(Mixins.FieldPrefetchMixin, Mixins.ComponentTraceMixin, A
             FHRPGroupAssignment.objects.create(group=fhrp_group, interface=interfaces['e'], priority=100)
             filters.append(f'device_id={device.pk}')
         return [filters[0], '&'.join(filters)]
+
+    def test_ordering_by_count_annotation(self):
+        """Ordering by a count annotation sorts the response whether or not it renders the count."""
+        self.add_permissions('dcim.view_interface', 'extras.view_exporttemplate')
+        interfaces = {name: Interface.objects.get(name=name) for name in ('Interface 2', 'Interface 3')}
+        IPAddress.objects.bulk_create((
+            IPAddress(address='192.0.2.1/24', assigned_object=interfaces['Interface 2']),
+            IPAddress(address='192.0.2.2/24', assigned_object=interfaces['Interface 2']),
+            IPAddress(address='192.0.2.3/24', assigned_object=interfaces['Interface 3']),
+        ))
+        export_template = ExportTemplate.objects.create(
+            name='Interfaces', template_code='{% for interface in queryset %}{{ interface.name }},{% endfor %}'
+        )
+        export_template.object_types.set([ObjectType.objects.get_for_model(Interface)])
+        url = f'{self._get_list_url()}?ordering=-count_ipaddresses'
+
+        # The count's source isn't a valid ordering field
+        response = self.client.get(f'{self._get_list_url()}?ordering=-_count_ipaddresses', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(
+            [row['name'] for row in response.data['results']], ['Interface 1', 'Interface 2', 'Interface 3']
+        )
+
+        # Responses without the count annotate it for the ordering alone
+        for params in ('', '&fields=id,name,count_ipaddresses', '&brief=1', '&fields=id,name', '&export=Interfaces'):
+            with self.subTest(params=params):
+                response = self.client.get(url + params, **self.header)
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                if 'export' in params:
+                    self.assertEqual(response.content.decode(), 'Interface 2,Interface 3,Interface 1,')
+                else:
+                    self.assertEqual(
+                        [row['name'] for row in response.data['results']],
+                        ['Interface 2', 'Interface 3', 'Interface 1'],
+                    )
+                    self.assertEqual(
+                        'count_ipaddresses' in response.data['results'][0],
+                        params in ('', '&fields=id,name,count_ipaddresses'),
+                    )
 
     def test_bulk_delete_child_interfaces(self):
         interface1 = Interface.objects.get(name='Interface 1')

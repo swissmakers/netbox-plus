@@ -3,6 +3,7 @@ import urllib.parse
 from pathlib import Path
 
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.messages import get_messages
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models.signals import pre_delete
 from django.http import HttpResponse
@@ -10,7 +11,7 @@ from django.test import Client, TransactionTestCase, override_settings, tag
 from django.urls import reverse
 from django.utils import timezone
 
-from core.models import DataFile, DataSource, ObjectChange
+from core.models import DataFile, DataSource, ObjectChange, ObjectType
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusChoices
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site, VirtualChassis
 from extras.events import enqueue_event
@@ -22,9 +23,9 @@ from ipam.views import VLANGroupVLANsView
 from netbox.choices import CSVDelimiterChoices, ImportFormatChoices, ImportMethodChoices
 from netbox.constants import EMPTY_TABLE_TEXT
 from netbox.search.backends import search_backend
-from users.models import User
+from users.models import ObjectPermission, User
 from utilities.exceptions import AbortRequest
-from utilities.testing import TestCase
+from utilities.testing import TestCase, create_test_device
 from utilities.views import get_action_url
 
 

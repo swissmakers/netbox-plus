@@ -15,7 +15,7 @@ from core.models import DataFile, DataSource, ObjectChange, ObjectType
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices, SiteStatusChoices
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site, VirtualChassis
 from extras.events import enqueue_event
-from extras.models import ImageAttachment
+from extras.models import ImageAttachment, JournalEntry
 from extras.validators import CustomValidator
 from ipam.choices import VLANStatusChoices
 from ipam.models import VLAN, VLANGroup
